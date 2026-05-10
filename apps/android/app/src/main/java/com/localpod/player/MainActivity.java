@@ -8,6 +8,9 @@ import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.media.MediaPlayer;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
@@ -55,8 +58,12 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -81,7 +88,11 @@ public class MainActivity extends Activity {
     private static final int SOFT_BLUE = 0xffeaf3ff;
     private static final int SOFT_GREEN = 0xffeaf8f2;
     private static final int SOFT_RED = 0xffffedf1;
+    private static final String ENGINE_VOSK   = "vosk";
+    private static final String ENGINE_WHISPER = "whisper_local";
+    private static final String ENGINE_OPENAI  = "openai";
     private static final int OPENAI_CHUNK_SECONDS = 12 * 60;
+    private static final int LOCAL_CHUNK_SECONDS  = 3 * 60;
     private static final double AD_PADDING_BEFORE_SECONDS = 4.0;
     private static final double AD_PADDING_AFTER_SECONDS = 4.0;
     private static final double MIN_KEEP_RANGE_SECONDS = 0.75;
@@ -160,6 +171,7 @@ public class MainActivity extends Activity {
     private void showHome() {
         base("Ad Free Podcast Player");
         setStatus("Independent, local-only podcast player. No account, backend, sync, background polling, or thumbnails.");
+        root.addView(text(buildIdentity(), 13, MUTED, false));
         String crash = getSharedPreferences("crash", MODE_PRIVATE).getString("last", "");
         if (!TextUtils.isEmpty(crash)) {
             LinearLayout warning = card();
@@ -238,6 +250,20 @@ public class MainActivity extends Activity {
         ArrayList<Podcast> cached = db.cachedDirectory();
         if (cached.isEmpty()) root.addView(emptyState("No cached directory results yet."));
         for (Podcast p : cached) root.addView(searchRow(p));
+
+    }
+
+    private String buildIdentity() {
+            try {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), android.content.pm.PackageManager.PackageInfoFlags.of(0));
+                    return "Build " + info.versionName + " (" + info.getLongVersionCode() + ")  |  " + getPackageName();
+                }
+                android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+                return "Build " + info.versionName + " (" + info.versionCode + ")  |  " + getPackageName();
+            } catch (Exception ignored) {
+                return "Package " + getPackageName();
+            }
     }
 
     private void searchOnline(String term) {
@@ -446,8 +472,45 @@ public class MainActivity extends Activity {
         autoplay.setChecked(settingBool("autoplay_next", false));
         autoplay.setOnCheckedChangeListener((b, checked) -> db.setSetting("autoplay_next", checked ? "1" : "0"));
         root.addView(autoplay);
-        section("Ad Removal Defaults");
-        root.addView(text("Windows defaults to Parakeet with Whisper fallback. Android will use OpenAI transcription and optional OpenAI ad analysis when a key is saved.", 14, MUTED, false));
+        section("Ad Removal — Transcription Engine");
+        String curEngine = db.setting("transcription_engine", ENGINE_VOSK);
+        root.addView(text("Choose how episodes are transcribed before ad detection. Local options run fully on this device and need no API key. OpenAI Whisper is the most accurate but costs API credits.", 14, MUTED, false));
+        LinearLayout engineRow = new LinearLayout(this);
+        engineRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        String[][] engineOpts = {
+            {ENGINE_VOSK,   "Vosk\n(local ~40 MB)"},
+            {ENGINE_WHISPER, "Whisper\n(local ~142 MB)"},
+            {ENGINE_OPENAI, "OpenAI\nWhisper"}
+        };
+        for (String[] opt : engineOpts) {
+            Button btn = new Button(this);
+            btn.setText(opt[1]);
+            btn.setLayoutParams(ep);
+            btn.setPadding(8, 8, 8, 8);
+            boolean selected = opt[0].equals(curEngine);
+            if (selected) {
+                btn.setBackgroundColor(BLUE);
+                btn.setTextColor(0xffffffff);
+            } else {
+                btn.setBackgroundColor(LINE);
+                btn.setTextColor(INK);
+            }
+            String engineKey = opt[0];
+            btn.setOnClickListener(v -> { db.setSetting("transcription_engine", engineKey); showSettings(); });
+            engineRow.addView(btn);
+        }
+        root.addView(engineRow);
+        if (ENGINE_VOSK.equals(curEngine)) {
+            root.addView(text("Vosk runs offline. On first use the app downloads a ~40 MB English model and stores it on the device.", 13, MUTED, false));
+        } else if (ENGINE_WHISPER.equals(curEngine)) {
+            String whisperStatus = WhisperEngine.isAvailable() ? "Whisper (whisper.cpp) runs offline. On first use the app downloads a ~142 MB model." : "Whisper native library not detected. Build the app with NDK support enabled, or choose Vosk instead.";
+            root.addView(text(whisperStatus, 13, WhisperEngine.isAvailable() ? MUTED : CORAL, false));
+        } else {
+            root.addView(text("OpenAI Whisper sends audio to OpenAI's servers. Requires an API key and internet. Most accurate.", 13, MUTED, false));
+        }
+        section("Ad Detection");
+        root.addView(text("If an OpenAI API key is set, GPT-4o-mini scans the transcript for ad breaks (best accuracy). Without a key, a built-in keyword scan is used for local engines.", 14, MUTED, false));
         settingText("OpenAI API key", "openai_api_key", "");
         settingText("OpenAI model", "openai_model", "gpt-4o-mini");
         settingNumber("Download retention days", "download_retention_days", 30);
@@ -659,17 +722,26 @@ public class MainActivity extends Activity {
     }
 
     private void removeAds(Episode e) {
-        String openAiKey = db.setting("openai_api_key", "");
-        if (TextUtils.isEmpty(openAiKey)) {
-            showError("OpenAI key required", "Save an OpenAI API key in Settings before running ad removal on Android.");
-            return;
-        }
         if (!e.downloaded()) {
-            showError("Download required", "Download the episode first so Android can process the file locally.");
+            showError("Download required", "Download the episode first so the app can process the file locally.");
             return;
         }
-        setStatus("Preparing local ad removal...");
+        String engine = db.setting("transcription_engine", ENGINE_VOSK);
+        if (ENGINE_OPENAI.equals(engine)) {
+            String openAiKey = db.setting("openai_api_key", "");
+            if (TextUtils.isEmpty(openAiKey)) {
+                showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to a local transcription engine (Vosk or Whisper) in the Ad Removal settings.");
+                return;
+            }
+        }
+        setStatus("Preparing ad removal (" + engineLabel(engine) + ")...");
         io.execute(() -> runAndroidAdRemoval(e.id));
+    }
+
+    private String engineLabel(String engine) {
+        if (ENGINE_WHISPER.equals(engine)) return "Whisper local";
+        if (ENGINE_OPENAI.equals(engine)) return "OpenAI Whisper";
+        return "Vosk local";
     }
 
     private void runAndroidAdRemoval(String episodeId) {
@@ -685,21 +757,45 @@ public class MainActivity extends Activity {
             return;
         }
 
-        String apiKey = db.setting("openai_api_key", "").trim();
-        String model = db.setting("openai_model", "gpt-4o-mini").trim();
+        String engine   = db.setting("transcription_engine", ENGINE_VOSK);
+        String apiKey   = db.setting("openai_api_key", "").trim();
+        String gptModel = db.setting("openai_model", "gpt-4o-mini").trim();
+        boolean hasKey  = !TextUtils.isEmpty(apiKey);
+
+        int chunkSeconds = ENGINE_OPENAI.equals(engine) ? OPENAI_CHUNK_SECONDS : LOCAL_CHUNK_SECONDS;
 
         File chunkDir = null;
         try {
             postUi(() -> setStatus("Chunking audio for transcription..."));
             chunkDir = new File(getCacheDir(), "adfree-" + episode.id);
-            ArrayList<File> chunks = createTranscriptionChunks(source, chunkDir);
+            ArrayList<File> chunks = createTranscriptionChunks(source, chunkDir, chunkSeconds);
 
-            postUi(() -> setStatus("Transcribing with OpenAI Whisper..."));
-            ArrayList<TranscriptSegment> segments = transcribeChunksWithOpenAi(chunks, apiKey);
+            ArrayList<TranscriptSegment> segments;
+            switch (engine) {
+                case ENGINE_OPENAI:
+                    postUi(() -> setStatus("Transcribing with OpenAI Whisper..."));
+                    segments = transcribeChunksWithOpenAi(chunks, apiKey);
+                    break;
+                case ENGINE_WHISPER:
+                    postUi(() -> setStatus("Transcribing with local Whisper..."));
+                    segments = transcribeChunksWithWhisperCpp(chunks);
+                    break;
+                default: // vosk
+                    postUi(() -> setStatus("Transcribing with Vosk..."));
+                    segments = transcribeChunksWithVosk(chunks);
+                    break;
+            }
             if (segments.isEmpty()) throw new RuntimeException("No timestamped transcript segments were returned.");
 
-            postUi(() -> setStatus("Finding ad ranges..."));
-            ArrayList<TranscriptAdRange> adRanges = detectAdRangesWithOpenAi(segments, apiKey, TextUtils.isEmpty(model) ? "gpt-4o-mini" : model);
+            ArrayList<TranscriptAdRange> adRanges;
+            if (hasKey) {
+                postUi(() -> setStatus("Finding ad ranges with OpenAI..."));
+                adRanges = detectAdRangesWithOpenAi(segments, apiKey, TextUtils.isEmpty(gptModel) ? "gpt-4o-mini" : gptModel);
+            } else {
+                postUi(() -> setStatus("Finding ad ranges (local keyword scan)..."));
+                adRanges = detectAdRangesLocally(segments);
+            }
+
             adRanges = mergeRanges(adRanges, 4.0, 8.0);
             if (adRanges.isEmpty()) {
                 db.setAdStatus(episode.id, "no_ads_found");
@@ -734,14 +830,14 @@ public class MainActivity extends Activity {
         db.clearDownloads(false, false);
     }
 
-    private ArrayList<File> createTranscriptionChunks(File source, File outputDir) {
+    private ArrayList<File> createTranscriptionChunks(File source, File outputDir, int chunkSeconds) {
         if (outputDir.exists()) deleteRecursively(outputDir);
         outputDir.mkdirs();
-        double totalSeconds = audioDurationSeconds(source, OPENAI_CHUNK_SECONDS);
+        double totalSeconds = audioDurationSeconds(source, chunkSeconds);
         ArrayList<File> out = new ArrayList<>();
         int partIndex = 0;
-        for (double start = 0.0; start < totalSeconds; start += OPENAI_CHUNK_SECONDS) {
-            double end = Math.min(totalSeconds, start + OPENAI_CHUNK_SECONDS);
+        for (double start = 0.0; start < totalSeconds; start += chunkSeconds) {
+            double end = Math.min(totalSeconds, start + chunkSeconds);
             File target = new File(outputDir, String.format(Locale.US, "chunk-%03d.m4a", partIndex + 1));
             exportSingleRange(source, start, end, target);
             if (target.exists()) out.add(target);
@@ -877,6 +973,405 @@ public class MainActivity extends Activity {
         return out;
     }
 
+    // ── Local ad detection (keyword pattern matching) ──────────────────────────
+
+    private ArrayList<TranscriptAdRange> detectAdRangesLocally(ArrayList<TranscriptSegment> segments) {
+        String[] adPhrases = {
+            "sponsored by", "brought to you by", "this episode is brought",
+            "today's sponsor", "our sponsor", "presenting sponsor",
+            "advertisement", "advertising message", "a word from",
+            "promo code", "use code", "use promo", "coupon code",
+            "discount code", "affiliate code", "special offer",
+            "limited time", "free trial", "sign up for free",
+            "go to ", ".com/", "slash podcast", "link in the description",
+            "squarespace", "betterhelp", "nordvpn", "expressvpn",
+            "audible", "hellofresh", "bluechew", "hims ", "roman ",
+            "support our show", "patreon.com",
+            "this show is supported", "this podcast is supported"
+        };
+        ArrayList<TranscriptSegment> adSegs = new ArrayList<>();
+        for (TranscriptSegment seg : segments) {
+            String lower = seg.text.toLowerCase(Locale.US);
+            for (String phrase : adPhrases) {
+                if (lower.contains(phrase)) { adSegs.add(seg); break; }
+            }
+        }
+        ArrayList<TranscriptAdRange> out = new ArrayList<>();
+        if (adSegs.isEmpty()) return out;
+        double start = adSegs.get(0).start;
+        double end   = adSegs.get(0).end;
+        for (int i = 1; i < adSegs.size(); i++) {
+            TranscriptSegment seg = adSegs.get(i);
+            if (seg.start - end < 120.0) {
+                end = Math.max(end, seg.end);
+            } else {
+                TranscriptAdRange r = new TranscriptAdRange();
+                r.start = start; r.end = end; r.confidence = 0.7; r.reason = "Keyword match";
+                out.add(r);
+                start = seg.start; end = seg.end;
+            }
+        }
+        TranscriptAdRange last = new TranscriptAdRange();
+        last.start = start; last.end = end; last.confidence = 0.7; last.reason = "Keyword match";
+        out.add(last);
+        return out;
+    }
+
+    // ── Vosk local transcription ───────────────────────────────────────────────
+
+    private ArrayList<TranscriptSegment> transcribeChunksWithVosk(ArrayList<File> chunks) throws Exception {
+        File modelDir = new File(getFilesDir(), "vosk-model-en");
+        if (!new File(modelDir, "am/final.mdl").exists()) {
+            postUi(() -> setStatus("Downloading Vosk speech model (~40 MB, once only)..."));
+            downloadAndExtractVoskModel(modelDir);
+        }
+        org.vosk.Model voskModel = new org.vosk.Model(modelDir.getAbsolutePath());
+        ArrayList<TranscriptSegment> all = new ArrayList<>();
+        double chunkOffset = 0.0;
+        try {
+            for (int i = 0; i < chunks.size(); i++) {
+                File chunk = chunks.get(i);
+                final int ci = i + 1;
+                final int total = chunks.size();
+                postUi(() -> setStatus("Transcribing chunk " + ci + " of " + total + " with Vosk..."));
+                org.vosk.Recognizer rec = new org.vosk.Recognizer(voskModel, 16000.0f);
+                rec.setWords(true);
+                try {
+                    short[] pcm = decodeToPcm16000(chunk);
+                    byte[] bytes = shortsToBytes(pcm);
+                    ArrayList<String> utterances = new ArrayList<>();
+                    int pos = 0;
+                    while (pos < bytes.length) {
+                        int len = Math.min(8192, bytes.length - pos);
+                        byte[] window = new byte[len];
+                        System.arraycopy(bytes, pos, window, 0, len);
+                        if (rec.acceptWaveForm(window, len)) {
+                            utterances.add(rec.getResult());
+                        }
+                        pos += len;
+                    }
+                    utterances.add(rec.getFinalResult());
+                    for (String json : utterances) {
+                        parseVoskResult(json, chunkOffset, all);
+                    }
+                } finally {
+                    rec.close();
+                }
+                chunkOffset += audioDurationSeconds(chunk, LOCAL_CHUNK_SECONDS);
+            }
+        } finally {
+            voskModel.close();
+        }
+        return all;
+    }
+
+    private void parseVoskResult(String json, double chunkOffset, ArrayList<TranscriptSegment> out) {
+        try {
+            JSONObject obj = new JSONObject(json);
+            JSONArray words = obj.optJSONArray("result");
+            if (words == null || words.length() == 0) return;
+            double segStart = -1, segEnd = -1;
+            StringBuilder segText = new StringBuilder();
+            for (int i = 0; i < words.length(); i++) {
+                JSONObject word = words.getJSONObject(i);
+                double ws = word.optDouble("start", 0);
+                double we = word.optDouble("end", 0);
+                String wt = word.optString("word", "").trim();
+                if (TextUtils.isEmpty(wt)) continue;
+                if (segStart < 0) {
+                    segStart = ws; segEnd = we; segText.append(wt);
+                } else if (ws - segStart > 12.0) {
+                    addVoskSegment(chunkOffset, segStart, segEnd, segText.toString(), out);
+                    segStart = ws; segEnd = we; segText = new StringBuilder(wt);
+                } else {
+                    segEnd = we; segText.append(" ").append(wt);
+                }
+            }
+            if (segStart >= 0) addVoskSegment(chunkOffset, segStart, segEnd, segText.toString(), out);
+        } catch (Exception ignored) {}
+    }
+
+    private void addVoskSegment(double chunkOffset, double start, double end, String text, ArrayList<TranscriptSegment> out) {
+        String t = text.trim();
+        if (TextUtils.isEmpty(t)) return;
+        TranscriptSegment seg = new TranscriptSegment();
+        seg.index = out.size();
+        seg.start = chunkOffset + start;
+        seg.end   = chunkOffset + end;
+        seg.text  = t;
+        out.add(seg);
+    }
+
+    private void downloadAndExtractVoskModel(File modelDir) throws Exception {
+        String url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip";
+        File zipFile = new File(getCacheDir(), "vosk-model.zip");
+        downloadFileWithProgress(url, zipFile);
+        postUi(() -> setStatus("Extracting Vosk model..."));
+        File extractRoot = new File(getCacheDir(), "vosk-extract-tmp");
+        deleteRecursively(extractRoot);
+        extractRoot.mkdirs();
+        extractZip(zipFile, extractRoot);
+        zipFile.delete();
+        File[] extracted = extractRoot.listFiles();
+        File sourceDir = (extracted != null && extracted.length == 1 && extracted[0].isDirectory())
+                ? extracted[0] : extractRoot;
+        deleteRecursively(modelDir);
+        if (!sourceDir.renameTo(modelDir)) {
+            copyDir(sourceDir, modelDir);
+            deleteRecursively(extractRoot);
+        }
+    }
+
+    private void extractZip(File zipFile, File destDir) throws Exception {
+        try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry;
+            byte[] buf = new byte[65536];
+            while ((entry = zis.getNextEntry()) != null) {
+                File target = new File(destDir, entry.getName());
+                if (entry.isDirectory()) {
+                    target.mkdirs();
+                } else {
+                    target.getParentFile().mkdirs();
+                    try (FileOutputStream fos = new FileOutputStream(target)) {
+                        int n;
+                        while ((n = zis.read(buf)) > 0) fos.write(buf, 0, n);
+                    }
+                }
+                zis.closeEntry();
+            }
+        }
+    }
+
+    private void copyDir(File src, File dst) throws Exception {
+        dst.mkdirs();
+        File[] files = src.listFiles();
+        if (files == null) return;
+        for (File f : files) {
+            if (f.isDirectory()) copyDir(f, new File(dst, f.getName()));
+            else copyFile(f, new File(dst, f.getName()));
+        }
+    }
+
+    private void copyFile(File src, File dst) throws Exception {
+        try (FileInputStream in = new FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
+    }
+
+    // ── Whisper.cpp local transcription ───────────────────────────────────────
+
+    private ArrayList<TranscriptSegment> transcribeChunksWithWhisperCpp(ArrayList<File> chunks) throws Exception {
+        if (!WhisperEngine.isAvailable()) {
+            throw new RuntimeException("Whisper native library not available. The app must be compiled with NDK support (externalNativeBuild). Switch to Vosk in Settings or rebuild with NDK.");
+        }
+        File modelFile = new File(getFilesDir(), "whisper/ggml-base.en.bin");
+        if (!modelFile.exists()) {
+            postUi(() -> setStatus("Downloading Whisper base model (~142 MB, once only)..."));
+            downloadWhisperModel(modelFile);
+        }
+        if (!WhisperEngine.nativeInit(modelFile.getAbsolutePath())) {
+            throw new RuntimeException("Failed to load Whisper model from " + modelFile.getAbsolutePath());
+        }
+        ArrayList<TranscriptSegment> all = new ArrayList<>();
+        double chunkOffset = 0.0;
+        try {
+            for (int i = 0; i < chunks.size(); i++) {
+                File chunk = chunks.get(i);
+                final int ci = i + 1;
+                final int total = chunks.size();
+                postUi(() -> setStatus("Transcribing chunk " + ci + " of " + total + " with Whisper..."));
+                short[] pcm = decodeToPcm16000(chunk);
+                float[] floats = shortsToFloats(pcm);
+                String json = WhisperEngine.nativeTranscribe(floats, chunkOffset);
+                parseWhisperResult(json, all);
+                chunkOffset += audioDurationSeconds(chunk, LOCAL_CHUNK_SECONDS);
+            }
+        } finally {
+            WhisperEngine.nativeFree();
+        }
+        return all;
+    }
+
+    private void parseWhisperResult(String json, ArrayList<TranscriptSegment> out) {
+        try {
+            JSONArray arr = new JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                String text = obj.optString("text", "").trim();
+                double start = obj.optDouble("start", -1);
+                double end   = obj.optDouble("end",   -1);
+                if (TextUtils.isEmpty(text) || start < 0 || end <= start) continue;
+                TranscriptSegment seg = new TranscriptSegment();
+                seg.index = out.size();
+                seg.start = start; seg.end = end; seg.text = text;
+                out.add(seg);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void downloadWhisperModel(File modelFile) throws Exception {
+        modelFile.getParentFile().mkdirs();
+        File tmp = new File(getCacheDir(), "ggml-model.bin.tmp");
+        downloadFileWithProgress("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin", tmp);
+        if (!tmp.renameTo(modelFile)) {
+            copyFile(tmp, modelFile);
+            tmp.delete();
+        }
+    }
+
+    // ── Shared: model download helper ────────────────────────────────────────
+
+    private void downloadFileWithProgress(String urlStr, File dest) throws Exception {
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(30000);
+        conn.setReadTimeout(600000);
+        conn.setInstanceFollowRedirects(true);
+        long total = conn.getContentLengthLong();
+        try (InputStream in = conn.getInputStream();
+             FileOutputStream out = new FileOutputStream(dest)) {
+            byte[] buf = new byte[65536];
+            long downloaded = 0;
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                downloaded += n;
+                if (total > 0) {
+                    long pct = downloaded * 100 / total;
+                    postUi(() -> setStatus("Downloading model... " + pct + "%"));
+                }
+            }
+        }
+    }
+
+    // ── Shared: PCM audio decoding ───────────────────────────────────────────
+
+    private short[] decodeToPcm16000(File audioFile) throws Exception {
+        MediaExtractor extractor = new MediaExtractor();
+        extractor.setDataSource(audioFile.getAbsolutePath());
+        int audioTrack = -1;
+        MediaFormat trackFormat = null;
+        for (int i = 0; i < extractor.getTrackCount(); i++) {
+            MediaFormat fmt = extractor.getTrackFormat(i);
+            String mime = fmt.getString(MediaFormat.KEY_MIME);
+            if (mime != null && mime.startsWith("audio/")) {
+                audioTrack = i; trackFormat = fmt; break;
+            }
+        }
+        if (audioTrack < 0) throw new RuntimeException("No audio track in " + audioFile.getName());
+        extractor.selectTrack(audioTrack);
+
+        final int[] srcRate  = {trackFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)};
+        final int[] channels = {trackFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)};
+        String mime = trackFormat.getString(MediaFormat.KEY_MIME);
+
+        MediaCodec codec = MediaCodec.createDecoderByType(mime);
+        codec.configure(trackFormat, null, null, 0);
+        codec.start();
+
+        // Collect per-buffer mono chunks as we decode to avoid one giant ByteArrayOutputStream.
+        ArrayList<short[]> monoChunks = new ArrayList<>();
+        int totalMonoSamples = 0;
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        boolean inputDone = false;
+
+        while (true) {
+            if (!inputDone) {
+                int inIdx = codec.dequeueInputBuffer(10000);
+                if (inIdx >= 0) {
+                    ByteBuffer inBuf = codec.getInputBuffer(inIdx);
+                    int size = extractor.readSampleData(inBuf, 0);
+                    if (size < 0) {
+                        codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                        inputDone = true;
+                    } else {
+                        codec.queueInputBuffer(inIdx, 0, size, extractor.getSampleTime(), 0);
+                        extractor.advance();
+                    }
+                }
+            }
+            int outIdx = codec.dequeueOutputBuffer(info, 10000);
+            if (outIdx >= 0) {
+                if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    codec.releaseOutputBuffer(outIdx, false);
+                    break;
+                }
+                ByteBuffer outBuf = codec.getOutputBuffer(outIdx);
+                if (outBuf != null && info.size > 0) {
+                    // Convert to shorts and downmix to mono immediately — no large byte buffer.
+                    short[] buf = new short[info.size / 2];
+                    outBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(buf);
+                    short[] mono;
+                    if (channels[0] > 1) {
+                        mono = new short[buf.length / channels[0]];
+                        for (int i = 0; i < mono.length; i++) {
+                            long sum = 0;
+                            for (int c = 0; c < channels[0]; c++) sum += buf[i * channels[0] + c];
+                            mono[i] = (short)(sum / channels[0]);
+                        }
+                    } else {
+                        mono = buf;
+                    }
+                    monoChunks.add(mono);
+                    totalMonoSamples += mono.length;
+                }
+                codec.releaseOutputBuffer(outIdx, false);
+            } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                MediaFormat outFmt = codec.getOutputFormat();
+                if (outFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE))
+                    srcRate[0]  = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+                if (outFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT))
+                    channels[0] = outFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+            }
+        }
+        codec.stop();
+        codec.release();
+        extractor.release();
+
+        // Combine mono chunks into one array, then free the list before resampling.
+        short[] combined = new short[totalMonoSamples];
+        int pos = 0;
+        for (short[] chunk : monoChunks) { System.arraycopy(chunk, 0, combined, pos, chunk.length); pos += chunk.length; }
+        monoChunks.clear();
+
+        // Resample to 16000 Hz
+        if (srcRate[0] != 16000) {
+            combined = resampleLinear(combined, srcRate[0], 16000);
+        }
+        return combined;
+    }
+
+    private short[] resampleLinear(short[] input, int srcRate, int dstRate) {
+        if (srcRate == dstRate) return input;
+        int outLen = (int)((long)input.length * dstRate / srcRate);
+        short[] out = new short[outLen];
+        double step = (double)srcRate / dstRate;
+        for (int i = 0; i < outLen; i++) {
+            double pos  = i * step;
+            int idx     = (int)pos;
+            double frac = pos - idx;
+            short a = input[Math.min(idx,     input.length - 1)];
+            short b = input[Math.min(idx + 1, input.length - 1)];
+            out[i] = (short)(a + frac * (b - a));
+        }
+        return out;
+    }
+
+    private byte[] shortsToBytes(short[] shorts) {
+        ByteBuffer buf = ByteBuffer.allocate(shorts.length * 2).order(ByteOrder.LITTLE_ENDIAN);
+        buf.asShortBuffer().put(shorts);
+        return buf.array();
+    }
+
+    private float[] shortsToFloats(short[] shorts) {
+        float[] out = new float[shorts.length];
+        for (int i = 0; i < shorts.length; i++) out[i] = shorts[i] / 32768.0f;
+        return out;
+    }
+
     private ArrayList<TranscriptAdRange> mergeRanges(ArrayList<TranscriptAdRange> ranges, double bridgeGapSeconds, double minSeconds) {
         ArrayList<TranscriptAdRange> ordered = new ArrayList<>();
         for (TranscriptAdRange range : ranges) {
@@ -961,14 +1456,6 @@ public class MainActivity extends Activity {
         return finalOutput;
     }
 
-    private void copyFile(File source, File target) throws Exception {
-        try (InputStream input = new FileInputStream(source); OutputStream output = new FileOutputStream(target)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
-        }
-    }
-
     private void exportSingleRange(File source, double startSeconds, double endSeconds, File output) {
         MediaItem mediaItem = new MediaItem.Builder()
                 .setUri(Uri.fromFile(source))
@@ -1000,22 +1487,25 @@ public class MainActivity extends Activity {
         if (output.exists()) output.delete();
         final RuntimeException[] errorHolder = new RuntimeException[1];
         final CountDownLatch latch = new CountDownLatch(1);
-        Transformer transformer = new Transformer.Builder(this)
-                .addListener(new Transformer.Listener() {
-                    @Override
-                    public void onCompleted(Composition composition, ExportResult exportResult) {
-                        latch.countDown();
-                    }
-
-                    @Override
-                    public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
-                        errorHolder[0] = new RuntimeException(exportException);
-                        latch.countDown();
-                    }
-                })
-                .build();
-        Composition composition = new Composition.Builder(new EditedMediaItemSequence(items)).build();
-        transformer.start(composition, output.getAbsolutePath());
+        // Transformer requires a Looper thread; post creation and start to the main thread,
+        // then block the background worker until export finishes.
+        main.post(() -> {
+            Transformer transformer = new Transformer.Builder(this)
+                    .addListener(new Transformer.Listener() {
+                        @Override
+                        public void onCompleted(Composition composition, ExportResult exportResult) {
+                            latch.countDown();
+                        }
+                        @Override
+                        public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
+                            errorHolder[0] = new RuntimeException(exportException);
+                            latch.countDown();
+                        }
+                    })
+                    .build();
+            Composition composition = new Composition.Builder(new EditedMediaItemSequence(items)).build();
+            transformer.start(composition, output.getAbsolutePath());
+        });
         try {
             latch.await();
         } catch (InterruptedException e) {
@@ -1370,6 +1860,25 @@ public class MainActivity extends Activity {
     private static String sha(String s) { try { MessageDigest md = MessageDigest.getInstance("SHA-256"); byte[] b = md.digest(s.getBytes("UTF-8")); StringBuilder out = new StringBuilder(); for (byte x : b) out.append(String.format("%02x", x)); return out.toString(); } catch (Exception e) { return String.valueOf(s.hashCode()); } }
 
     static class Feed { Podcast podcast; ArrayList<Episode> episodes; }
+
+    // ── whisper.cpp JNI wrapper ───────────────────────────────────────────────
+    // The native library is compiled via CMake (see app/src/main/cpp/).
+    // If NDK is not installed or the build did not include native libs, isAvailable()
+    // returns false and the Whisper engine option shows a message in Settings.
+    static class WhisperEngine {
+        private static Boolean sLoaded = null;
+        static boolean isAvailable() {
+            if (sLoaded == null) {
+                try { System.loadLibrary("whisper_jni"); sLoaded = true; }
+                catch (UnsatisfiedLinkError e) { sLoaded = false; }
+            }
+            return Boolean.TRUE.equals(sLoaded);
+        }
+        static native boolean nativeInit(String modelPath);
+        static native String  nativeTranscribe(float[] samples, double offsetSeconds);
+        static native void    nativeFree();
+    }
+
     static class TranscriptSegment {
         int index;
         double start;

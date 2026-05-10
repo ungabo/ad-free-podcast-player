@@ -10,11 +10,32 @@ android {
         applicationId "com.adfreepod.player"
         minSdk 23
         targetSdk 35
-        versionCode 1
-        versionName "0.1.0"
+        versionCode 3
+        versionName "0.3.0"
+
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -O2 -fvisibility=hidden"
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DGGML_OPENMP=OFF",
+                          "-DWHISPER_BUILD_TESTS=OFF",
+                          "-DWHISPER_BUILD_EXAMPLES=OFF"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
     }
 }
 
 dependencies {
     implementation "androidx.media3:media3-transformer:1.4.1"
+    implementation "com.alphacephei:vosk-android:0.3.47"
 }
