@@ -1,0 +1,22 @@
+{
+  "name": "ad-free-podcast-player",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"No root tests configured yet\"",
+    "build:web": "npm run build -w apps/web",
+    "android:package": "powershell -NoProfile -Command \"Set-Location '.\\apps\\android'; .\\gradlew.bat assembleDebug; Copy-Item '.\\app\\build\\outputs\\apk\\debug\\app-debug.apk' '.\\Ad Free Podcast Player-debug.apk' -Force\"",
+    "windows:package": "npm run package:win -w apps/desktop",
+    "windows:run": "powershell -NoProfile -Command \"Start-Process '.\\apps\\desktop\\Ad Free Podcast Player-win32-x64\\Ad Free Podcast Player.exe'\"",
+    "install:desktop": "npm install -w apps/desktop"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

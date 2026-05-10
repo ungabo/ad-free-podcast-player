@@ -1,0 +1,366 @@
+:root {
+  color-scheme: light;
+  --player-dock-height: 0px;
+  --bg: #f3f7fb;
+  --surface: #ffffff;
+  --ink: #1f2933;
+  --muted: #667085;
+  --line: #d8e1ea;
+  --blue: #1769aa;
+  --blue-soft: #e8f2ff;
+  --green: #0f766e;
+  --green-soft: #e7f7f2;
+  --red: #be123c;
+  --red-soft: #fff0f3;
+  --amber-soft: #fff7df;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button, input, textarea, select {
+  font: inherit;
+}
+
+button {
+  min-height: 42px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--blue);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 750;
+  padding: 0 14px;
+}
+
+button:hover {
+  filter: brightness(0.96);
+}
+
+button.ghost {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+button.danger {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+input, textarea, select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  padding: 12px;
+}
+
+textarea {
+  min-height: 94px;
+  resize: vertical;
+}
+
+label {
+  display: block;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  margin: 12px 0;
+}
+
+.appShell {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #0f172a;
+  color: #e5eef9;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 22px 18px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  background: #38bdf8;
+  color: #082f49;
+  font-weight: 900;
+}
+
+.brandName {
+  font-size: 20px;
+  font-weight: 900;
+}
+
+.brandSub, .legalNote {
+  color: #b7c7d8;
+  font-size: 13px;
+}
+
+.nav {
+  display: grid;
+  gap: 8px;
+}
+
+.nav button {
+  justify-content: flex-start;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #e5eef9;
+  text-align: left;
+}
+
+.nav button.active {
+  background: #1e3a5f;
+  border-color: #38bdf8;
+}
+
+.main {
+  padding: 22px clamp(18px, 4vw, 38px) calc(var(--player-dock-height) + 42px);
+}
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.topActions, .row, .buttonRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--blue);
+  font-size: 13px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+h1, h2, h3, p {
+  margin-top: 0;
+}
+
+h1 {
+  font-size: 32px;
+}
+
+h2 {
+  font-size: 21px;
+  margin: 24px 0 12px;
+}
+
+h3 {
+  font-size: 17px;
+  margin-bottom: 6px;
+}
+
+.status {
+  background: var(--blue-soft);
+  border-radius: 8px;
+  color: #26445f;
+  margin: 16px 0;
+  padding: 12px 14px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 15px;
+}
+
+.card.compact {
+  padding: 12px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.pill {
+  display: inline-block;
+  background: var(--green-soft);
+  border-radius: 999px;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 850;
+  margin: 4px 6px 4px 0;
+  padding: 4px 8px;
+}
+
+.pill.blue {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.pill.red {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.code {
+  background: #0f172a;
+  border-radius: 8px;
+  color: #dbeafe;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+  padding: 10px;
+  white-space: pre-wrap;
+}
+
+.progressCard {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 12px;
+}
+
+.progressMeta {
+  justify-content: space-between;
+}
+
+.progressBar {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: #dbe7fb;
+  overflow: hidden;
+  margin: 8px 0 10px;
+}
+
+.progressFill {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #1769aa, #38bdf8);
+}
+
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.statGrid strong {
+  display: block;
+  margin-top: 2px;
+}
+
+.statLabel {
+  display: block;
+  font-size: 12px;
+}
+
+.episodeList {
+  display: grid;
+  gap: 12px;
+}
+
+.playerDock {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  left: calc(260px + 18px);
+  background: #0f172a;
+  border-radius: 8px;
+  color: #e5eef9;
+  padding: 10px 12px;
+  box-shadow: 0 18px 46px rgba(15, 23, 42, 0.28);
+}
+
+.playerDock.hidden {
+  display: none;
+}
+
+.playerDock audio {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.logList {
+  display: grid;
+  gap: 12px;
+}
+
+details {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 850;
+}
+
+.twoCol {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.85fr) minmax(320px, 1.15fr);
+  gap: 16px;
+}
+
+@media (max-width: 900px) {
+  .appShell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+  }
+
+  .nav {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .nav button {
+    text-align: center;
+    padding: 0 8px;
+  }
+
+  .topbar, .twoCol {
+    display: block;
+  }
+
+  .playerDock {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+  }
+}

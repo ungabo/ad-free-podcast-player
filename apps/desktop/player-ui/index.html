@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ad Free Podcast Player</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="appShell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="logo">AF</div>
+          <div>
+            <div class="brandName">Ad Free Podcast Player</div>
+            <div class="brandSub">Windows player</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <button data-route="home">Home</button>
+          <button data-route="search">Search</button>
+          <button data-route="player">Player</button>
+          <button data-route="adremover">Ad remover</button>
+          <button data-route="settings">Settings</button>
+          <button data-route="debug">Debug</button>
+        </nav>
+        <div class="legalNote">
+          Podcast player first. Ad removal is an optional local tool inside the same Windows app.
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="eyebrow">Windows desktop build</p>
+            <h1 id="screenTitle">Home</h1>
+          </div>
+          <div class="topActions">
+            <button id="sampleFeedBtn" class="ghost">Sample Omny Feed</button>
+            <button id="smartlessBtn" class="ghost">SmartLess Feed</button>
+          </div>
+        </header>
+
+        <section id="status" class="status">Ready.</section>
+        <section id="screen"></section>
+      </main>
+    </div>
+
+    <div id="playerDock" class="playerDock hidden"></div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

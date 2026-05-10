@@ -1,0 +1,48 @@
+{
+  "name": "desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Ad Free Podcast Player desktop shell",
+  "author": "Ad Free Podcast Player",
+  "main": "src/main.js",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron .",
+    "package:win": "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '.\\Ad Free Podcast Player-win32-x64' -ErrorAction SilentlyContinue; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue; npx @electron/packager . 'Ad Free Podcast Player' --platform=win32 --arch=x64 --out .\\dist --overwrite --asar --ignore=renderer --ignore=dist --ignore='Ad Free Podcast Player-win32-x64'; Move-Item '.\\dist\\Ad Free Podcast Player-win32-x64' '.\\Ad Free Podcast Player-win32-x64'; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue\""
+  },
+  "devDependencies": {
+    "@electron/get": "^2.0.3",
+    "@electron/packager": "^18.3.2",
+    "electron": "37.7.1",
+    "electron-builder": "^24.13.3",
+    "electron-packager": "^17.1.2"
+  },
+  "build": {
+    "appId": "com.adfreepod.player.desktop",
+    "productName": "Ad Free Podcast Player",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!dist/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
