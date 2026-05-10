@@ -37,6 +37,15 @@ function isPathInside(rootDir, candidatePath) {
   return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
 }
 
+function isAllowedTarget(target) {
+  try {
+    const u = new URL(target);
+    return u.protocol === 'https:' || u.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 async function moveFile(sourcePath, destinationPath) {
   await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
   if (path.resolve(sourcePath) === path.resolve(destinationPath)) {
@@ -59,6 +68,159 @@ async function moveFile(sourcePath, destinationPath) {
   }
 }
 
+async function cleanupEpisodeFiles(offlineDir, episodeId, keepPath) {
+  if (!episodeId) {
+    return { removedPaths: [], keptPath: keepPath };
+  }
+
+  const safeEpisodeKey = safeFilename(episodeId);
+  const prefix = `${safeEpisodeKey}-`;
+  const removedPaths = [];
+  const entries = await fs.promises.readdir(offlineDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!entry.name.startsWith(prefix)) continue;
+    const candidate = path.join(offlineDir, entry.name);
+    if (path.resolve(candidate) === path.resolve(keepPath)) continue;
+    await fs.promises.rm(candidate, { force: true }).catch(() => {});
+    removedPaths.push(candidate);
+  }
+
+  return { removedPaths, keptPath: keepPath };
+}
+
+function extensionFromTarget(target, contentType) {
+  const pathname = (() => {
+    try {
+      return new URL(target).pathname;
+    } catch {
+      return '';
+    }
+  })();
+  const fromPath = path.extname(pathname || '').toLowerCase();
+  if (fromPath && fromPath.length <= 5) {
+    return fromPath;
+  }
+  if ((contentType || '').includes('audio/mp4') || (contentType || '').includes('audio/x-m4a')) {
+    return '.m4a';
+  }
+  if ((contentType || '').includes('audio/aac')) {
+    return '.aac';
+  }
+  if ((contentType || '').includes('audio/wav')) {
+    return '.wav';
+  }
+  return '.mp3';
+}
+
+async function downloadEpisodeOffline({ url, title, keyHint, episodeId }, onProgress) {
+  if (!isAllowedTarget(url)) {
+    throw new Error('Expected a full http(s) URL.');
+  }
+
+  const offlineDir = getOfflineAudioDir();
+  await fs.promises.mkdir(offlineDir, { recursive: true });
+
+  onProgress({ type: 'status', stage: 'Downloading audio', line: 'Preparing download...', percent: 0, episodeId });
+  const response = await fetch(url, {
+    redirect: 'follow',
+    headers: {
+      'user-agent': 'Mozilla/5.0 AdFreePodcastPlayer/1.0',
+      accept: '*/*',
+    },
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Save offline failed (${response.status})`);
+  }
+
+  const extension = extensionFromTarget(response.url || url, response.headers.get('content-type') || '');
+  const base = safeFilename(title || keyHint || 'podcast-episode');
+  const relativePath = `${safeFilename(keyHint || base)}-${base}${extension}`;
+  const finalPath = path.join(offlineDir, relativePath);
+  const tempPath = `${finalPath}.download`;
+
+  const totalBytes = Number(response.headers.get('content-length') || 0);
+  let downloadedBytes = 0;
+  let lastEmitAt = 0;
+  const writer = fs.createWriteStream(tempPath);
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      downloadedBytes += value.byteLength;
+      writer.write(Buffer.from(value));
+      const now = Date.now();
+      if (now - lastEmitAt >= 250) {
+        const percent = totalBytes > 0 ? Math.min(100, (downloadedBytes * 100) / totalBytes) : 0;
+        onProgress({
+          type: 'progress',
+          stage: 'Downloading audio',
+          line: totalBytes > 0
+            ? `Downloading... ${Math.round(percent)}% (${downloadedBytes}/${totalBytes} bytes)`
+            : `Downloading... ${downloadedBytes} bytes`,
+          percent,
+          episodeId,
+          downloadedBytes,
+          totalBytes,
+        });
+        lastEmitAt = now;
+      }
+    }
+    await new Promise((resolve, reject) => {
+      writer.end((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  } catch (error) {
+    writer.destroy();
+    await fs.promises.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+
+  await fs.promises.rm(finalPath, { force: true }).catch(() => {});
+  await fs.promises.rename(tempPath, finalPath);
+  const stat = await fs.promises.stat(finalPath);
+  onProgress({
+    type: 'progress',
+    stage: 'Download complete',
+    line: 'Download complete: 100%',
+    percent: 100,
+    episodeId,
+    downloadedBytes: stat.size,
+    totalBytes: totalBytes || stat.size,
+  });
+
+  return {
+    ok: true,
+    requestedUrl: url,
+    finalUrl: response.url,
+    relativePath: normalizeRelativePath(finalPath, offlineDir),
+    filePath: finalPath,
+    size: stat.size,
+    finishedAt: new Date().toISOString(),
+  };
+}
+
+async function deleteOfflineAudioSource({ filePath }) {
+  if (!filePath) {
+    throw new Error('No file path was provided.');
+  }
+
+  const offlineDir = getOfflineAudioDir();
+  if (!isPathInside(offlineDir, filePath)) {
+    throw new Error('Refusing to delete a file outside the offline audio cache.');
+  }
+
+  await fs.promises.rm(filePath, { force: true });
+  return { ok: true, filePath };
+}
+
 async function promoteEpisodeAudioSource({ editedAudioPath, episodeId, title, previousSourcePath }) {
   if (!editedAudioPath || !fs.existsSync(editedAudioPath)) {
     throw new Error(`Edited audio not found: ${editedAudioPath || 'missing path'}`);
@@ -71,15 +233,22 @@ async function promoteEpisodeAudioSource({ editedAudioPath, episodeId, title, pr
 
   await moveFile(editedAudioPath, targetPath);
 
+  let removedPreviousSource = false;
   if (previousSourcePath && path.resolve(previousSourcePath) !== path.resolve(targetPath) && isPathInside(offlineDir, previousSourcePath)) {
     await fs.promises.rm(previousSourcePath, { force: true }).catch(() => {});
+    removedPreviousSource = true;
   }
+
+  const cleanup = await cleanupEpisodeFiles(offlineDir, episodeId, targetPath);
 
   return {
     ok: true,
     filePath: targetPath,
     relativePath: normalizeRelativePath(targetPath, offlineDir),
     size: fs.statSync(targetPath).size,
+    removedPreviousSource,
+    removedSiblingFiles: cleanup.removedPaths,
+    keptPath: cleanup.keptPath,
   };
 }
 
@@ -215,6 +384,31 @@ ipcMain.handle('desktop:pick-audio-file', async () => {
 
 ipcMain.handle('desktop:promote-episode-audio-source', async (_evt, payload) => {
   return promoteEpisodeAudioSource(payload || {});
+});
+
+ipcMain.handle('desktop:download-episode-offline', async (_evt, payload) => {
+  const eventSink = (event) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('download:event', event);
+    }
+  };
+
+  try {
+    return await downloadEpisodeOffline(payload || {}, eventSink);
+  } catch (error) {
+    eventSink({
+      type: 'error',
+      stage: 'Download failed',
+      line: error.message,
+      percent: 0,
+      episodeId: payload?.episodeId || '',
+    });
+    throw error;
+  }
+});
+
+ipcMain.handle('desktop:delete-offline-audio-source', async (_evt, payload) => {
+  return deleteOfflineAudioSource(payload || {});
 });
 
 ipcMain.handle('desktop:run-processing', async (_evt, payload) => {

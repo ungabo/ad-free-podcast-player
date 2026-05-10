@@ -10,6 +10,11 @@ let selectedPodcastId = "";
 let selectedEpisodeId = "";
 const runtime = {
   desktop: { connected: false, adCutForgeRoot: "", stateFilePath: "" },
+  downloads: {},
+  activity: {
+    lines: [],
+    lastHeartbeatAt: 0,
+  },
   adRemover: {
     isRunning: false,
     logs: [],
@@ -25,6 +30,7 @@ let lastStateSaveError = "";
 const els = {
   title: document.querySelector("#screenTitle"),
   eyebrow: document.querySelector("#eyebrow"),
+  activityPanel: document.querySelector("#activityPanel"),
   status: document.querySelector("#status"),
   screen: document.querySelector("#screen"),
   playerDock: document.querySelector("#playerDock"),
@@ -40,6 +46,7 @@ function createDefaultState() {
     settings: { autoplayNext: false, seekBack: 15, seekForward: 30, retentionDays: 30 },
     adRemover: {
       openAiKey: "",
+      openAiModel: "gpt-4.1-mini",
       detectionMode: "local",
       backend: "parakeet",
       removeOriginal: true,
@@ -163,6 +170,152 @@ function setStatus(message, kind = "") {
   els.status.textContent = message;
 }
 
+function pushActivityLine(message, type = "info") {
+  if (!message) return;
+  runtime.activity.lines.unshift({
+    at: new Date().toLocaleTimeString(),
+    message: String(message),
+    type,
+  });
+  runtime.activity.lines = runtime.activity.lines.slice(0, 80);
+  renderActivityPanel();
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (!value) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function renderActivityPanel() {
+  if (!els.activityPanel) return;
+
+  const adState = adRemoverState();
+  const activeDownloads = Object.values(runtime.downloads).filter((entry) => entry?.isRunning);
+  const adEpisode = adState.episodeId ? state.episodes[adState.episodeId] : null;
+  const secSinceHB = runtime.activity.lastHeartbeatAt
+    ? Math.floor((Date.now() - runtime.activity.lastHeartbeatAt) / 1000)
+    : null;
+  const isAdRunning = runtime.adRemover.isRunning;
+
+  els.activityPanel.className = isAdRunning
+    ? "activityPanel activityPanel--adRunning"
+    : (activeDownloads.length ? "activityPanel activityPanel--downloading" : "activityPanel");
+
+  const sections = [];
+
+  if (isAdRunning) {
+    const percent = Math.max(0, Math.min(100, Number(runtime.adRemover.percent) || 0));
+    const elapsedS = runtime.adRemover.startedAt ? Math.floor((Date.now() - runtime.adRemover.startedAt) / 1000) : 0;
+    const elapsedText = formatRuntime(elapsedS);
+    const etaText = percent > 1 && percent < 100 ? formatRuntime((elapsedS * (100 - percent)) / percent) : "--:--";
+
+    // Heartbeat health
+    let heartbeatHtml;
+    if (secSinceHB === null) {
+      heartbeatHtml = `<span class="hb hb--waiting">Waiting for first output...</span>`;
+    } else if (secSinceHB < 30) {
+      heartbeatHtml = `<span class="hb hb--ok">&#9679; Running — last output ${secSinceHB}s ago</span>`;
+    } else if (secSinceHB < 120) {
+      heartbeatHtml = `<span class="hb hb--slow">&#9650; No output for ${secSinceHB}s — still running (normal during transcription)</span>`;
+    } else {
+      heartbeatHtml = `<span class="hb hb--stale">&#9888; No output for ${secSinceHB}s — process may be stuck</span>`;
+    }
+
+    // Engine label
+    const engineLabel = adState.backend === "parakeet" ? "Parakeet (NVIDIA, local GPU)"
+      : adState.backend === "whisper" ? "Whisper (local CPU)"
+      : adState.backend === "openai-whisper" ? "OpenAI Whisper API (cloud)"
+      : escapeHtml(adState.backend || "unknown");
+
+    // Recent ad-remover log lines (last 8, strip the [type] prefix noise for readability)
+    const recentLogs = runtime.adRemover.logs.slice(-8).map((line) =>
+      escapeHtml(line.replace(/^\[(stdout|stderr|status|progress)\]\s*/i, "").trim())
+    ).filter(Boolean);
+
+    // Pull out any error lines from recent logs
+    const errorLines = runtime.adRemover.logs
+      .filter((l) => /\[error\]|error:|failed|exception|traceback/i.test(l))
+      .slice(-3)
+      .map((l) => escapeHtml(l.replace(/^\[\w+\]\s*/, "").trim()));
+
+    sections.push(`
+      <div class="adRunPanel">
+        <div class="adRunPanel__header">
+          <span class="adRunPanel__spinner"></span>
+          <strong>Removing ads</strong>
+          <span class="adRunPanel__episode">${escapeHtml(adEpisode?.title || adState.selectedFile ? adState.selectedFile.split(/[\\/]/).pop() : "Selected file")}</span>
+        </div>
+
+        <div class="adRunPanel__meta">
+          <span><em>Engine:</em> ${engineLabel}</span>
+          <span><em>Detection:</em> ${escapeHtml(adState.detectionMode || "local")}</span>
+          <span><em>Elapsed:</em> ${elapsedText}</span>
+          <span><em>ETA:</em> ${etaText}</span>
+        </div>
+
+        <div class="adRunPanel__stepRow">
+          <span class="adRunPanel__step">${escapeHtml(runtime.adRemover.stage || "Working")}</span>
+          <span class="adRunPanel__pct">${Math.round(percent)}%</span>
+        </div>
+        <div class="adRunPanel__bar"><div class="adRunPanel__fill" style="width:${percent}%"></div></div>
+
+        <div class="adRunPanel__hb">${heartbeatHtml}</div>
+
+        ${errorLines.length ? `
+          <div class="adRunPanel__errors">
+            <strong>Issues detected:</strong>
+            <pre>${errorLines.join("\n")}</pre>
+          </div>` : ""}
+
+        ${recentLogs.length ? `
+          <div class="adRunPanel__logWrap">
+            <div class="adRunPanel__logLabel">Recent output</div>
+            <div class="adRunPanel__log">${recentLogs.join("\n")}</div>
+          </div>` : ""}
+      </div>
+    `);
+  }
+
+  if (activeDownloads.length) {
+    sections.push(`
+      <div class="activitySection">
+        <strong>Downloads in progress</strong>
+        ${activeDownloads.map((entry) => {
+          const ep = state.episodes[entry.episodeId] || {};
+          const percent = Math.round(entry.percent || 0);
+          const transferred = entry.totalBytes
+            ? `${formatBytes(entry.downloadedBytes)} / ${formatBytes(entry.totalBytes)}`
+            : formatBytes(entry.downloadedBytes);
+          return `<div class="muted">${escapeHtml(ep.title || "Episode")} — ${percent}% (${transferred})</div>`;
+        }).join("")}
+      </div>
+    `);
+  }
+
+  if (!isAdRunning) {
+    const recent = runtime.activity.lines.slice(0, 6);
+    if (recent.length) {
+      sections.push(`
+        <div class="activitySection">
+          <strong>Recent activity</strong>
+          <div class="activityLog">${recent.map((line) => `${escapeHtml(line.at)} | ${escapeHtml(line.message)}`).join("\n")}</div>
+        </div>
+      `);
+    }
+  }
+
+  if (!sections.length) {
+    els.activityPanel.innerHTML = "";
+    return;
+  }
+
+  els.activityPanel.innerHTML = sections.join("");
+}
+
 function setRoute(next, args = {}) {
   route = next;
   if (args.podcastId) selectedPodcastId = args.podcastId;
@@ -182,6 +335,7 @@ function adRemoverState() {
   if (!state.adRemover) {
     state.adRemover = {
       openAiKey: "",
+      openAiModel: "gpt-4.1-mini",
       detectionMode: "local",
       backend: "parakeet",
       removeOriginal: true,
@@ -190,6 +344,7 @@ function adRemoverState() {
       lastResult: null,
     };
   }
+  if (!state.adRemover.openAiModel) state.adRemover.openAiModel = "gpt-4.1-mini";
   return state.adRemover;
 }
 
@@ -232,6 +387,14 @@ function startAdProgressTimer() {
   stopAdProgressTimer();
   runtime.adRemover.timerId = window.setInterval(() => {
     updateAdProgressPanel();
+    // On any route other than the adremover screen, do a full re-render so
+    // episode cards on home/podcast/episode pages stay updated with the
+    // current ad-removal progress (removing-ads note, pill, etc.).
+    if (route !== "adremover" && runtime.adRemover.isRunning) {
+      render(); // render() calls renderActivityPanel() internally
+    } else {
+      renderActivityPanel();
+    }
   }, 1000);
 }
 
@@ -255,6 +418,7 @@ async function initializeDesktopBridge() {
   }
 
   window.desktopApi.onProcessingEvent((event) => {
+    runtime.activity.lastHeartbeatAt = Date.now();
     runtime.adRemover.logs = [...runtime.adRemover.logs, `[${event.type}] ${event.line}`].slice(-120);
     if (typeof event.percent === "number") {
       runtime.adRemover.percent = event.percent;
@@ -262,16 +426,49 @@ async function initializeDesktopBridge() {
     if (event.stage) {
       runtime.adRemover.stage = event.stage;
     }
+    pushActivityLine(`[ad-removal/${event.type}] ${event.line}`, event.type);
     updateAdLogPanel();
     updateAdProgressPanel();
     if (route !== "adremover" && runtime.adRemover.isRunning && event.stage) {
       setStatus(`${event.stage}: ${String(event.line || "Working...").replace(/\s+/g, " ").trim()}`);
+    }
+    if (route !== "adremover") {
+      render();
+    } else {
+      renderActivityPanel();
+    }
+  });
+
+  window.desktopApi.onDownloadEvent?.((event) => {
+    runtime.activity.lastHeartbeatAt = Date.now();
+    const episodeId = event.episodeId || "";
+    if (episodeId) {
+      const existing = runtime.downloads[episodeId] || { episodeId, isRunning: true, percent: 0, downloadedBytes: 0, totalBytes: 0, stage: "" };
+      runtime.downloads[episodeId] = {
+        ...existing,
+        isRunning: event.type !== "error" && (event.percent ?? 0) < 100,
+        percent: typeof event.percent === "number" ? event.percent : existing.percent,
+        downloadedBytes: typeof event.downloadedBytes === "number" ? event.downloadedBytes : existing.downloadedBytes,
+        totalBytes: typeof event.totalBytes === "number" ? event.totalBytes : existing.totalBytes,
+        stage: event.stage || existing.stage,
+        lastLine: event.line || existing.lastLine,
+      };
+      if (event.type === "error" || (typeof event.percent === "number" && event.percent >= 100)) {
+        runtime.downloads[episodeId].isRunning = false;
+      }
+    }
+    pushActivityLine(`[download/${event.type}] ${event.line || event.stage || "update"}`, event.type || "status");
+    if (route !== "adremover") {
+      render();
+    } else {
+      renderActivityPanel();
     }
   });
 
   if (route === "adremover") {
     renderAdRemover();
   }
+  renderActivityPanel();
 }
 
 async function sha256(text) {
@@ -437,15 +634,39 @@ function podcastEpisodes(podcastId, filter = "All") {
 function episodeIndicators(episode) {
   const progress = state.progress[episode.id]?.positionSeconds || 0;
   const percent = state.progress[episode.id]?.percentComplete || 0;
+  const downloadRuntime = runtime.downloads[episode.id];
   const pills = [];
   if (episode.isNew) pills.push("New");
   if (episode.isListened) pills.push("Listened");
   else if (progress > 0 && percent < 95) pills.push("In progress");
   if (episode.downloadStatus === "downloaded") pills.push("Downloaded");
+  if (episode.downloadStatus === "downloading" || downloadRuntime?.isRunning) pills.push("Downloading...");
   if (episode.offlineRelativePath) pills.push("Offline saved");
   if (episode.adSupportedStatus === "processed") pills.push("Ad free");
   if (episode.adSupportedStatus === "no_ads_found") pills.push("No ads found");
+  if (episode.adSupportedStatus === "processing") pills.push("Removing ads");
   return pills.map((pill) => `<span class="pill blue">${escapeHtml(pill)}</span>`).join("");
+}
+
+function episodeOperationMessage(episode) {
+  const downloadRuntime = runtime.downloads[episode.id];
+  if (episode.downloadStatus === "downloading" || downloadRuntime?.isRunning) {
+    const percent = Math.round(downloadRuntime?.percent || 0);
+    const bytes = downloadRuntime?.totalBytes
+      ? `${formatBytes(downloadRuntime?.downloadedBytes || 0)} / ${formatBytes(downloadRuntime.totalBytes)}`
+      : formatBytes(downloadRuntime?.downloadedBytes || 0);
+    return `Downloading... ${percent}% (${bytes})`;
+  }
+
+  if (episode.adSupportedStatus === "processing") {
+    return "removing ads. please wait. this could take some time";
+  }
+
+  if (episode.adSupportedStatus === "failed" && episode.adSupportedError) {
+    return `Ad removal failed: ${episode.adSupportedError}`;
+  }
+
+  return "";
 }
 
 function episodeAudioUrl(episode) {
@@ -499,6 +720,9 @@ async function promoteEpisodeSourceToAdFree(episodeId, result, sourceLabel) {
     editedAudio: promoted.filePath,
     promotedSourcePath: promoted.filePath,
     promotedSourceRelativePath: promoted.relativePath,
+    removedPreviousSource: promoted.removedPreviousSource,
+    removedSiblingFiles: promoted.removedSiblingFiles || [],
+    keptPath: promoted.keptPath || promoted.filePath,
     runSummary: result.runSummary
       ? `${result.runSummary}\nEpisode playback now uses the ad-free copy.`
       : "Episode playback now uses the ad-free copy.",
@@ -548,6 +772,7 @@ function render() {
   if (route === "adremover") renderAdRemover();
   if (route === "settings") renderSettings();
   if (route === "debug") renderDebug();
+  renderActivityPanel();
   renderPlayerDock();
 }
 
@@ -664,18 +889,24 @@ function episodeCard(episode) {
   const podcast = state.podcasts[episode.podcastId];
   const progress = state.progress[episode.id]?.positionSeconds || 0;
   const title = escapeHtml(episode.title);
+  const downloadRuntime = runtime.downloads[episode.id];
+  const isDownloading = episode.downloadStatus === "downloading" || downloadRuntime?.isRunning;
   const isProcessingThisEpisode = runtime.adRemover.isRunning && episode.offlineFilePath && adRemoverState().selectedFile === episode.offlineFilePath;
+  const operationMessage = episodeOperationMessage(episode);
   return `
     <article class="card compact">
       <h3>${title}</h3>
       <div class="muted">${escapeHtml(podcast?.title || "")} ${episode.pubDate ? `| ${escapeHtml(episode.pubDate)}` : ""} ${episode.durationSeconds ? `| ${formatDuration(episode.durationSeconds)}` : ""}</div>
       <div>${episodeIndicators(episode)}</div>
+      ${operationMessage ? `<p class="opNote">${escapeHtml(operationMessage)}</p>` : ""}
       <div class="buttonRow">
         <button data-play="${episode.id}">${progress ? "Resume" : "Play"}</button>
         <button class="ghost" data-details="${episode.id}">Details</button>
-        <button class="ghost" data-save-offline="${episode.id}">${episode.offlineRelativePath ? "Saved offline" : "Save offline"}</button>
+        <button class="ghost" data-save-offline="${episode.id}" ${isDownloading ? "disabled" : ""}>${episode.offlineRelativePath ? "Saved offline" : "Save offline"}</button>
+        <button data-download-remove="${episode.id}" ${isDownloading || isProcessingThisEpisode ? "disabled" : ""}>${isDownloading ? "Downloading..." : isProcessingThisEpisode ? "Removing ads..." : "Download and remove ads"}</button>
         ${episode.offlineFilePath ? `<button data-remove-ads-now="${episode.id}" ${isProcessingThisEpisode ? "disabled" : ""}>${isProcessingThisEpisode ? "Processing..." : "Remove ads"}</button>` : ""}
         ${episode.offlineFilePath ? `<button class="ghost" data-use-offline-ad="${episode.id}">Open in ad remover</button>` : ""}
+        ${episode.offlineFilePath ? `<button class="danger" title="Delete downloaded file" data-delete-offline="${episode.id}">🗑 Delete file</button>` : ""}
         <a class="downloadLink" href="/api/download?url=${encodeURIComponent(episode.enclosureUrl)}&filename=${encodeURIComponent(episode.title)}" data-download="${episode.id}"><button type="button" class="ghost">Download MP3</button></a>
       </div>
     </article>
@@ -689,6 +920,9 @@ function renderEpisode() {
     return;
   }
   const podcast = state.podcasts[episode.podcastId];
+  const downloadRuntime = runtime.downloads[episode.id];
+  const isDownloading = episode.downloadStatus === "downloading" || downloadRuntime?.isRunning;
+  const operationMessage = episodeOperationMessage(episode);
   setTitle("Episode", podcast?.title || "Episode detail");
   setStatus("Episode detail shows the exact audio enclosure URL used for playback and download.");
   els.screen.innerHTML = `
@@ -696,13 +930,16 @@ function renderEpisode() {
       <h2>${escapeHtml(episode.title)}</h2>
       <div class="muted">${escapeHtml(podcast?.title || "")} ${episode.pubDate ? `| ${escapeHtml(episode.pubDate)}` : ""}</div>
       <div>${episodeIndicators(episode)}</div>
+      ${operationMessage ? `<p class="opNote">${escapeHtml(operationMessage)}</p>` : ""}
       <h3>Audio enclosure URL</h3>
       <div class="code">${escapeHtml(episode.enclosureUrl)}</div>
       <div class="buttonRow">
         <button data-play="${episode.id}">Play / Resume</button>
-        <button class="ghost" data-save-offline="${episode.id}">${episode.offlineRelativePath ? "Saved offline" : "Save offline"}</button>
+        <button class="ghost" data-save-offline="${episode.id}" ${isDownloading ? "disabled" : ""}>${episode.offlineRelativePath ? "Saved offline" : "Save offline"}</button>
+        <button data-download-remove="${episode.id}" ${isDownloading || episode.adSupportedStatus === "processing" ? "disabled" : ""}>${isDownloading ? "Downloading..." : episode.adSupportedStatus === "processing" ? "Removing ads..." : "Download and remove ads"}</button>
         ${episode.offlineFilePath ? `<button data-remove-ads-now="${episode.id}" ${runtime.adRemover.isRunning && adRemoverState().selectedFile === episode.offlineFilePath ? "disabled" : ""}>${runtime.adRemover.isRunning && adRemoverState().selectedFile === episode.offlineFilePath ? "Processing..." : "Remove ads"}</button>` : ""}
         ${episode.offlineFilePath ? `<button class="ghost" data-use-offline-ad="${episode.id}">Open in ad remover</button>` : ""}
+        ${episode.offlineFilePath ? `<button class="danger" title="Delete downloaded file" data-delete-offline="${episode.id}">🗑 Delete file</button>` : ""}
         <a href="/api/download?url=${encodeURIComponent(episode.enclosureUrl)}&filename=${encodeURIComponent(episode.title)}" data-download="${episode.id}"><button type="button" class="ghost">Download MP3</button></a>
         <button class="ghost" data-head="${episode.enclosureUrl}">HEAD check</button>
         <button class="ghost" data-probe="${episode.enclosureUrl}">Probe first 4 KB</button>
@@ -794,22 +1031,125 @@ async function saveEpisodeOffline(episodeId) {
   const episode = state.episodes[episodeId];
   if (!episode) return;
 
-  if (episode.offlineFilePath && episode.offlineRelativePath) {
+  if (episode.downloadStatus === "downloading" || runtime.downloads[episodeId]?.isRunning) {
+    setStatus(`Download already in progress for ${episode.title}.`);
+    return;
+  }
+
+  if (episode.offlineFilePath && episode.offlineRelativePath && episode.downloadStatus === "downloaded") {
     setStatus(`Already saved offline: ${episode.title}`);
     return;
   }
 
-  setStatus(`Saving ${episode.title} for offline playback...`);
-  const payload = await callApi(
-    "Save offline episode",
-    `/api/save-offline?url=${encodeURIComponent(episode.enclosureUrl)}&filename=${encodeURIComponent(episode.title)}&key=${encodeURIComponent(episode.id)}`,
-  );
-  episode.offlineRelativePath = payload.relativePath;
-  episode.offlineFilePath = payload.filePath;
-  episode.downloadStatus = "downloaded";
-  episode.downloadedAt = nowIso();
+  episode.downloadStatus = "downloading";
+  runtime.downloads[episodeId] = {
+    episodeId,
+    isRunning: true,
+    percent: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+    stage: "Starting",
+    lastLine: "Preparing download",
+  };
   saveState();
-  setStatus(`Saved offline: ${episode.title}`);
+  render();
+  setStatus(`Downloading ${episode.title}...`);
+  pushActivityLine(`Download started for ${episode.title}`);
+
+  try {
+    let payload;
+    if (window.desktopApi?.downloadEpisodeOffline) {
+      payload = await window.desktopApi.downloadEpisodeOffline({
+        url: episode.enclosureUrl,
+        title: episode.title,
+        keyHint: episode.id,
+        episodeId,
+      });
+    } else {
+      payload = await callApi(
+        "Save offline episode",
+        `/api/save-offline?url=${encodeURIComponent(episode.enclosureUrl)}&filename=${encodeURIComponent(episode.title)}&key=${encodeURIComponent(episode.id)}`,
+      );
+    }
+
+    episode.offlineRelativePath = payload.relativePath;
+    episode.offlineFilePath = payload.filePath;
+    episode.downloadStatus = "downloaded";
+    episode.downloadedAt = nowIso();
+    runtime.downloads[episodeId] = {
+      ...(runtime.downloads[episodeId] || {}),
+      episodeId,
+      isRunning: false,
+      percent: 100,
+      downloadedBytes: payload.size || runtime.downloads[episodeId]?.downloadedBytes || 0,
+      totalBytes: payload.size || runtime.downloads[episodeId]?.totalBytes || 0,
+      stage: "Download complete",
+      lastLine: "Download complete",
+    };
+    saveState();
+    setStatus(`Saved offline: ${episode.title}`);
+    pushActivityLine(`Download complete for ${episode.title}`);
+    render();
+    return payload;
+  } catch (error) {
+    episode.downloadStatus = "not_downloaded";
+    runtime.downloads[episodeId] = {
+      ...(runtime.downloads[episodeId] || {}),
+      episodeId,
+      isRunning: false,
+      stage: "Download failed",
+      lastLine: error.message,
+    };
+    saveState();
+    setStatus(`Save offline failed: ${error.message}`);
+    pushActivityLine(`Download failed for ${episode.title}: ${error.message}`, "error");
+    render();
+    throw error;
+  }
+}
+
+async function downloadAndRemoveAdsForEpisode(episodeId) {
+  const episode = state.episodes[episodeId];
+  if (!episode) return;
+  if (runtime.adRemover.isRunning && adRemoverState().episodeId === episodeId) {
+    setStatus(`Ad removal is already running for ${episode.title}.`);
+    return;
+  }
+
+  if (!episode.offlineFilePath || episode.downloadStatus !== "downloaded") {
+    await saveEpisodeOffline(episodeId);
+  }
+
+  await removeAdsForEpisode(episodeId);
+}
+
+async function deleteOfflineEpisodeFile(episodeId) {
+  const episode = state.episodes[episodeId];
+  if (!episode?.offlineFilePath) {
+    setStatus("This episode has no downloaded file to delete.");
+    return;
+  }
+  if (episode.downloadStatus === "downloading" || runtime.downloads[episodeId]?.isRunning) {
+    setStatus("Wait for the active download to finish before deleting the file.");
+    return;
+  }
+  if (episode.adSupportedStatus === "processing") {
+    setStatus("Wait for ad removal to finish before deleting the file.");
+    return;
+  }
+  if (!confirm(`Delete downloaded file for \"${episode.title}\"?`)) return;
+
+  if (window.desktopApi?.deleteOfflineAudioSource) {
+    await window.desktopApi.deleteOfflineAudioSource({ filePath: episode.offlineFilePath });
+  }
+  episode.offlineFilePath = "";
+  episode.offlineRelativePath = "";
+  episode.downloadStatus = "not_downloaded";
+  episode.adSupportedStatus = "";
+  episode.adSupportedError = "";
+  saveState();
+  setStatus(`Deleted downloaded file for ${episode.title}.`);
+  pushActivityLine(`Deleted offline file for ${episode.title}`);
   render();
 }
 
@@ -851,6 +1191,10 @@ async function runAdRemoval(options = {}) {
       ? state.episodes[adState.episodeId] || null
       : findEpisodeBySourceFile(adState.selectedFile);
   const targetEpisodeId = targetEpisode?.id || "";
+  if (targetEpisode) {
+    targetEpisode.adSupportedStatus = "processing";
+    targetEpisode.adSupportedError = "";
+  }
   const removeOriginalAfterExport = adState.removeOriginal && !isOfflineSavedEpisodeFile(adState.selectedFile);
 
   runtime.adRemover.isRunning = true;
@@ -864,6 +1208,7 @@ async function runAdRemoval(options = {}) {
   startAdProgressTimer();
   adState.lastResult = null;
   saveState();
+  pushActivityLine(`Ad removal started for ${sourceLabel}. Engine: ${adState.backend}, detection: ${adState.detectionMode}`);
   if (!preserveRoute || route === "adremover") {
     renderAdRemover();
   }
@@ -874,7 +1219,7 @@ async function runAdRemoval(options = {}) {
       filePath: adState.selectedFile,
       settings: {
         openAiApiKey: adState.openAiKey,
-        openAiModel: "gpt-4o-mini",
+        openAiModel: adState.openAiModel || "gpt-4.1-mini",
         transcriptionBackend: adState.backend,
         detectionMode: adState.detectionMode,
         parakeetPythonPath: "",
@@ -886,15 +1231,30 @@ async function runAdRemoval(options = {}) {
     adState.lastResult = targetEpisodeId
       ? await promoteEpisodeSourceToAdFree(targetEpisodeId, result, sourceLabel)
       : result;
+    if (targetEpisode) {
+      targetEpisode.adSupportedStatus = "processed";
+      targetEpisode.adSupportedError = "";
+    }
     saveState();
+    if (adState.lastResult?.promotedSourcePath) {
+      const removedCount = Array.isArray(adState.lastResult.removedSiblingFiles)
+        ? adState.lastResult.removedSiblingFiles.length
+        : 0;
+      pushActivityLine(`Ad-free file active for ${sourceLabel}. Cleanup removed ${removedCount} older file(s).`);
+    }
     setStatus(
       targetEpisodeId
-        ? `Ad-free export finished. ${sourceLabel} now plays from the cleaned file.`
+        ? `Ad-free export finished. ${sourceLabel} now plays from the cleaned file. Confirmed: only the ad-free file is kept for this episode.`
         : `Ad-free export finished for ${sourceLabel}.`,
     );
   } catch (error) {
+    if (targetEpisode) {
+      targetEpisode.adSupportedStatus = "failed";
+      targetEpisode.adSupportedError = error.message;
+    }
     runtime.adRemover.stage = "Failed";
     runtime.adRemover.logs = [...runtime.adRemover.logs, `[error] ${error.message}`].slice(-120);
+    pushActivityLine(`Ad removal failed for ${sourceLabel}: ${error.message}`, "error");
     updateAdLogPanel();
     updateAdProgressPanel();
     setStatus(`Ad removal failed for ${sourceLabel}: ${error.message}`);
@@ -910,6 +1270,7 @@ async function runAdRemoval(options = {}) {
     } else {
       render();
     }
+    renderActivityPanel();
   }
 }
 
@@ -962,6 +1323,9 @@ function renderAdRemover() {
             <option value="openai" ${adState.detectionMode === "openai" ? "selected" : ""}>OpenAI only</option>
           </select>
         </label>
+        <label>OpenAI model — type the model ID directly (e.g. gpt-4.1-mini, gpt-4.5, o3, o4-mini)
+          <input id="adOpenAiModel" value="${escapeHtml(adState.openAiModel || "gpt-4.1-mini")}" placeholder="gpt-4.1-mini">
+        </label>
         <label>OpenAI API key (optional)
           <input id="adOpenAiKey" type="password" value="${escapeHtml(adState.openAiKey || "")}" placeholder="sk-...">
         </label>
@@ -989,6 +1353,8 @@ function renderAdRemover() {
           <div class="code">${escapeHtml(adState.lastResult.outputDir || "")}</div>
           <p><strong>Edited audio:</strong></p>
           <div class="code">${escapeHtml(adState.lastResult.editedAudio || "")}</div>
+          ${adState.lastResult.keptPath ? `<p><strong>Kept episode source:</strong></p><div class="code">${escapeHtml(adState.lastResult.keptPath)}</div>` : ""}
+          ${Array.isArray(adState.lastResult.removedSiblingFiles) ? `<p><strong>Removed old episode files:</strong> ${adState.lastResult.removedSiblingFiles.length}</p>` : ""}
           <p><strong>Run summary:</strong></p>
           <div class="code">${escapeHtml(adState.lastResult.runSummary || "")}</div>
         ` : `<p class="muted">No ad-removal run completed yet.</p>`}
@@ -1005,6 +1371,7 @@ function renderAdRemover() {
   document.querySelector("#adRunButton")?.addEventListener("click", () => {
     adState.backend = document.querySelector("#adBackend").value;
     adState.detectionMode = document.querySelector("#adDetectionMode").value;
+    adState.openAiModel = document.querySelector("#adOpenAiModel").value;
     adState.openAiKey = document.querySelector("#adOpenAiKey").value.trim();
     adState.removeOriginal = document.querySelector("#adRemoveOriginal").checked;
     saveState();
@@ -1177,11 +1544,17 @@ function wireCommonActions() {
   document.querySelectorAll("[data-save-offline]").forEach((el) => el.addEventListener("click", () => {
     saveEpisodeOffline(el.dataset.saveOffline).catch((error) => setStatus(`Save offline failed: ${error.message}`));
   }));
+  document.querySelectorAll("[data-download-remove]").forEach((el) => el.addEventListener("click", () => {
+    downloadAndRemoveAdsForEpisode(el.dataset.downloadRemove).catch((error) => setStatus(`Download/remove failed: ${error.message}`));
+  }));
   document.querySelectorAll("[data-use-offline-ad]").forEach((el) => el.addEventListener("click", () => {
     useEpisodeInAdRemover(el.dataset.useOfflineAd);
   }));
   document.querySelectorAll("[data-remove-ads-now]").forEach((el) => el.addEventListener("click", () => {
     removeAdsForEpisode(el.dataset.removeAdsNow).catch((error) => setStatus(`Ad removal failed: ${error.message}`));
+  }));
+  document.querySelectorAll("[data-delete-offline]").forEach((el) => el.addEventListener("click", () => {
+    deleteOfflineEpisodeFile(el.dataset.deleteOffline).catch((error) => setStatus(`Delete failed: ${error.message}`));
   }));
   document.querySelectorAll("[data-head]").forEach((el) => el.addEventListener("click", async () => {
     try {

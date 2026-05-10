@@ -27,14 +27,18 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.util.Clock;
 import androidx.media3.transformer.Composition;
 import androidx.media3.transformer.EditedMediaItem;
 import androidx.media3.transformer.EditedMediaItemSequence;
+import androidx.media3.transformer.DefaultAssetLoaderFactory;
+import androidx.media3.transformer.DefaultDecoderFactory;
 import androidx.media3.transformer.ExportException;
 import androidx.media3.transformer.ExportResult;
 import androidx.media3.transformer.Transformer;
@@ -75,6 +79,14 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.CountDownLatch;
+import java.util.LinkedList;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
 
 public class MainActivity extends Activity {
     private static final int BG = 0xfff4f7fb;
@@ -99,14 +111,35 @@ public class MainActivity extends Activity {
     private static final String SAMPLE_FEED_URL = "https://www.omnycontent.com/d/playlist/e73c998e-6e60-432f-8610-ae210140c5b1/2e824128-fbd5-4c9e-9a57-ae2f0056b0c4/66d98a23-900c-44b0-a40b-ae2f0056b0db/podcast.rss";
     private static final String[] FILTERS = {"All", "New", "In progress", "Downloaded", "Not downloaded", "Listened", "Unlistened"};
 
+    private static final String NOTIF_CH_REMOVAL = "ad_removal";
+    private static final String NOTIF_CH_COMPLETE = "ad_complete";
+    private static final String NOTIF_CH_PLAY    = "playback";
+    private static final int    NOTIF_ID_REMOVAL = 1001;
+    private static final int    NOTIF_ID_PLAY    = 1002;
+
+    // Static so they survive screen navigation inside the same activity instance.
+    private static final LinkedList<String>  adQueue         = new LinkedList<>();
+    private static volatile boolean          adRunning       = false;
+    private static volatile String           adCurrentId     = null;
+    private static volatile String           adCurrentTitle  = "";
+    private static volatile String           adCurrentStatus = "";
+    private static volatile String           adCurrentEst    = "";
+    private static final AtomicBoolean       adCancelled     = new AtomicBoolean(false);
+    // Each entry: [episodeId, episodeTitle, "ok"|"no_ads"]
+    private static final ArrayList<String[]> completionCards = new ArrayList<>();
+
     private final ExecutorService io = Executors.newFixedThreadPool(4);
     private final Handler main = new Handler(Looper.getMainLooper());
     private Db db;
     private LinearLayout root;
     private TextView status;
+    private LinearLayout busyPanel;
+    private ProgressBar busySpinner;
+    private TextView busyText;
     private MediaPlayer player;
     private Episode currentEpisode;
     private boolean userSeeking;
+    private NotificationManager notifMgr;
     private final ArrayList<CallLog> callLogs = new ArrayList<>();
     private final Runnable tick = new Runnable() {
         @Override public void run() {
@@ -120,6 +153,9 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         installCrashRecorder();
         db = new Db(this);
+        notifMgr = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        createNotificationChannels();
+        if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 0);
         cleanupExpiredDownloads();
         safeScreen(() -> showHome());
         main.post(tick);
@@ -158,6 +194,7 @@ public class MainActivity extends Activity {
         nav.addView(navButton("Debug", v -> safeScreen(() -> showDebug())));
         nav.addView(navButton("Settings", v -> safeScreen(() -> showSettings())));
         root.addView(nav);
+
         status = text("", 14, MUTED, false);
         status.setPadding(dp(12), dp(10), dp(12), dp(10));
         LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(-1, -2);
@@ -165,6 +202,86 @@ public class MainActivity extends Activity {
         status.setLayoutParams(statusLp);
         status.setBackground(rounded(SOFT_BLUE, dp(14), 0));
         root.addView(status);
+
+        // ── Persistent ad-removal busy panel (survives tab switches via static state) ──
+        busyPanel = new LinearLayout(this);
+        busyPanel.setOrientation(LinearLayout.VERTICAL);
+        busyPanel.setPadding(dp(14), dp(12), dp(14), dp(12));
+        busyPanel.setBackground(rounded(SOFT_GREEN, dp(14), 0));
+        LinearLayout.LayoutParams busyLp = new LinearLayout.LayoutParams(-1, -2);
+        busyLp.setMargins(0, dp(6), 0, dp(4));
+        busyPanel.setLayoutParams(busyLp);
+        LinearLayout busyTopRow = row();
+        busySpinner = new ProgressBar(this);
+        LinearLayout.LayoutParams spinnerLp = new LinearLayout.LayoutParams(dp(22), dp(22));
+        spinnerLp.rightMargin = dp(10);
+        busyTopRow.addView(busySpinner, spinnerLp);
+        busyText = text("", 14, INK, false);
+        busyTopRow.addView(busyText, new LinearLayout.LayoutParams(0, -2, 1));
+        Button cancelAdBtn = new Button(this);
+        cancelAdBtn.setText("Cancel");
+        cancelAdBtn.setTextSize(12);
+        cancelAdBtn.setPadding(dp(10), dp(4), dp(10), dp(4));
+        cancelAdBtn.setBackground(rounded(SOFT_RED, dp(20), 0));
+        cancelAdBtn.setTextColor(CORAL);
+        cancelAdBtn.setOnClickListener(v -> {
+            adCancelled.set(true);
+            synchronized (adQueue) { adQueue.clear(); }
+            busyPanel.setVisibility(View.GONE);
+            setStatus("Ad removal cancelled. Transcript cache is preserved — re-tapping Remove ads will resume from the detection step.");
+        });
+        busyTopRow.addView(cancelAdBtn);
+        busyPanel.addView(busyTopRow);
+        busyPanel.setVisibility(adRunning ? View.VISIBLE : View.GONE);
+        if (adRunning) refreshAdBusyPanel();
+        root.addView(busyPanel);
+
+        // ── Persistent completion cards (one per finished job, until dismissed) ──
+        synchronized (completionCards) {
+            for (int i = completionCards.size() - 1; i >= 0; i--) {
+                String[] card = completionCards.get(i);
+                final String[] cardRef = card;
+                String cardEpId    = card[0];
+                String cardEpTitle = card[1];
+                boolean isOk       = "ok".equals(card[2]);
+                LinearLayout cc = new LinearLayout(this);
+                cc.setOrientation(LinearLayout.VERTICAL);
+                cc.setPadding(dp(14), dp(12), dp(14), dp(12));
+                LinearLayout.LayoutParams ccLp = new LinearLayout.LayoutParams(-1, -2);
+                ccLp.setMargins(0, dp(6), 0, 0);
+                cc.setLayoutParams(ccLp);
+                cc.setBackground(rounded(isOk ? 0xffe6f4ea : SOFT_BLUE, dp(14), 0));
+                LinearLayout topRow = row();
+                String msg = isOk
+                    ? cardEpTitle + " — ad removal complete"
+                    : cardEpTitle + " — no ads detected";
+                topRow.addView(text(msg, 14, INK, true), new LinearLayout.LayoutParams(0, -2, 1));
+                Button xBtn = new Button(this);
+                xBtn.setText("✕");
+                xBtn.setBackgroundColor(0);
+                xBtn.setTextColor(MUTED);
+                xBtn.setPadding(dp(8), 0, 0, 0);
+                xBtn.setOnClickListener(v -> {
+                    synchronized (completionCards) { completionCards.remove(cardRef); }
+                    safeScreen(() -> showHome());
+                });
+                topRow.addView(xBtn);
+                cc.addView(topRow);
+                if (isOk) {
+                    Episode cardEp = db.episode(cardEpId);
+                    if (cardEp != null) {
+                        LinearLayout acts = row();
+                        LinearLayout.LayoutParams actLp = new LinearLayout.LayoutParams(-2, -2);
+                        actLp.topMargin = dp(6);
+                        acts.setLayoutParams(actLp);
+                        acts.addView(button("▶ Play ad-free", v -> playEpisode(cardEp)));
+                        cc.addView(acts);
+                    }
+                }
+                root.addView(cc);
+            }
+        }
+
         renderMiniPlayer(true);
     }
 
@@ -431,7 +548,16 @@ public class MainActivity extends Activity {
         actions.addView(secondaryButton(e.downloaded() ? "Remove" : "Download", v -> {
             if (e.downloaded()) removeDownload(e); else downloadEpisode(e);
         }));
-        if (e.downloaded()) actions.addView(secondaryButton("processed".equals(e.adSupportedStatus) ? "Refresh ad-free" : "Remove ads", v -> removeAds(e)));
+        if (e.downloaded()) {
+            if ("processed".equals(e.adSupportedStatus)) {
+                TextView pill = text("✓ Ads removed", 12, TEAL, false);
+                pill.setPadding(dp(10), dp(6), dp(10), dp(6));
+                pill.setBackground(rounded(SOFT_GREEN, dp(20), 0));
+                actions.addView(pill);
+            } else {
+                actions.addView(secondaryButton(adQueue.contains(e.id) || e.id.equals(adCurrentId) ? "Queued…" : "Remove ads", v -> removeAds(e)));
+            }
+        }
         actions.addView(secondaryButton("Details", v -> safeScreen(() -> showEpisode(e.id))));
         card.addView(actions);
         if (openable) card.setOnClickListener(v -> safeScreen(() -> showEpisode(e.id)));
@@ -461,7 +587,14 @@ public class MainActivity extends Activity {
         actions.addView(secondaryButton(e.downloaded() ? "Remove download" : "Download", v -> {
             if (e.downloaded()) removeDownload(e); else downloadEpisode(e);
         }));
-        actions.addView(secondaryButton("processed".equals(e.adSupportedStatus) ? "Refresh ad-free" : "Remove ads", v -> removeAds(e)));
+        if ("processed".equals(e.adSupportedStatus)) {
+            TextView pill = text("✓ Ads removed", 13, TEAL, false);
+            pill.setPadding(dp(12), dp(7), dp(12), dp(7));
+            pill.setBackground(rounded(SOFT_GREEN, dp(20), 0));
+            actions.addView(pill);
+        } else {
+            actions.addView(secondaryButton(adQueue.contains(e.id) || e.id.equals(adCurrentId) ? "Queued…" : "Remove ads", v -> removeAds(e)));
+        }
         root.addView(actions);
     }
 
@@ -601,9 +734,11 @@ public class MainActivity extends Activity {
                 mp.start();
                 db.touchPlayed(currentEpisode.id);
                 renderMiniPlayer(false);
+                updatePlaybackNotification();
             });
             player.setOnCompletionListener(mp -> {
                 db.markComplete(currentEpisode.id, mp.getDuration() / 1000);
+                updatePlaybackNotification();
                 if (settingBool("autoplay_next", false)) {
                     Episode next = db.nextEpisode(currentEpisode);
                     if (next != null) playEpisode(next);
@@ -617,6 +752,7 @@ public class MainActivity extends Activity {
             });
             player.prepareAsync();
             setStatus("Preparing audio...");
+            updatePlaybackNotification();
         } catch (Exception ex) {
             setStatus("Playback failed. The podcast host may have rejected the request or the file may no longer exist.");
         }
@@ -648,10 +784,10 @@ public class MainActivity extends Activity {
         LinearLayout controls = row();
         controls.addView(button(player != null && player.isPlaying() ? "Pause" : "Play", v -> {
             if (player == null) playEpisode(currentEpisode);
-            else if (player.isPlaying()) { player.pause(); saveCurrentProgress(); safeScreen(() -> showHome()); }
-            else { player.start(); safeScreen(() -> showHome()); }
+            else if (player.isPlaying()) { player.pause(); updatePlaybackNotification(); saveCurrentProgress(); safeScreen(() -> showHome()); }
+            else { player.start(); updatePlaybackNotification(); safeScreen(() -> showHome()); }
         }));
-        controls.addView(secondaryButton("Stop", v -> { if (player != null) player.pause(); saveCurrentProgress(); }));
+        controls.addView(secondaryButton("Stop", v -> { if (player != null) { player.pause(); updatePlaybackNotification(); } saveCurrentProgress(); }));
         controls.addView(secondaryButton("Back", v -> seekBy(-settingInt("seek_back", 15))));
         controls.addView(secondaryButton("Next", v -> { Episode n = db.nextEpisode(currentEpisode); if (n != null) playEpisode(n); }));
         panel.addView(controls);
@@ -727,15 +863,13 @@ public class MainActivity extends Activity {
             return;
         }
         String engine = db.setting("transcription_engine", ENGINE_VOSK);
-        if (ENGINE_OPENAI.equals(engine)) {
-            String openAiKey = db.setting("openai_api_key", "");
-            if (TextUtils.isEmpty(openAiKey)) {
-                showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to a local transcription engine (Vosk or Whisper) in the Ad Removal settings.");
-                return;
-            }
+        if (ENGINE_OPENAI.equals(engine) && TextUtils.isEmpty(db.setting("openai_api_key", ""))) {
+            showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to a local transcription engine (Vosk or Whisper).");
+            return;
         }
-        setStatus("Preparing ad removal (" + engineLabel(engine) + ")...");
-        io.execute(() -> runAndroidAdRemoval(e.id));
+        // Force-refresh clears cached transcript so the whole run starts fresh
+        boolean isRefresh = "processed".equals(e.adSupportedStatus) || "no_ads_found".equals(e.adSupportedStatus);
+        queueAdRemoval(e, isRefresh);
     }
 
     private String engineLabel(String engine) {
@@ -745,84 +879,168 @@ public class MainActivity extends Activity {
     }
 
     private void runAndroidAdRemoval(String episodeId) {
-        Episode episode = db.episode(episodeId);
+        adCancelled.set(false);
+        Db localDb = db;
+        if (localDb == null) { handleAdError(); return; }
+
+        Episode episode = localDb.episode(episodeId);
         if (episode == null || TextUtils.isEmpty(episode.localFilePath)) {
             postUi(() -> showError("Episode unavailable", "The downloaded episode could not be found in local storage."));
-            return;
+            handleAdError(); return;
         }
-
         File source = new File(episode.localFilePath);
         if (!source.exists()) {
             postUi(() -> showError("File missing", "The local episode file is missing. Download it again before running ad removal."));
-            return;
+            handleAdError(); return;
         }
 
-        String engine   = db.setting("transcription_engine", ENGINE_VOSK);
-        String apiKey   = db.setting("openai_api_key", "").trim();
-        String gptModel = db.setting("openai_model", "gpt-4o-mini").trim();
+        String engine   = localDb.setting("transcription_engine", ENGINE_VOSK);
+        String apiKey   = localDb.setting("openai_api_key", "").trim();
+        String gptModel = localDb.setting("openai_model", "gpt-4o-mini").trim();
         boolean hasKey  = !TextUtils.isEmpty(apiKey);
-
         int chunkSeconds = ENGINE_OPENAI.equals(engine) ? OPENAI_CHUNK_SECONDS : LOCAL_CHUNK_SECONDS;
 
-        File chunkDir = null;
-        try {
-            postUi(() -> setStatus("Chunking audio for transcription..."));
-            chunkDir = new File(getCacheDir(), "adfree-" + episode.id);
-            ArrayList<File> chunks = createTranscriptionChunks(source, chunkDir, chunkSeconds);
+        double audioSeconds = audioDurationSeconds(source, Math.max(1, episode.durationSeconds));
+        adCurrentEst = estimateRemovalTime(engine, audioSeconds);
+        long tTotal = System.currentTimeMillis();
+        long tStep;
 
-            ArrayList<TranscriptSegment> segments;
-            switch (engine) {
-                case ENGINE_OPENAI:
-                    postUi(() -> setStatus("Transcribing with OpenAI Whisper..."));
-                    segments = transcribeChunksWithOpenAi(chunks, apiKey);
-                    break;
-                case ENGINE_WHISPER:
-                    postUi(() -> setStatus("Transcribing with local Whisper..."));
-                    segments = transcribeChunksWithWhisperCpp(chunks);
-                    break;
-                default: // vosk
-                    postUi(() -> setStatus("Transcribing with Vosk..."));
-                    segments = transcribeChunksWithVosk(chunks);
-                    break;
-            }
-            if (segments.isEmpty()) throw new RuntimeException("No timestamped transcript segments were returned.");
+        // ── Step 1: Transcription (resumable via disk cache) ────────────────
+        File cacheFile = transcriptCacheFile(episode.id, engine);
+        ArrayList<TranscriptSegment> segments = null;
+        long transcriptionSec = 0;
 
-            ArrayList<TranscriptAdRange> adRanges;
-            if (hasKey) {
-                postUi(() -> setStatus("Finding ad ranges with OpenAI..."));
-                adRanges = detectAdRangesWithOpenAi(segments, apiKey, TextUtils.isEmpty(gptModel) ? "gpt-4o-mini" : gptModel);
+        if (cacheFile.exists()) {
+            ArrayList<TranscriptSegment> cached = loadTranscriptCache(cacheFile);
+            if (cached != null && !cached.isEmpty()) {
+                segments = cached;
+                addCallLog("TRANSCRIPT CACHE HIT", cacheFile.getName(), "", 0,
+                    "engine=" + engine, "Loaded " + segments.size() + " cached segments — skipping re-transcription.", 0);
+                adCurrentStatus = "Transcript loaded from cache (" + segments.size() + " segments)";
+                postUi(() -> refreshAdBusyPanel());
+                updateAdNotification();
             } else {
-                postUi(() -> setStatus("Finding ad ranges (local keyword scan)..."));
+                cacheFile.delete();
+            }
+        }
+
+        if (segments == null) {
+            if (adCancelled.get()) { handleCancelled(); return; }
+            adCurrentStatus = "Chunking audio for transcription...";
+            postUi(() -> refreshAdBusyPanel());
+            updateAdNotification();
+
+            File chunkDir = new File(getCacheDir(), "adfree-" + episode.id);
+            try {
+                ArrayList<File> chunks = createTranscriptionChunks(source, chunkDir, chunkSeconds);
+                tStep = System.currentTimeMillis();
+
+                switch (engine) {
+                    case ENGINE_OPENAI:  segments = transcribeChunksWithOpenAi(chunks, apiKey);  break;
+                    case ENGINE_WHISPER: segments = transcribeChunksWithWhisperCpp(chunks);       break;
+                    default:             segments = transcribeChunksWithVosk(chunks);             break;
+                }
+
+                if (adCancelled.get()) { deleteRecursively(chunkDir); handleCancelled(); return; }
+                if (segments.isEmpty()) throw new RuntimeException("No timestamped transcript segments were returned.");
+
+                transcriptionSec = (System.currentTimeMillis() - tStep) / 1000;
+                saveTranscriptCache(cacheFile, segments);
+                addCallLog("TRANSCRIPT COMPLETE", "", "", 0,
+                    "engine=" + engine, "Saved " + segments.size() + " segments to cache. Took " + transcriptionSec + "s.", 0);
+            } catch (Exception ex) {
+                deleteRecursively(chunkDir);
+                String body = TextUtils.isEmpty(ex.getMessage()) ? "Transcription failed." : ex.getMessage();
+                postUi(() -> showError("Ad removal failed", body));
+                handleAdError(); return;
+            } finally {
+                deleteRecursively(chunkDir);
+            }
+        }
+
+        if (adCancelled.get()) { handleCancelled(); return; }
+
+        // ── Step 2: Ad detection ────────────────────────────────────────────
+        tStep = System.currentTimeMillis();
+        ArrayList<TranscriptAdRange> adRanges;
+        try {
+            if (hasKey) {
+                adCurrentStatus = "Finding ad ranges with OpenAI...";
+                postUi(() -> refreshAdBusyPanel()); updateAdNotification();
+                adRanges = detectAdRangesWithOpenAi(segments, apiKey,
+                    TextUtils.isEmpty(gptModel) ? "gpt-4o-mini" : gptModel);
+            } else {
+                adCurrentStatus = "Finding ad ranges (local keyword scan)...";
+                postUi(() -> refreshAdBusyPanel()); updateAdNotification();
                 adRanges = detectAdRangesLocally(segments);
             }
+        } catch (Exception ex) {
+            String body = TextUtils.isEmpty(ex.getMessage()) ? "Ad detection failed." : ex.getMessage();
+            postUi(() -> showError("Ad removal failed", body));
+            handleAdError(); return;
+        }
+        long detectionSec = (System.currentTimeMillis() - tStep) / 1000;
+        addCallLog("AD DETECTION", "", "", 0, "engine=" + engine,
+            adRanges.size() + " raw ranges found in " + detectionSec + "s.", 0);
 
-            adRanges = mergeRanges(adRanges, 4.0, 8.0);
-            if (adRanges.isEmpty()) {
-                db.setAdStatus(episode.id, "no_ads_found");
-                postUi(() -> setStatus("No ad ranges detected for this episode."));
-                return;
-            }
+        adRanges = mergeRanges(adRanges, 4.0, 8.0);
+        if (adRanges.isEmpty()) {
+            localDb.setAdStatus(episode.id, "no_ads_found");
+            cacheFile.delete();
+            synchronized (completionCards) { completionCards.add(new String[]{episode.id, episode.title, "no_ads"}); }
+            postCompletionNotification("No ads found: " + episode.title, "Finished processing. No ad ranges detected.");
+            postUi(() -> { refreshAdBusyPanel(); showEpisode(episode.id); });
+            processNextFromQueue(); return;
+        }
 
-            postUi(() -> setStatus("Rendering ad-free audio..."));
+        if (adCancelled.get()) { handleCancelled(); return; }
+
+        // ── Step 3: Render ──────────────────────────────────────────────────
+        tStep = System.currentTimeMillis();
+        try {
+            adCurrentStatus = "Rendering ad-free audio (" + adRanges.size() + " ad segments cut)...";
+            postUi(() -> refreshAdBusyPanel()); updateAdNotification();
+
             File output = buildProcessedAudioPath(source);
-            File renderTarget = source.getAbsolutePath().equals(output.getAbsolutePath()) ? buildProcessedStagingPath(source) : output;
+            File renderTarget = source.getAbsolutePath().equals(output.getAbsolutePath())
+                ? buildProcessedStagingPath(source) : output;
             double durationSeconds = audioDurationSeconds(source, Math.max(1, episode.durationSeconds));
             renderAdFreeAudio(source, renderTarget, adRanges, durationSeconds);
             output = finalizeProcessedAudioOutput(source, output, renderTarget);
-
-            db.setProcessedAudio(episode.id, output.getAbsolutePath(), "processed");
-            postUi(() -> {
-                setStatus("Ad-free audio saved locally and is now the default playback source for this episode.");
-                showEpisode(episode.id);
-            });
-        } catch (Exception e) {
-            String body = nullToEmpty(e.getMessage());
-            if (TextUtils.isEmpty(body)) body = "The on-device ad-removal job failed.";
-            final String finalBody = body;
-            postUi(() -> showError("Ad removal failed", finalBody));
-        } finally {
-            deleteRecursively(chunkDir);
+            localDb.setProcessedAudio(episode.id, output.getAbsolutePath(), "processed");
+            cacheFile.delete();
+        } catch (Exception ex) {
+            String body = TextUtils.isEmpty(ex.getMessage()) ? "Rendering failed." : ex.getMessage();
+            postUi(() -> showError("Ad removal failed", body));
+            handleAdError(); return;
         }
+        long renderSec = (System.currentTimeMillis() - tStep) / 1000;
+        long totalSec  = (System.currentTimeMillis() - tTotal) / 1000;
+        addCallLog("RENDER COMPLETE", "", "", 0, "",
+            "Rendered in " + renderSec + "s. Total job: " + totalSec + "s.", 0);
+
+        // Save timing record for future estimates
+        localDb.ensureTimingTable();
+        localDb.saveTimingRecord(engine, (long) audioSeconds, transcriptionSec, detectionSec, renderSec, totalSec);
+
+        synchronized (completionCards) { completionCards.add(new String[]{episode.id, episode.title, "ok"}); }
+        postCompletionNotification("Ad removal complete", episode.title + " is ready to play ad-free.");
+        final String doneId = episode.id;
+        postUi(() -> { refreshAdBusyPanel(); showEpisode(doneId); });
+        processNextFromQueue();
+    }
+
+    private void handleCancelled() {
+        synchronized (adQueue) { adQueue.clear(); }
+        adRunning = false; adCurrentId = null; adCurrentTitle = ""; adCurrentStatus = ""; adCurrentEst = "";
+        if (notifMgr != null) notifMgr.cancel(NOTIF_ID_REMOVAL);
+        postUi(() -> setWorking(false, null));
+    }
+
+    private void handleAdError() {
+        adRunning = false; adCurrentId = null; adCurrentTitle = ""; adCurrentStatus = ""; adCurrentEst = "";
+        if (notifMgr != null) notifMgr.cancel(NOTIF_ID_REMOVAL);
+        postUi(() -> setWorking(false, null));
     }
 
     private void cleanupExpiredDownloads() {
@@ -850,12 +1068,19 @@ public class MainActivity extends Activity {
     private ArrayList<TranscriptSegment> transcribeChunksWithOpenAi(ArrayList<File> chunks, String apiKey) throws Exception {
         ArrayList<TranscriptSegment> all = new ArrayList<>();
         double offsetSeconds = 0.0;
-        for (int i = 0; i < chunks.size(); i++) {
+        int total = chunks.size();
+        for (int i = 0; i < total; i++) {
             File chunk = chunks.get(i);
-            final int chunkNumber = i + 1;
-            postUi(() -> setStatus("Transcribing chunk " + chunkNumber + " of " + chunks.size() + "..."));
+            final int ci = i + 1;
+            adCurrentStatus = "Transcribing chunk " + ci + "/" + total + " (OpenAI Whisper)...";
+            postUi(() -> refreshAdBusyPanel()); updateAdNotification();
+            int segsBefore = all.size();
             ArrayList<TranscriptSegment> current = transcribeChunkWithOpenAi(chunk, apiKey, offsetSeconds);
             all.addAll(current);
+            int newSegs = all.size() - segsBefore;
+            addCallLog("OPENAI CHUNK " + ci + "/" + total, chunk.getName(), "", 0,
+                "offset=" + String.format(Locale.US, "%.1f", offsetSeconds) + "s",
+                newSegs + " segments transcribed", 0);
             offsetSeconds += audioDurationSeconds(chunk, OPENAI_CHUNK_SECONDS);
         }
         return all;
@@ -1033,9 +1258,12 @@ public class MainActivity extends Activity {
                 File chunk = chunks.get(i);
                 final int ci = i + 1;
                 final int total = chunks.size();
+                adCurrentStatus = "Transcribing chunk " + ci + "/" + total + " (Vosk)...";
+                postUi(() -> refreshAdBusyPanel()); updateAdNotification();
                 postUi(() -> setStatus("Transcribing chunk " + ci + " of " + total + " with Vosk..."));
                 org.vosk.Recognizer rec = new org.vosk.Recognizer(voskModel, 16000.0f);
                 rec.setWords(true);
+                int segsBefore = all.size();
                 try {
                     short[] pcm = decodeToPcm16000(chunk);
                     byte[] bytes = shortsToBytes(pcm);
@@ -1057,6 +1285,10 @@ public class MainActivity extends Activity {
                 } finally {
                     rec.close();
                 }
+                int newSegs = all.size() - segsBefore;
+                addCallLog("VOSK CHUNK " + ci + "/" + total, chunk.getName(), "", 0,
+                    "offset=" + String.format(Locale.US, "%.1f", chunkOffset) + "s",
+                    newSegs + " segments transcribed", 0);
                 chunkOffset += audioDurationSeconds(chunk, LOCAL_CHUNK_SECONDS);
             }
         } finally {
@@ -1182,11 +1414,18 @@ public class MainActivity extends Activity {
                 File chunk = chunks.get(i);
                 final int ci = i + 1;
                 final int total = chunks.size();
+                adCurrentStatus = "Transcribing chunk " + ci + "/" + total + " (Whisper)...";
+                postUi(() -> refreshAdBusyPanel()); updateAdNotification();
                 postUi(() -> setStatus("Transcribing chunk " + ci + " of " + total + " with Whisper..."));
+                int segsBefore = all.size();
                 short[] pcm = decodeToPcm16000(chunk);
                 float[] floats = shortsToFloats(pcm);
                 String json = WhisperEngine.nativeTranscribe(floats, chunkOffset);
                 parseWhisperResult(json, all);
+                int newSegs = all.size() - segsBefore;
+                addCallLog("WHISPER CHUNK " + ci + "/" + total, chunk.getName(), "", 0,
+                    "offset=" + String.format(Locale.US, "%.1f", chunkOffset) + "s",
+                    newSegs + " segments transcribed", 0);
                 chunkOffset += audioDurationSeconds(chunk, LOCAL_CHUNK_SECONDS);
             }
         } finally {
@@ -1490,21 +1729,30 @@ public class MainActivity extends Activity {
         // Transformer requires a Looper thread; post creation and start to the main thread,
         // then block the background worker until export finishes.
         main.post(() -> {
-            Transformer transformer = new Transformer.Builder(this)
-                    .addListener(new Transformer.Listener() {
-                        @Override
-                        public void onCompleted(Composition composition, ExportResult exportResult) {
-                            latch.countDown();
-                        }
-                        @Override
-                        public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
-                            errorHolder[0] = new RuntimeException(exportException);
-                            latch.countDown();
-                        }
-                    })
-                    .build();
-            Composition composition = new Composition.Builder(new EditedMediaItemSequence(items)).build();
-            transformer.start(composition, output.getAbsolutePath());
+            try {
+                DefaultDecoderFactory decoderFactory = new DefaultDecoderFactory.Builder(this)
+                        .setEnableDecoderFallback(true)
+                        .build();
+                Transformer transformer = new Transformer.Builder(this)
+                    .setAssetLoaderFactory(new DefaultAssetLoaderFactory(this, decoderFactory, Clock.DEFAULT))
+                        .addListener(new Transformer.Listener() {
+                            @Override
+                            public void onCompleted(Composition composition, ExportResult exportResult) {
+                                latch.countDown();
+                            }
+                            @Override
+                            public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
+                                errorHolder[0] = new RuntimeException(exportException);
+                                latch.countDown();
+                            }
+                        })
+                        .build();
+                Composition composition = new Composition.Builder(new EditedMediaItemSequence(items)).build();
+                transformer.start(composition, output.getAbsolutePath());
+            } catch (RuntimeException e) {
+                errorHolder[0] = e;
+                latch.countDown();
+            }
         });
         try {
             latch.await();
@@ -1723,7 +1971,247 @@ public class MainActivity extends Activity {
         return e;
     }
     private void section(String s) { TextView t = text(s, 19, INK, true); t.setPadding(0, dp(18), 0, dp(6)); root.addView(t); }
+    // ── Notification channels ────────────────────────────────────────────────
+    private void createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel ch1 = new NotificationChannel(
+                NOTIF_CH_REMOVAL, "Ad Removal Progress", NotificationManager.IMPORTANCE_LOW);
+            ch1.setDescription("Shows progress while ads are being removed.");
+            ch1.setSound(null, null);
+            NotificationChannel ch2 = new NotificationChannel(
+                NOTIF_CH_COMPLETE, "Ad Removal Complete", NotificationManager.IMPORTANCE_DEFAULT);
+            ch2.setDescription("Notifies when ad removal finishes.");
+            NotificationChannel ch3 = new NotificationChannel(
+                NOTIF_CH_PLAY, "Podcast Playback", NotificationManager.IMPORTANCE_LOW);
+            ch3.setDescription("Shows episode controls while playing.");
+            ch3.setSound(null, null);
+            notifMgr.createNotificationChannel(ch1);
+            notifMgr.createNotificationChannel(ch2);
+            notifMgr.createNotificationChannel(ch3);
+        }
+    }
+
+    /** Safe to call from any thread. */
+    private void updateAdNotification() {
+        if (notifMgr == null || !adRunning) return;
+        try {
+            Intent tap = new Intent(this, MainActivity.class);
+            tap.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(this, 0, tap,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, NOTIF_CH_REMOVAL)
+                : new Notification.Builder(this);
+            String title = TextUtils.isEmpty(adCurrentTitle) ? "Ad Removal" : adCurrentTitle;
+            String line  = adCurrentStatus + (TextUtils.isEmpty(adCurrentEst) ? "" : "  " + adCurrentEst);
+            int queued; synchronized (adQueue) { queued = adQueue.size(); }
+            if (queued > 0) line += "  (" + queued + " more queued)";
+            b.setSmallIcon(android.R.drawable.ic_media_ff)
+             .setContentTitle("Removing ads: " + title)
+             .setContentText(line)
+             .setStyle(new Notification.BigTextStyle().bigText(line))
+             .setOngoing(true)
+             .setContentIntent(pi)
+             .setProgress(0, 0, true);
+            notifMgr.notify(NOTIF_ID_REMOVAL, b.build());
+        } catch (Exception ignored) {}
+    }
+
+    private void postCompletionNotification(String title, String body) {
+        if (notifMgr == null) return;
+        try {
+            Intent tap = new Intent(this, MainActivity.class);
+            tap.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(this,
+                (int)(System.currentTimeMillis() % Integer.MAX_VALUE), tap,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, NOTIF_CH_COMPLETE)
+                : new Notification.Builder(this);
+            b.setSmallIcon(android.R.drawable.ic_popup_reminder)
+             .setContentTitle(title)
+             .setContentText(body)
+             .setContentIntent(pi)
+             .setAutoCancel(true);
+            int id = NOTIF_ID_REMOVAL + 1 + (int)(System.currentTimeMillis() % 1000);
+            notifMgr.notify(id, b.build());
+        } catch (Exception ignored) {}
+    }
+
+    private void updatePlaybackNotification() {
+        if (notifMgr == null) return;
+        try {
+            if (player == null || currentEpisode == null) {
+                notifMgr.cancel(NOTIF_ID_PLAY);
+                return;
+            }
+            boolean playing = false;
+            try { playing = player.isPlaying(); } catch (Exception ignored2) {}
+            Intent tap = new Intent(this, MainActivity.class);
+            tap.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(this, 1, tap,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, NOTIF_CH_PLAY)
+                : new Notification.Builder(this);
+            b.setSmallIcon(playing ? android.R.drawable.ic_media_play : android.R.drawable.ic_media_pause)
+             .setContentTitle(currentEpisode.title)
+             .setContentText(playing ? "Playing — tap to open" : "Paused — tap to open")
+             .setOngoing(playing)
+             .setContentIntent(pi);
+            notifMgr.notify(NOTIF_ID_PLAY, b.build());
+        } catch (Exception ignored) {}
+    }
+
+    // ── Ad removal queue ─────────────────────────────────────────────────────
+    private void queueAdRemoval(Episode e, boolean forceRefresh) {
+        if (forceRefresh) deleteTranscriptCache(e.id);
+        boolean wasAlreadyRunning;
+        synchronized (adQueue) {
+            if (e.id.equals(adCurrentId)) {
+                setStatus("Already processing this episode.");
+                return;
+            }
+            if (adQueue.contains(e.id)) {
+                setStatus(e.title + " is already in the queue.");
+                return;
+            }
+            wasAlreadyRunning = adRunning;
+            if (!wasAlreadyRunning) adRunning = true;
+            else adQueue.add(e.id);
+        }
+        if (!wasAlreadyRunning) {
+            adCurrentId = e.id;
+            adCurrentTitle = e.title;
+            adCurrentStatus = "Starting...";
+            adCurrentEst = "";
+            setWorking(true, e.title + ": Starting...");
+            io.execute(() -> runAndroidAdRemoval(e.id));
+        } else {
+            setStatus(e.title + " added to queue (" + adQueue.size() + " waiting).");
+            postUi(() -> refreshAdBusyPanel());
+        }
+    }
+
+    private void processNextFromQueue() {
+        String nextId;
+        synchronized (adQueue) { nextId = adQueue.poll(); }
+        if (nextId == null || io.isShutdown()) {
+            adRunning = false; adCurrentId = null; adCurrentTitle = ""; adCurrentStatus = ""; adCurrentEst = "";
+            if (notifMgr != null) notifMgr.cancel(NOTIF_ID_REMOVAL);
+            postUi(() -> setWorking(false, null));
+            return;
+        }
+        Db localDb = db;
+        Episode next = localDb != null ? localDb.episode(nextId) : null;
+        if (next == null) { processNextFromQueue(); return; }
+        adCurrentId = nextId;
+        adCurrentTitle = next.title;
+        adCurrentStatus = "Starting...";
+        adCurrentEst = "";
+        postUi(() -> setWorking(true, next.title + ": Starting..."));
+        io.execute(() -> runAndroidAdRemoval(nextId));
+    }
+
+    /** Must be called on the main thread (accesses Views). */
+    private void refreshAdBusyPanel() {
+        if (busyPanel == null) return;
+        if (adRunning) {
+            busyPanel.setVisibility(View.VISIBLE);
+            if (busyText != null) {
+                StringBuilder txt = new StringBuilder(adCurrentTitle).append("\n").append(adCurrentStatus);
+                if (!TextUtils.isEmpty(adCurrentEst)) txt.append("  ").append(adCurrentEst);
+                synchronized (adQueue) {
+                    if (!adQueue.isEmpty()) txt.append("\n").append(adQueue.size()).append(" more queued");
+                }
+                busyText.setText(txt.toString());
+            }
+        } else {
+            busyPanel.setVisibility(View.GONE);
+        }
+    }
+
+    // ── Transcript cache ─────────────────────────────────────────────────────
+    private File transcriptCacheFile(String episodeId, String engine) {
+        return new File(getFilesDir(), "transcripts/" + episodeId + "." + engine + ".json");
+    }
+
+    private void saveTranscriptCache(File f, ArrayList<TranscriptSegment> segs) {
+        try {
+            f.getParentFile().mkdirs();
+            JSONArray arr = new JSONArray();
+            for (TranscriptSegment s : segs) {
+                JSONObject o = new JSONObject();
+                o.put("i", s.index); o.put("s", s.start); o.put("e", s.end); o.put("t", s.text);
+                arr.put(o);
+            }
+            try (FileOutputStream fos = new FileOutputStream(f)) {
+                fos.write(arr.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private ArrayList<TranscriptSegment> loadTranscriptCache(File f) {
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            try (FileInputStream fis = new FileInputStream(f)) {
+                byte[] buf = new byte[8192]; int n;
+                while ((n = fis.read(buf)) > 0) bos.write(buf, 0, n);
+            }
+            JSONArray arr = new JSONArray(bos.toString("UTF-8"));
+            ArrayList<TranscriptSegment> segs = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                TranscriptSegment s = new TranscriptSegment();
+                s.index = o.optInt("i"); s.start = o.optDouble("s"); s.end = o.optDouble("e"); s.text = o.optString("t");
+                segs.add(s);
+            }
+            return segs;
+        } catch (Exception e) { return null; }
+    }
+
+    private void deleteTranscriptCache(String episodeId) {
+        for (String eng : new String[]{ENGINE_VOSK, ENGINE_WHISPER, ENGINE_OPENAI}) {
+            transcriptCacheFile(episodeId, eng).delete();
+        }
+    }
+
+    // ── Time estimation ──────────────────────────────────────────────────────
+    private String estimateRemovalTime(String engine, double audioSeconds) {
+        try {
+            Db localDb = db;
+            if (localDb == null) return "";
+            localDb.ensureTimingTable();
+            long lo = Math.max(0, (long)(audioSeconds * 0.6));
+            long hi = (long)(audioSeconds * 1.4) + 120;
+            Cursor cur = localDb.getReadableDatabase().rawQuery(
+                "SELECT AVG(CAST(transcription_seconds AS REAL)/NULLIF(audio_length_seconds,0))," +
+                "AVG(detection_seconds),AVG(render_seconds),COUNT(*) " +
+                "FROM ad_removal_timing WHERE engine=? AND audio_length_seconds BETWEEN ? AND ?",
+                new String[]{engine, String.valueOf(lo), String.valueOf(hi)});
+            try {
+                if (cur.moveToFirst() && cur.getInt(3) > 0 && !cur.isNull(0)) {
+                    double rate = cur.getDouble(0);
+                    double det  = cur.getDouble(1);
+                    double ren  = cur.getDouble(2);
+                    double est  = audioSeconds * rate + det + ren;
+                    if (est < 90) return "(~" + (int) est + "s est.)";
+                    return "(~" + (int)(est / 60) + " min est.)";
+                }
+            } finally { cur.close(); }
+        } catch (Exception ignored) {}
+        return "";
+    }
+
     private void setStatus(String s) { if (status != null) status.setText(s); }
+    private void setWorking(boolean working, String message) {
+        if (busyPanel != null) busyPanel.setVisibility((working || adRunning) ? View.VISIBLE : View.GONE);
+        if (!TextUtils.isEmpty(message)) {
+            setStatus(message);
+            if (busyText != null) busyText.setText(message);
+        }
+        if (!working && !adRunning && notifMgr != null) notifMgr.cancel(NOTIF_ID_REMOVAL);
+    }
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
     private void hideKeyboard(View v) { ((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(v.getWindowToken(), 0); }
     private String indicators(Episode e) { ArrayList<String> a = new ArrayList<>(); if (e.isNew) a.add("New"); if (e.isListened) a.add("Listened"); else if (e.positionSeconds > 0) a.add("In progress"); if (e.downloaded()) a.add("Saved"); if ("processed".equals(e.adSupportedStatus)) a.add("Ad free"); else if ("no_ads_found".equals(e.adSupportedStatus)) a.add("No ads found"); else if ("supported".equals(e.adSupportedStatus)) a.add("AD"); return TextUtils.join("  |  ", a); }
@@ -1824,7 +2312,7 @@ public class MainActivity extends Activity {
         log.at = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
         synchronized (callLogs) {
             callLogs.add(0, log);
-            while (callLogs.size() > 30) callLogs.remove(callLogs.size() - 1);
+            while (callLogs.size() > 200) callLogs.remove(callLogs.size() - 1);
         }
     }
     private String headersToText(HttpURLConnection c) {
@@ -1916,6 +2404,7 @@ public class MainActivity extends Activity {
             db.execSQL("CREATE TABLE directory_cache (id TEXT PRIMARY KEY, query TEXT, source TEXT NOT NULL, source_id TEXT, title TEXT NOT NULL, publisher TEXT, feed_url TEXT, directory_url TEXT, description TEXT, genres TEXT, artwork_url TEXT, cached_at TEXT NOT NULL, expires_at TEXT NOT NULL)");
             db.execSQL("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)");
             db.execSQL("CREATE TABLE feed_refreshes (podcast_id TEXT NOT NULL, refreshed_at INTEGER NOT NULL)");
+            db.execSQL("CREATE TABLE IF NOT EXISTS ad_removal_timing (id INTEGER PRIMARY KEY AUTOINCREMENT, engine TEXT NOT NULL, audio_length_seconds INTEGER NOT NULL, transcription_seconds INTEGER NOT NULL, detection_seconds INTEGER NOT NULL, render_seconds INTEGER NOT NULL, total_seconds INTEGER NOT NULL, created_at TEXT NOT NULL)");
         }
         @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {}
         String now() { SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US); f.setTimeZone(TimeZone.getTimeZone("UTC")); return f.format(new Date()); }
@@ -1953,6 +2442,8 @@ public class MainActivity extends Activity {
         void setProcessedAudio(String id, String path, String adStatus) { ContentValues v = new ContentValues(); v.put("local_file_path", path); v.put("download_status", "processed"); v.put("ad_supported_status", adStatus); v.put("downloaded_at", now()); v.putNull("download_expires_at"); getWritableDatabase().update("episodes", v, "id=?", new String[]{id}); }
         void setAdStatus(String id, String adStatus) { ContentValues v = new ContentValues(); v.put("ad_supported_status", adStatus); getWritableDatabase().update("episodes", v, "id=?", new String[]{id}); }
         void removeDownload(String id) { ContentValues v = new ContentValues(); v.putNull("local_file_path"); v.put("download_status", "not_downloaded"); getWritableDatabase().update("episodes", v, "id=?", new String[]{id}); }
+        void ensureTimingTable() { try { getWritableDatabase().execSQL("CREATE TABLE IF NOT EXISTS ad_removal_timing (id INTEGER PRIMARY KEY AUTOINCREMENT, engine TEXT NOT NULL, audio_length_seconds INTEGER NOT NULL, transcription_seconds INTEGER NOT NULL, detection_seconds INTEGER NOT NULL, render_seconds INTEGER NOT NULL, total_seconds INTEGER NOT NULL, created_at TEXT NOT NULL)"); } catch (Exception ignored) {} }
+        void saveTimingRecord(String engine, long audioSec, long transSec, long detSec, long renSec, long totalSec) { try { ContentValues v = new ContentValues(); v.put("engine", engine); v.put("audio_length_seconds", audioSec); v.put("transcription_seconds", transSec); v.put("detection_seconds", detSec); v.put("render_seconds", renSec); v.put("total_seconds", totalSec); v.put("created_at", now()); getWritableDatabase().insert("ad_removal_timing", null, v); } catch (Exception ignored) {} }
         void clearDownloads(boolean listenedOnly, boolean all) { String where = all ? "e.download_status='downloaded'" : listenedOnly ? "e.download_status='downloaded' AND e.is_listened=1" : "e.download_status='downloaded' AND CAST(e.download_expires_at AS INTEGER)<?"; String[] args = all||listenedOnly ? null : new String[]{String.valueOf(System.currentTimeMillis())}; for (Episode e : episodes(where, args, 10000)) { if (!TextUtils.isEmpty(e.localFilePath)) new File(e.localFilePath).delete(); removeDownload(e.id); } }
         int countNew(String pid) { return count("episodes", "podcast_id=? AND is_new=1", new String[]{pid}); }
         int countDownloaded(String pid) { return count("episodes", "podcast_id=? AND download_status IN ('downloaded','processed')", new String[]{pid}); }
