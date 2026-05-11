@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Assemble Android Debug APK",
+      "type": "shell",
+      "command": "cd /workspaces/ad-free-podcast-player/apps/android && sh gradlew app:assembleDebug",
+      "problemMatcher": ["$gradle"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    }
+  ]
+}

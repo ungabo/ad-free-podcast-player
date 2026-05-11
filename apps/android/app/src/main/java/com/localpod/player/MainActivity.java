@@ -79,6 +79,7 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.LinkedList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -935,10 +936,16 @@ public class MainActivity extends Activity {
                 ArrayList<File> chunks = createTranscriptionChunks(source, chunkDir, chunkSeconds);
                 tStep = System.currentTimeMillis();
 
-                switch (engine) {
-                    case ENGINE_OPENAI:  segments = transcribeChunksWithOpenAi(chunks, apiKey);  break;
-                    case ENGINE_WHISPER: segments = transcribeChunksWithWhisperCpp(chunks);       break;
-                    default:             segments = transcribeChunksWithVosk(chunks);             break;
+                try {
+                    switch (engine) {
+                        case ENGINE_OPENAI:  segments = transcribeChunksWithOpenAi(chunks, apiKey);  break;
+                        case ENGINE_WHISPER: segments = transcribeChunksWithWhisperCpp(chunks);       break;
+                        default:             segments = transcribeChunksWithVosk(chunks);             break;
+                    }
+                } catch (AdRemovalCancelledException ex) {
+                    deleteRecursively(chunkDir);
+                    handleCancelled();
+                    return;
                 }
 
                 if (adCancelled.get()) { deleteRecursively(chunkDir); handleCancelled(); return; }
@@ -948,6 +955,9 @@ public class MainActivity extends Activity {
                 saveTranscriptCache(cacheFile, segments);
                 addCallLog("TRANSCRIPT COMPLETE", "", "", 0,
                     "engine=" + engine, "Saved " + segments.size() + " segments to cache. Took " + transcriptionSec + "s.", 0);
+            } catch (AdRemovalCancelledException ex) {
+                deleteRecursively(chunkDir);
+                handleCancelled(); return;
             } catch (Exception ex) {
                 deleteRecursively(chunkDir);
                 String body = TextUtils.isEmpty(ex.getMessage()) ? "Transcription failed." : ex.getMessage();
@@ -1070,6 +1080,7 @@ public class MainActivity extends Activity {
         double offsetSeconds = 0.0;
         int total = chunks.size();
         for (int i = 0; i < total; i++) {
+            if (adCancelled.get()) throw new AdRemovalCancelledException();
             File chunk = chunks.get(i);
             final int ci = i + 1;
             adCurrentStatus = "Transcribing chunk " + ci + "/" + total + " (OpenAI Whisper)...";
@@ -1135,6 +1146,7 @@ public class MainActivity extends Activity {
         ArrayList<TranscriptAdRange> out = new ArrayList<>();
         int batchSize = 90;
         for (int startIndex = 0; startIndex < segments.size(); startIndex += batchSize) {
+            if (adCancelled.get()) throw new AdRemovalCancelledException();
             int endIndex = Math.min(segments.size(), startIndex + batchSize);
             JSONArray payloadSegments = new JSONArray();
             for (int i = startIndex; i < endIndex; i++) {
@@ -1255,6 +1267,7 @@ public class MainActivity extends Activity {
         double chunkOffset = 0.0;
         try {
             for (int i = 0; i < chunks.size(); i++) {
+                if (adCancelled.get()) throw new AdRemovalCancelledException();
                 File chunk = chunks.get(i);
                 final int ci = i + 1;
                 final int total = chunks.size();
@@ -1411,6 +1424,7 @@ public class MainActivity extends Activity {
         double chunkOffset = 0.0;
         try {
             for (int i = 0; i < chunks.size(); i++) {
+                if (adCancelled.get()) throw new AdRemovalCancelledException();
                 File chunk = chunks.get(i);
                 final int ci = i + 1;
                 final int total = chunks.size();
@@ -1755,7 +1769,10 @@ public class MainActivity extends Activity {
             }
         });
         try {
-            latch.await();
+            boolean finished = latch.await(30, TimeUnit.MINUTES);
+            if (!finished) {
+                throw new RuntimeException("Media export timed out after 30 minutes.");
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Media export interrupted.", e);
@@ -2367,6 +2384,9 @@ public class MainActivity extends Activity {
         static native void    nativeFree();
     }
 
+    static class AdRemovalCancelledException extends Exception {
+        AdRemovalCancelledException() { super(); }
+    }
     static class TranscriptSegment {
         int index;
         double start;
