@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ad Free Podcast Server</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f2ea;
+      --panel: #fffaf2;
+      --line: #d8c9b4;
+      --ink: #2c2418;
+      --muted: #6a5a47;
+      --accent: #8b5e3c;
+      --accent-soft: #f4e7d7;
+      --ok: #1e7a45;
+      --err: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Trebuchet MS", "Lucida Grande", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 5% 5%, #fff, transparent 35%),
+        radial-gradient(circle at 90% 0, #efe1cf, transparent 40%),
+        var(--bg);
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .shell {
+      max-width: 900px;
+      margin: 0 auto;
+      display: grid;
+      gap: 16px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 14px 28px rgba(62, 42, 19, 0.08);
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: clamp(1.9rem, 4vw, 2.4rem);
+      line-height: 1.1;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .grid {
+      margin-top: 12px;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 0.92rem;
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
+    input,
+    select,
+    button {
+      font: inherit;
+    }
+
+    input,
+    select {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 10px;
+      background: #fff;
+      color: var(--ink);
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      background: linear-gradient(135deg, #8b5e3c, #a16f46);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button[disabled] {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    .ghost {
+      background: #fff;
+      color: var(--accent);
+      border: 1px solid var(--line);
+    }
+
+    .progress-wrap {
+      width: 100%;
+      height: 14px;
+      border-radius: 999px;
+      background: #e9dbc8;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      margin-top: 12px;
+    }
+
+    .progress {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, #8b5e3c, #6f9e5c);
+      transition: width 220ms ease;
+    }
+
+    .kvs {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .kvs div {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #fff;
+    }
+
+    .kvs strong {
+      display: block;
+      font-size: 0.78rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-weight: 700;
+    }
+
+    .status.ok {
+      color: var(--ok);
+    }
+
+    .status.err {
+      color: var(--err);
+    }
+
+    .note {
+      font-size: 0.9rem;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+
+    .logs {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #fff;
+      min-height: 110px;
+      max-height: 280px;
+      overflow: auto;
+      font-family: Consolas, "Lucida Console", monospace;
+      font-size: 0.82rem;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 14px;
+      }
+
+      .grid,
+      .kvs {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel">
+      <h1>Ad Free Podcast Server</h1>
+      <p>Upload a file, queue a job, and download the processed output when it is finished.</p>
+
+      <form id="jobForm" class="grid">
+        <label class="full">
+          Audio file
+          <input type="file" id="audio" name="audio" accept="audio/*" required />
+        </label>
+
+        <label>
+          Backend
+          <select id="backend" name="backend">
+            <option value="parakeet">Parakeet</option>
+            <option value="whisper">Whisper local</option>
+            <option value="openai-whisper">OpenAI Whisper API</option>
+          </select>
+        </label>
+
+        <label>
+          Detection mode
+          <select id="detectionMode" name="detection_mode">
+            <option value="local">Local</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="openai">OpenAI only</option>
+          </select>
+        </label>
+
+        <label>
+          OpenAI model
+          <input type="text" id="openAiModel" name="openai_model" value="gpt-4o-mini" />
+        </label>
+
+        <label>
+          OpenAI API key (optional)
+          <input type="password" id="openAiApiKey" name="openai_api_key" placeholder="sk-..." />
+        </label>
+
+        <div class="full actions">
+          <button type="submit" id="submitBtn">Queue Ad Removal</button>
+          <button type="button" class="ghost" id="cancelBtn" disabled>Cancel Job</button>
+          <button type="button" class="ghost" id="downloadBtn" disabled>Download Output</button>
+        </div>
+      </form>
+
+      <p class="note">Tip: if worker mode is ffmpeg-copy, this validates the full pipeline without ad removal logic.</p>
+    </section>
+
+    <section class="panel">
+      <p id="statusText" class="status">No job running.</p>
+      <div class="progress-wrap">
+        <div id="progressBar" class="progress"></div>
+      </div>
+
+      <div class="kvs">
+        <div>
+          <strong>Job ID</strong>
+          <span id="jobId">-</span>
+        </div>
+        <div>
+          <strong>Backend</strong>
+          <span id="jobBackend">-</span>
+        </div>
+        <div>
+          <strong>State</strong>
+          <span id="jobState">-</span>
+        </div>
+        <div>
+          <strong>Progress</strong>
+          <span id="jobProgress">0%</span>
+        </div>
+      </div>
+
+      <pre id="jobLogs" class="logs">No logs yet.</pre>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById('jobForm');
+    const submitBtn = document.getElementById('submitBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    const statusText = document.getElementById('statusText');
+    const progressBar = document.getElementById('progressBar');
+    const jobIdText = document.getElementById('jobId');
+    const backendText = document.getElementById('jobBackend');
+    const stateText = document.getElementById('jobState');
+    const progressText = document.getElementById('jobProgress');
+    const logsBox = document.getElementById('jobLogs');
+
+    const APP_BASE = window.location.pathname
+      .replace(/\/index\.html?$/i, '')
+      .replace(/\/$/, '');
+    const apiUrl = (path) => `${APP_BASE}${path}`;
+
+    let currentJob = null;
+    let pollTimer = null;
+
+    function setStatus(message, type) {
+      statusText.textContent = message;
+      statusText.classList.remove('ok', 'err');
+      if (type) {
+        statusText.classList.add(type);
+      }
+    }
+
+    function setProgress(value) {
+      const bounded = Math.max(0, Math.min(100, Number(value) || 0));
+      progressBar.style.width = bounded + '%';
+      progressText.textContent = bounded.toFixed(1).replace('.0', '') + '%';
+    }
+
+    function updateJobCard(job) {
+      jobIdText.textContent = job.job_id || '-';
+      backendText.textContent = job.backend || '-';
+      stateText.textContent = job.status || '-';
+      setProgress(job.progress || 0);
+
+      if (job.status === 'completed') {
+        setStatus('Job complete. Output is ready.', 'ok');
+      } else if (job.status === 'failed') {
+        setStatus(job.error_message || 'Job failed.', 'err');
+      } else if (job.status === 'cancelled') {
+        setStatus('Job cancelled.', 'err');
+      } else {
+        setStatus('Job is processing...', null);
+      }
+
+      cancelBtn.disabled = !(job.status === 'queued' || job.status === 'running');
+      downloadBtn.disabled = !(job.status === 'completed' && job.download_url);
+      logsBox.textContent = job.logs || 'No logs yet.';
+    }
+
+    async function loadJob(jobId) {
+      const response = await fetch(apiUrl('/api/jobs/' + encodeURIComponent(jobId)));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || 'Failed to fetch job status.');
+      }
+      currentJob = payload;
+      updateJobCard(payload);
+      return payload;
+    }
+
+    function schedulePoll(jobId) {
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(async () => {
+        try {
+          const job = await loadJob(jobId);
+          if (job.status === 'queued' || job.status === 'running') {
+            schedulePoll(jobId);
+          }
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : 'Polling failed.', 'err');
+        }
+      }, 1500);
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      submitBtn.disabled = true;
+      cancelBtn.disabled = true;
+      downloadBtn.disabled = true;
+      setStatus('Uploading and queueing...', null);
+
+      try {
+        const data = new FormData(form);
+        const response = await fetch(apiUrl('/api/jobs'), { method: 'POST', body: data });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || 'Job creation failed.');
+        }
+
+        currentJob = { job_id: payload.job_id, status: 'queued', progress: 0 };
+        updateJobCard({
+          job_id: payload.job_id,
+          status: 'queued',
+          backend: document.getElementById('backend').value,
+          progress: 0,
+        });
+
+        await loadJob(payload.job_id);
+        schedulePoll(payload.job_id);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Could not queue job.', 'err');
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+      if (!currentJob || !currentJob.job_id) return;
+      try {
+        const response = await fetch(apiUrl('/api/jobs/' + encodeURIComponent(currentJob.job_id) + '/cancel'), {
+          method: 'POST',
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || 'Cancel failed.');
+        }
+        currentJob = payload;
+        updateJobCard(payload);
+        clearTimeout(pollTimer);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Cancel failed.', 'err');
+      }
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      if (!currentJob || !currentJob.download_url) return;
+      window.location.href = currentJob.download_url;
+    });
+  </script>
+</body>
+</html>

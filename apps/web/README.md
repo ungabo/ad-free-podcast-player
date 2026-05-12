@@ -1,5 +1,10 @@
 # React + TypeScript + Vite
 
+## Server Build Output
+
+Running `npm run build` in this folder now generates both `dist/index.html` and `dist/index.php`.
+Use `dist/index.php` as the server entrypoint when deploying to the PHP host.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

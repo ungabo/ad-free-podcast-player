@@ -32,6 +32,17 @@ apps/desktop/dist/
 apps/desktop/Ad Free Podcast Player-win32-x64/
 apps/desktop/renderer/
 
+# Web server runtime artifacts
+apps/server/storage/*
+!apps/server/storage/input/
+!apps/server/storage/output/
+!apps/server/storage/queue/
+!apps/server/storage/work/
+!apps/server/storage/input/.gitkeep
+!apps/server/storage/output/.gitkeep
+!apps/server/storage/queue/.gitkeep
+!apps/server/storage/work/.gitkeep
+
 # Python
 *.pyc
 *.pyo

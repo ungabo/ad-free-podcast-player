@@ -1,12 +1,59 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
-const STORAGE_KEY = 'adfree-podcast-player-settings'
+const STORAGE_KEY = 'adfree-web-settings'
+const USER_KEY = 'adfree-user-id'
+const ACTIVE_JOB_KEY = 'adfree-active-job-id'
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '/adfree-api').replace(/\/$/, '')
+
+const SEARCH_CACHE_TTL = 24 * 60 * 60 * 1000
+const EPISODE_CACHE_TTL = 6 * 60 * 60 * 1000
+
+function getSearchCache(term: string): PodcastResult[] | null {
+  try {
+    const raw = window.localStorage.getItem(`adfree-search:${term.toLowerCase().trim()}`)
+    if (!raw) return null
+    const { ts, data } = JSON.parse(raw) as { ts: number; data: PodcastResult[] }
+    if (Date.now() - ts > SEARCH_CACHE_TTL) return null
+    return data
+  } catch { return null }
+}
+
+function setSearchCache(term: string, data: PodcastResult[]): void {
+  try {
+    window.localStorage.setItem(
+      `adfree-search:${term.toLowerCase().trim()}`,
+      JSON.stringify({ ts: Date.now(), data })
+    )
+  } catch { /* ignore quota errors */ }
+}
+
+function getEpisodeCache(collectionId: number): EpisodeResult[] | null {
+  try {
+    const raw = window.localStorage.getItem(`adfree-episodes:${collectionId}`)
+    if (!raw) return null
+    const { ts, data } = JSON.parse(raw) as { ts: number; data: EpisodeResult[] }
+    if (Date.now() - ts > EPISODE_CACHE_TTL) return null
+    return data
+  } catch { return null }
+}
+
+function setEpisodeCache(collectionId: number, data: EpisodeResult[]): void {
+  try {
+    window.localStorage.setItem(
+      `adfree-episodes:${collectionId}`,
+      JSON.stringify({ ts: Date.now(), data })
+    )
+  } catch { /* ignore quota errors */ }
+}
+
+type DetectionMode = 'local' | 'hybrid' | 'openai'
+type Backend = 'parakeet' | 'whisper' | 'openai-whisper'
 
 type SavedSettings = {
   openAiKey: string
-  detectionMode: 'local' | 'hybrid' | 'openai'
-  backend: 'parakeet' | 'whisper' | 'openai-whisper'
-  removeOriginal: boolean
+  openAiModel: string
+  detectionMode: DetectionMode
+  backend: Backend
 }
 
 type PodcastResult = {
@@ -16,8 +63,6 @@ type PodcastResult = {
   feedUrl?: string
   artworkUrl600?: string
   artworkUrl100?: string
-  trackCount?: number
-  primaryGenreName?: string
 }
 
 type EpisodeResult = {
@@ -30,6 +75,58 @@ type EpisodeResult = {
   trackTimeMillis?: number
 }
 
+type CreateJobResponse = {
+  job_id: string
+  status: string
+  poll_url?: string
+  download_url?: string
+}
+
+type JobStatusResponse = {
+  job_id: string
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  backend: string
+  detection_mode: string
+  openai_model: string
+  progress: number
+  error_message: string | null
+  logs: string | null
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+  download_url: string | null
+}
+
+type JobRecord = JobStatusResponse & {
+  source_url: string | null
+  episode_title: string | null
+  podcast_name: string | null
+  duration_seconds: number | null
+  transcript_url: string | null
+  timestamps_url: string | null
+  stats_url: string | null
+  user_id: string | null
+}
+
+type User = {
+  id: string
+  name: string
+  device_fingerprint: string | null
+  created_at: string
+}
+
+type Subscription = {
+  id: string
+  user_id: string
+  podcast_title: string
+  podcast_author: string | null
+  feed_url: string
+  artwork_url: string | null
+  collection_id: number | null
+  added_at: string
+}
+
 function loadSavedSettings(): SavedSettings | null {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
@@ -40,94 +137,218 @@ function loadSavedSettings(): SavedSettings | null {
   }
 }
 
+function formatDuration(ms?: number): string {
+  if (!ms || ms <= 0) return 'Unknown length'
+  const totalSeconds = Math.floor(ms / 1000)
+  const h = Math.floor(totalSeconds / 3600)
+  const m = Math.floor((totalSeconds % 3600) / 60)
+  const s = totalSeconds % 60
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  }
+  return `${m}:${String(s).padStart(2, '0')}`
+}
+
+function formatSecondsToHMS(seconds: number): string {
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = Math.round(seconds % 60)
+  if (h > 0) return `${h}h ${m}m ${s}s`
+  if (m > 0) return `${m}m ${s}s`
+  return `${s}s`
+}
+
+function formatTimestamp(iso: string | null): string {
+  if (!iso) return '—'
+  try {
+    return new Date(iso).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) + ' ET'
+  } catch {
+    return iso
+  }
+}
+
+function episodePlayableUrl(episode: EpisodeResult): string {
+  return episode.episodeUrl || episode.previewUrl || ''
+}
+
+function toAbsoluteUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) {
+    return url
+  }
+
+  if (url.startsWith('/')) {
+    return `${window.location.origin}${url}`
+  }
+
+  return `${window.location.origin}/${url}`
+}
+
+function apiUrl(path: string): string {
+  return `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
 function App() {
   const savedSettings = loadSavedSettings()
+
   const [openAiKey, setOpenAiKey] = useState(savedSettings?.openAiKey ?? '')
-  const [detectionMode, setDetectionMode] = useState<'local' | 'hybrid' | 'openai'>(savedSettings?.detectionMode ?? 'local')
-  const [backend, setBackend] = useState<'parakeet' | 'whisper' | 'openai-whisper'>(savedSettings?.backend ?? 'parakeet')
-  const [removeOriginal, setRemoveOriginal] = useState(savedSettings?.removeOriginal ?? true)
-  const [searchTerm, setSearchTerm] = useState('daily')
+  const [openAiModel, setOpenAiModel] = useState(savedSettings?.openAiModel ?? 'gpt-4o-mini')
+  const [detectionMode, setDetectionMode] = useState<DetectionMode>(savedSettings?.detectionMode ?? 'local')
+  const [backend, setBackend] = useState<Backend>(savedSettings?.backend ?? 'parakeet')
+
+  const [searchTerm, setSearchTerm] = useState('smartless')
   const [isSearching, setIsSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [podcasts, setPodcasts] = useState<PodcastResult[]>([])
   const [activePodcast, setActivePodcast] = useState<PodcastResult | null>(null)
+
   const [episodes, setEpisodes] = useState<EpisodeResult[]>([])
+  const [episodePage, setEpisodePage] = useState(0)
   const [isLoadingEpisodes, setIsLoadingEpisodes] = useState(false)
   const [episodeError, setEpisodeError] = useState('')
   const [activeEpisode, setActiveEpisode] = useState<EpisodeResult | null>(null)
-  const [audioUrl, setAudioUrl] = useState('')
+  const [sourceAudioUrl, setSourceAudioUrl] = useState('')
 
-  const [selectedFile, setSelectedFile] = useState('')
-  const [isDesktop, setIsDesktop] = useState(false)
-  const [desktopRoot, setDesktopRoot] = useState('')
-  const [isRunning, setIsRunning] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isPreparingPlayback, setIsPreparingPlayback] = useState(false)
   const [runError, setRunError] = useState('')
   const [logLines, setLogLines] = useState<string[]>([])
-  const [lastResult, setLastResult] = useState<null | {
-    backend: string
-    outputDir: string
-    editedAudio: string
-    runSummary: string
-  }>(null)
+  const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null)
+  const [processedAudioUrl, setProcessedAudioUrl] = useState('')
+  const [directDownloadUrl, setDirectDownloadUrl] = useState('')
+  const [activeJobId, setActiveJobId] = useState<string>(() => window.localStorage.getItem(ACTIVE_JOB_KEY) ?? '')
 
-  useEffect(() => {
-    let unsubscribe: (() => void) | undefined
+  const [liveJobs, setLiveJobs] = useState<JobRecord[]>([])
+  const [completedJobs, setCompletedJobs] = useState<JobRecord[]>([])
+  const [failedJobs, setFailedJobs] = useState<JobRecord[]>([])
+  const [selectedHistoryJob, setSelectedHistoryJob] = useState<JobRecord | null>(null)
 
-    if (!window.desktopApi) {
-      return
-    }
+  const [users, setUsers] = useState<User[]>([])
+  const [currentUserId, setCurrentUserId] = useState<string>(
+    () => window.localStorage.getItem(USER_KEY) ?? ''
+  )
+  const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
 
-    window.desktopApi.getCapabilities().then((capabilities) => {
-      setIsDesktop(capabilities.isDesktop)
-      setDesktopRoot(capabilities.adCutForgeRoot)
-      setBackend('parakeet')
-      setDetectionMode('local')
-    })
-
-    unsubscribe = window.desktopApi.onProcessingEvent((event) => {
-      setLogLines((current) => [...current, `[${event.type}] ${event.line}`].slice(-120))
-    })
-
-    return () => {
-      unsubscribe?.()
-    }
-  }, [])
-
-  useEffect(() => {
-    const payload: SavedSettings = {
-      openAiKey,
-      detectionMode,
-      backend,
-      removeOriginal,
-    }
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
-  }, [openAiKey, detectionMode, backend, removeOriginal])
-
-  const isOpenAiEnabled = openAiKey.trim().length > 0
-  const canRunDesktopJob = isDesktop && selectedFile.trim().length > 0 && !isRunning
+  const processedUrlRef = useRef<string | null>(null)
 
   const activeAudioLabel = useMemo(() => {
     if (!activeEpisode) return 'No episode selected'
     return activeEpisode.trackName
   }, [activeEpisode])
 
-  const formatDuration = (ms?: number) => {
-    if (!ms || ms <= 0) return 'Unknown length'
-    const totalSeconds = Math.floor(ms / 1000)
-    const h = Math.floor(totalSeconds / 3600)
-    const m = Math.floor((totalSeconds % 3600) / 60)
-    const s = totalSeconds % 60
-    if (h > 0) {
-      return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  const canSubmit = Boolean(activeEpisode && episodePlayableUrl(activeEpisode) && !isSubmitting)
+  const isOpenAiEnabled = openAiKey.trim().length > 0
+
+  useEffect(() => {
+    const payload: SavedSettings = {
+      openAiKey,
+      openAiModel,
+      detectionMode,
+      backend,
     }
-    return `${m}:${String(s).padStart(2, '0')}`
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+  }, [openAiKey, openAiModel, detectionMode, backend])
+
+  useEffect(() => {
+    return () => {
+      if (processedUrlRef.current) {
+        URL.revokeObjectURL(processedUrlRef.current)
+        processedUrlRef.current = null
+      }
+    }
+  }, [])
+
+  function appendLog(message: string): void {
+    const stamp = new Date().toLocaleTimeString()
+    setLogLines((current) => [...current, `${stamp}  ${message}`].slice(-180))
   }
 
-  const runPodcastSearch = async () => {
-    const term = searchTerm.trim()
+  function setActiveJob(jobId: string): void {
+    setActiveJobId(jobId)
+    if (jobId) {
+      window.localStorage.setItem(ACTIVE_JOB_KEY, jobId)
+    } else {
+      window.localStorage.removeItem(ACTIVE_JOB_KEY)
+    }
+  }
+
+  async function loadPodcastEpisodes(podcast: PodcastResult): Promise<EpisodeResult[]> {
+    setEpisodeError('')
+    setIsLoadingEpisodes(true)
+
+    try {
+      const cached = getEpisodeCache(podcast.collectionId)
+      let normalized: EpisodeResult[]
+
+      if (cached) {
+        normalized = cached
+      } else {
+        const lookupUrl = apiUrl(`/api/catalog/episodes?collection_id=${podcast.collectionId}`)
+        const response = await fetch(lookupUrl)
+        if (!response.ok) {
+          throw new Error(`Could not load episodes (${response.status})`)
+        }
+
+        const payload = (await response.json()) as { results?: Array<Record<string, unknown>> }
+        normalized = (payload.results ?? [])
+          .filter((item) => item.wrapperType === 'podcastEpisode')
+          .map((item) => ({
+            trackId: Number(item.trackId),
+            trackName: String(item.trackName ?? 'Untitled episode'),
+            description: typeof item.description === 'string' ? item.description : undefined,
+            releaseDate: typeof item.releaseDate === 'string' ? item.releaseDate : undefined,
+            episodeUrl: typeof item.episodeUrl === 'string' ? item.episodeUrl : undefined,
+            previewUrl: typeof item.previewUrl === 'string' ? item.previewUrl : undefined,
+            trackTimeMillis: typeof item.trackTimeMillis === 'number' ? item.trackTimeMillis : undefined,
+          }))
+          .filter((item) => item.trackId > 0)
+          .sort((a, b) => {
+            const dateA = a.releaseDate ? Date.parse(a.releaseDate) : 0
+            const dateB = b.releaseDate ? Date.parse(b.releaseDate) : 0
+            return dateB - dateA
+          })
+        setEpisodeCache(podcast.collectionId, normalized)
+      }
+
+      setEpisodes(normalized)
+
+      if (normalized.length > 0) {
+        const firstPlayable = normalized.find((item) => episodePlayableUrl(item).length > 0) ?? normalized[0]
+        setActiveEpisode(firstPlayable)
+        setSourceAudioUrl(episodePlayableUrl(firstPlayable))
+      } else {
+        setActiveEpisode(null)
+        setSourceAudioUrl('')
+      }
+
+      return normalized
+    } catch (error) {
+      setEpisodeError(error instanceof Error ? error.message : 'Could not fetch episodes.')
+      setEpisodes([])
+      setActiveEpisode(null)
+      setSourceAudioUrl('')
+      return []
+    } finally {
+      setIsLoadingEpisodes(false)
+    }
+  }
+
+  async function selectPodcast(podcast: PodcastResult): Promise<EpisodeResult[]> {
+    setActivePodcast(podcast)
+    setEpisodePage(0)
+    return loadPodcastEpisodes(podcast)
+  }
+
+  async function runPodcastSearch(termOverride?: string): Promise<PodcastResult[]> {
+    const term = (termOverride ?? searchTerm).trim()
     if (!term) {
       setSearchError('Enter a podcast name or topic.')
-      return
+      return []
     }
 
     setSearchError('')
@@ -135,190 +356,484 @@ function App() {
     setIsSearching(true)
 
     try {
-      const url = `https://itunes.apple.com/search?media=podcast&limit=24&term=${encodeURIComponent(term)}`
-      const response = await fetch(url)
-      if (!response.ok) {
-        throw new Error(`Search failed (${response.status})`)
+      const cached = getSearchCache(term)
+      let list: PodcastResult[]
+
+      if (cached) {
+        list = cached
+      } else {
+        const url = apiUrl(`/api/catalog/search?term=${encodeURIComponent(term)}`)
+        const response = await fetch(url)
+        if (!response.ok) {
+          throw new Error(`Search failed (${response.status})`)
+        }
+        const data = (await response.json()) as { results?: PodcastResult[] }
+        list = data.results ?? []
+        setSearchCache(term, list)
       }
 
-      const data = (await response.json()) as { results?: PodcastResult[] }
-      const list = data.results ?? []
       setPodcasts(list)
+
       if (list.length > 0) {
-        setActivePodcast(list[0])
+        await selectPodcast(list[0])
       } else {
         setActivePodcast(null)
         setEpisodes([])
         setActiveEpisode(null)
-        setAudioUrl('')
+        setSourceAudioUrl('')
       }
+
+      return list
     } catch (error) {
       setSearchError(error instanceof Error ? error.message : 'Search failed.')
+      return []
     } finally {
       setIsSearching(false)
     }
   }
 
-  const loadPodcastEpisodes = async (podcast: PodcastResult) => {
-    setActivePodcast(podcast)
-    setEpisodeError('')
-    setIsLoadingEpisodes(true)
-
-    try {
-      const lookupUrl = `https://itunes.apple.com/lookup?id=${podcast.collectionId}&entity=podcastEpisode&limit=40`
-      const response = await fetch(lookupUrl)
-      if (!response.ok) {
-        throw new Error(`Could not load episodes (${response.status})`)
-      }
-      const payload = (await response.json()) as { results?: Array<Record<string, unknown>> }
-      const normalized = (payload.results ?? [])
-        .filter((item) => item.wrapperType === 'podcastEpisode')
-        .map((item) => ({
-          trackId: Number(item.trackId),
-          trackName: String(item.trackName ?? 'Untitled episode'),
-          description: typeof item.description === 'string' ? item.description : undefined,
-          releaseDate: typeof item.releaseDate === 'string' ? item.releaseDate : undefined,
-          episodeUrl: typeof item.episodeUrl === 'string' ? item.episodeUrl : undefined,
-          previewUrl: typeof item.previewUrl === 'string' ? item.previewUrl : undefined,
-          trackTimeMillis: typeof item.trackTimeMillis === 'number' ? item.trackTimeMillis : undefined,
-        }))
-        .filter((item) => item.trackId > 0)
-
-      setEpisodes(normalized)
-      if (normalized.length > 0) {
-        const firstPlayable = normalized.find((ep) => ep.episodeUrl || ep.previewUrl) ?? normalized[0]
-        setActiveEpisode(firstPlayable)
-        setAudioUrl(firstPlayable.episodeUrl || firstPlayable.previewUrl || '')
-      } else {
-        setActiveEpisode(null)
-        setAudioUrl('')
-      }
-    } catch (error) {
-      setEpisodeError(error instanceof Error ? error.message : 'Could not fetch episodes.')
-      setEpisodes([])
-      setActiveEpisode(null)
-      setAudioUrl('')
-    } finally {
-      setIsLoadingEpisodes(false)
-    }
-  }
-
-  const chooseEpisode = (episode: EpisodeResult) => {
+  function chooseEpisode(episode: EpisodeResult): void {
     setActiveEpisode(episode)
-    setAudioUrl(episode.episodeUrl || episode.previewUrl || '')
+    setSourceAudioUrl(episodePlayableUrl(episode))
   }
 
-  const pickAudioFile = async () => {
-    if (!window.desktopApi) {
-      setRunError('File picking is only enabled in the Windows desktop shell right now.')
-      return
-    }
-
-    setRunError('')
-    const filePath = await window.desktopApi.pickAudioFile()
-    if (filePath) {
-      setSelectedFile(filePath)
-    }
-  }
-
-  const runProcessing = async () => {
-    if (!window.desktopApi) {
-      setRunError('Processing is currently wired through the Windows desktop shell.')
-      return
-    }
-
-    if (!selectedFile) {
-      setRunError('Select an audio file first.')
-      return
-    }
-
-    setRunError('')
-    setLogLines([])
-    setLastResult(null)
-    setIsRunning(true)
+  async function prepareProcessedPlayback(downloadPath: string): Promise<void> {
+    const absolute = toAbsoluteUrl(downloadPath)
+    setDirectDownloadUrl(absolute)
+    setIsPreparingPlayback(true)
 
     try {
-      const result = await window.desktopApi.runProcessing({
-        filePath: selectedFile,
-        settings: {
-          openAiApiKey: openAiKey,
-          openAiModel: 'gpt-4o-mini',
-          transcriptionBackend: backend,
-          detectionMode,
-          parakeetPythonPath: '',
-          parakeetModel: 'nvidia/parakeet-tdt-0.6b-v3',
-          removeOriginalAfterExport: removeOriginal,
-          cacheTtlDays: 30,
-        },
+      const response = await fetch(absolute)
+      if (!response.ok) {
+        throw new Error(`Could not fetch processed audio (${response.status})`)
+      }
+
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+
+      if (processedUrlRef.current) {
+        URL.revokeObjectURL(processedUrlRef.current)
+      }
+
+      processedUrlRef.current = objectUrl
+      setProcessedAudioUrl(objectUrl)
+      appendLog('Processed audio is ready to play in-browser.')
+    } finally {
+      setIsPreparingPlayback(false)
+    }
+  }
+
+  async function fetchLiveJobs(): Promise<void> {
+    try {
+      const userParam = currentUserId ? `&user_id=${encodeURIComponent(currentUserId)}` : ''
+      const response = await fetch(apiUrl(`/api/jobs?status=queued,running&limit=20${userParam}`))
+      if (!response.ok) return
+      const data = (await response.json()) as { jobs: JobRecord[] }
+      setLiveJobs(data.jobs ?? [])
+    } catch {
+      // Best-effort live monitoring
+    }
+  }
+
+  async function killJob(jobId: string): Promise<void> {
+    try {
+      await fetch(apiUrl(`/api/jobs/${jobId}/cancel`), { method: 'POST' })
+      void fetchLiveJobs()
+    } catch {
+      // ignore
+    }
+  }
+
+  async function fetchCompletedJobs(): Promise<void> {
+    try {
+      const userParam = currentUserId ? `&user_id=${encodeURIComponent(currentUserId)}` : ''
+      const response = await fetch(apiUrl(`/api/jobs?status=completed&limit=100${userParam}`))
+      if (!response.ok) return
+      const data = (await response.json()) as { jobs: JobRecord[] }
+      setCompletedJobs(data.jobs ?? [])
+    } catch {
+      // Best-effort history
+    }
+  }
+
+  async function fetchFailedJobs(): Promise<void> {
+    try {
+      const userParam = currentUserId ? `&user_id=${encodeURIComponent(currentUserId)}` : ''
+      const response = await fetch(apiUrl(`/api/jobs?status=failed,cancelled&limit=100${userParam}`))
+      if (!response.ok) return
+      const data = (await response.json()) as { jobs: JobRecord[] }
+      setFailedJobs(data.jobs ?? [])
+    } catch {
+      // Best-effort
+    }
+  }
+
+  async function fetchUsers(): Promise<void> {
+    try {
+      const response = await fetch(apiUrl('/api/users'))
+      if (!response.ok) return
+      const data = (await response.json()) as { users: User[] }
+      const list = data.users ?? []
+      setUsers(list)
+      // If no user is selected yet, pick the first one (test account).
+      if (!currentUserId && list.length > 0) {
+        const id = list[0].id
+        setCurrentUserId(id)
+        window.localStorage.setItem(USER_KEY, id)
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+
+  async function fetchSubscriptions(userId: string): Promise<void> {
+    if (!userId) return
+    try {
+      const response = await fetch(apiUrl(`/api/users/${encodeURIComponent(userId)}/subscriptions`))
+      if (!response.ok) return
+      const data = (await response.json()) as { subscriptions: Subscription[] }
+      setSubscriptions(data.subscriptions ?? [])
+    } catch {
+      // Best-effort
+    }
+  }
+
+  async function toggleSubscription(podcast: PodcastResult): Promise<void> {
+    if (!currentUserId) return
+    const alreadySubbed = subscriptions.some(
+      (s) => s.feed_url === podcast.feedUrl || s.collection_id === podcast.collectionId
+    )
+    if (alreadySubbed) {
+      const sub = subscriptions.find(
+        (s) => s.feed_url === podcast.feedUrl || s.collection_id === podcast.collectionId
+      )
+      if (!sub) return
+      await fetch(
+        apiUrl(`/api/users/${encodeURIComponent(currentUserId)}/subscriptions/${encodeURIComponent(sub.id)}`),
+        { method: 'DELETE' }
+      )
+    } else {
+      await fetch(
+        apiUrl(`/api/users/${encodeURIComponent(currentUserId)}/subscriptions`),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            podcast_title: podcast.collectionName,
+            podcast_author: podcast.artistName ?? null,
+            feed_url: podcast.feedUrl ?? '',
+            artwork_url: podcast.artworkUrl100 ?? podcast.artworkUrl600 ?? null,
+            collection_id: podcast.collectionId,
+          }),
+        }
+      )
+    }
+    void fetchSubscriptions(currentUserId)
+  }
+
+  async function deleteJobById(jobId: string): Promise<void> {
+    try {
+      await fetch(apiUrl(`/api/jobs/${jobId}`), { method: 'DELETE' })
+      void fetchCompletedJobs()
+      void fetchFailedJobs()
+      if (selectedHistoryJob?.job_id === jobId) setSelectedHistoryJob(null)
+    } catch {
+      // Best-effort
+    }
+  }
+
+  async function clearAllJobs(status: 'completed' | 'failed' | 'cancelled' | 'all' = 'all'): Promise<void> {
+    try {
+      await fetch(apiUrl('/api/jobs/clear'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: currentUserId || undefined, status }),
+      })
+      void fetchCompletedJobs()
+      void fetchFailedJobs()
+      setSelectedHistoryJob(null)
+    } catch {
+      // Best-effort
+    }
+  }
+
+  async function waitForJob(jobId: string): Promise<void> {
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      const response = await fetch(apiUrl(`/api/jobs/${jobId}`))
+      const status = (await response.json()) as Partial<JobStatusResponse> & { error?: string }
+
+      if (!response.ok) {
+        const detail = status.error || `Status check failed (${response.status})`
+        throw new Error(detail)
+      }
+
+      if (!status.job_id || !status.status) {
+        throw new Error('Status response was missing job details.')
+      }
+
+      const typedStatus = status as JobStatusResponse
+      const nextLogs = typedStatus.logs ? typedStatus.logs.split('\n').filter((line) => line.trim().length > 0) : []
+      setJobStatus(typedStatus)
+      setLogLines((current) => {
+        if (nextLogs.length === 0) {
+          return current
+        }
+        if (current.length === nextLogs.length && current.every((line, index) => line === nextLogs[index])) {
+          return current
+        }
+        return nextLogs.slice(-180)
+      })
+      appendLog(`Job ${jobId} status: ${typedStatus.status} (${Math.round(typedStatus.progress)}%)`)
+
+      if (typedStatus.status === 'completed') {
+        if (!typedStatus.download_url) {
+          throw new Error('Job completed but download URL was missing.')
+        }
+
+        setActiveJob('')
+        await prepareProcessedPlayback(typedStatus.download_url)
+        return
+      }
+
+      if (typedStatus.status === 'failed' || typedStatus.status === 'cancelled') {
+        setActiveJob('')
+        throw new Error(typedStatus.error_message || `Job ${typedStatus.status}.`)
+      }
+
+      await sleep(2500)
+    }
+
+    throw new Error('Timed out waiting for the processing job to finish.')
+  }
+
+  async function submitEpisodeForProcessing(episode: EpisodeResult, sourceLabel: string): Promise<void> {
+    const mediaUrl = episodePlayableUrl(episode)
+    if (!mediaUrl) {
+      setRunError('This episode does not expose an audio URL from iTunes.')
+      return
+    }
+
+    setRunError('')
+    setIsSubmitting(true)
+    setJobStatus(null)
+    setDirectDownloadUrl('')
+    setProcessedAudioUrl('')
+    setLogLines([])
+    setActiveJob('')
+
+    appendLog(`Submitting ${sourceLabel} with backend ${backend} and detection ${detectionMode}.`)
+
+    try {
+      const form = new FormData()
+      form.append('source_url', mediaUrl)
+      form.append('backend', backend)
+      form.append('detection_mode', detectionMode)
+      form.append('openai_model', openAiModel.trim() || 'gpt-4o-mini')
+      if (openAiKey.trim()) {
+        form.append('openai_api_key', openAiKey.trim())
+      }
+      if (currentUserId) {
+        form.append('user_id', currentUserId)
+      }
+      // Pass episode metadata so the server can store it on the job.
+      if (activeEpisode) {
+        form.append('episode_title', activeEpisode.trackName)
+      }
+      if (activePodcast) {
+        form.append('podcast_name', activePodcast.collectionName)
+      }
+
+      const response = await fetch(apiUrl('/api/jobs'), {
+        method: 'POST',
+        body: form,
       })
 
-      setLastResult({
-        backend: result.backend,
-        outputDir: result.outputDir,
-        editedAudio: result.editedAudio,
-        runSummary: result.runSummary,
-      })
+      const createResult = (await response.json()) as Partial<CreateJobResponse> & { error?: string }
+      if (!response.ok) {
+        throw new Error(createResult.error || `Job submit failed (${response.status})`)
+      }
+
+      if (!createResult.job_id) {
+        throw new Error('API did not return a job id.')
+      }
+
+      appendLog(`Job queued: ${createResult.job_id}`)
+      setActiveJob(createResult.job_id)
+      await waitForJob(createResult.job_id)
     } catch (error) {
-      setRunError(error instanceof Error ? error.message : 'Processing failed.')
+      const message = error instanceof Error ? error.message : 'Processing failed.'
+      setRunError(message)
+      appendLog(`Error: ${message}`)
     } finally {
-      setIsRunning(false)
+      setIsSubmitting(false)
     }
+  }
+
+  async function runSmartlessRoutine(): Promise<void> {
+    setBackend('parakeet')
+    setDetectionMode('local')
+    setSearchTerm('smartless')
+    appendLog('Running SmartLess latest-episode routine with Parakeet defaults.')
+
+    const results = await runPodcastSearch('smartless')
+    if (results.length === 0) {
+      setRunError('No podcasts matched SmartLess.')
+      return
+    }
+
+    const smartless =
+      results.find((item) => item.collectionName.toLowerCase().includes('smartless')) ?? results[0]
+
+    const loaded = await selectPodcast(smartless)
+    const latestPlayable = loaded.find((item) => episodePlayableUrl(item).length > 0)
+    if (!latestPlayable) {
+      setRunError('Could not find a playable episode URL for SmartLess.')
+      return
+    }
+
+    chooseEpisode(latestPlayable)
+    await submitEpisodeForProcessing(latestPlayable, 'SmartLess latest episode')
   }
 
   useEffect(() => {
-    runPodcastSearch()
+    void runPodcastSearch('smartless')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    if (!activePodcast) return
-    loadPodcastEpisodes(activePodcast)
-  }, [activePodcast?.collectionId])
+    void fetchLiveJobs()
+    const interval = setInterval(() => void fetchLiveJobs(), 5000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    void fetchCompletedJobs()
+    void fetchFailedJobs()
+    const interval = setInterval(() => { void fetchCompletedJobs(); void fetchFailedJobs() }, 30000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    void fetchUsers()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!activeJobId) return
+
+    void waitForJob(activeJobId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (currentUserId) {
+      window.localStorage.setItem(USER_KEY, currentUserId)
+      void fetchSubscriptions(currentUserId)
+      void fetchLiveJobs()
+      void fetchCompletedJobs()
+      void fetchFailedJobs()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId])
+
+  useEffect(() => {
+    if (jobStatus?.status === 'completed' || jobStatus?.status === 'failed') {
+      void fetchLiveJobs()
+      void fetchCompletedJobs()
+      void fetchFailedJobs()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobStatus?.status])
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <p className="kicker">Windows Desktop Player</p>
+        <p className="kicker">Linux Web Interface</p>
         <h1>Ad Free Podcast Player</h1>
         <p className="lede">
-          Search podcasts, play episodes, and run ad removal when you want a cleaned local copy.
+          Search for podcasts, pick the most recent episode, and run server-side ad removal with Parakeet by default.
         </p>
+        {users.length > 0 ? (
+          <div className="user-selector-row">
+            <label htmlFor="user-select">Account:</label>
+            <select
+              id="user-select"
+              value={currentUserId}
+              onChange={(e) => setCurrentUserId(e.target.value)}
+            >
+              {users.map((u) => (
+                <option key={u.id} value={u.id}>{u.name}</option>
+              ))}
+            </select>
+          </div>
+        ) : null}
       </header>
 
       <section className="player-layout">
         <div className="panel search-panel">
           <h2>Find podcasts</h2>
+
+          {subscriptions.length > 0 ? (
+            <div className="subscriptions-panel">
+              <p className="panel-subheading">Your favorites</p>
+              <div className="sub-list">
+                {subscriptions.map((sub) => (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    className="sub-item"
+                    onClick={() => void runPodcastSearch(sub.podcast_title)}
+                  >
+                    {sub.artwork_url ? (
+                      <img src={sub.artwork_url} alt="" className="sub-art" />
+                    ) : null}
+                    <span>{sub.podcast_title}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="search-row">
             <input
               type="text"
               value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+              onChange={(event) => setSearchTerm(event.target.value)}
               placeholder="Search podcasts"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  runPodcastSearch()
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  void runPodcastSearch()
                 }
               }}
             />
-            <button type="button" onClick={runPodcastSearch} disabled={isSearching}>
+            <button type="button" onClick={() => void runPodcastSearch()} disabled={isSearching}>
               {isSearching ? 'Searching...' : 'Search'}
             </button>
           </div>
+
+          <div className="button-row">
+            <button type="button" onClick={() => void runSmartlessRoutine()} disabled={isSubmitting || isSearching}>
+              Run latest SmartLess now
+            </button>
+          </div>
+
           {searchError ? <p className="error-text">{searchError}</p> : null}
+
           <div className="podcast-list">
             {podcasts.length === 0 ? <p className="tiny">No podcasts found yet.</p> : null}
-            {podcasts.map((podcast) => (
+            {podcasts.slice(0, 8).map((podcast) => (
               <button
                 key={podcast.collectionId}
                 type="button"
                 className={`podcast-item ${activePodcast?.collectionId === podcast.collectionId ? 'active' : ''}`}
-                onClick={() => setActivePodcast(podcast)}
+                onClick={() => void selectPodcast(podcast)}
               >
                 <img
                   src={podcast.artworkUrl100 || podcast.artworkUrl600 || ''}
                   alt=""
-                  onError={(e) => {
-                    ;(e.currentTarget as HTMLImageElement).style.visibility = 'hidden'
+                  onError={(event) => {
+                    ;(event.currentTarget as HTMLImageElement).style.visibility = 'hidden'
                   }}
                 />
                 <span>
@@ -336,14 +851,27 @@ function App() {
               <h2>{activePodcast?.collectionName || 'Episodes'}</h2>
               <p className="tiny">{activePodcast?.artistName || ''}</p>
             </div>
-            <span className="status neutral">{episodes.length} episodes</span>
+            <div className="episode-panel-actions">
+              <span className="status neutral">{episodes.length} episodes</span>
+              {activePodcast ? (
+                <button
+                  type="button"
+                  className={`sub-toggle-btn ${subscriptions.some((s) => s.collection_id === activePodcast.collectionId || s.feed_url === activePodcast.feedUrl) ? 'subbed' : ''}`}
+                  onClick={() => void toggleSubscription(activePodcast)}
+                >
+                  {subscriptions.some((s) => s.collection_id === activePodcast.collectionId || s.feed_url === activePodcast.feedUrl)
+                    ? '★ Favorited'
+                    : '☆ Favorite'}
+                </button>
+              ) : null}
+            </div>
           </div>
 
           {episodeError ? <p className="error-text">{episodeError}</p> : null}
           {isLoadingEpisodes ? <p className="tiny">Loading episodes...</p> : null}
 
           <div className="episode-list">
-            {episodes.map((episode) => (
+            {episodes.slice(episodePage * 10, episodePage * 10 + 10).map((episode) => (
               <button
                 key={episode.trackId}
                 type="button"
@@ -359,98 +887,352 @@ function App() {
               </button>
             ))}
           </div>
+          {episodes.length > 10 ? (
+            <div className="episode-pagination">
+              <button
+                type="button"
+                className="page-btn"
+                disabled={episodePage === 0}
+                onClick={() => setEpisodePage((p) => p - 1)}
+              >← Prev</button>
+              <span className="page-info">{episodePage + 1} / {Math.ceil(episodes.length / 10)}</span>
+              <button
+                type="button"
+                className="page-btn"
+                disabled={(episodePage + 1) * 10 >= episodes.length}
+                onClick={() => setEpisodePage((p) => p + 1)}
+              >Next →</button>
+            </div>
+          ) : null}
 
           <div className="player-bar">
-            <p className="now-playing">Now playing: <strong>{activeAudioLabel}</strong></p>
-            <audio key={audioUrl} controls src={audioUrl} className="audio-player" />
-            {!audioUrl ? <p className="tiny">This episode has no playable audio URL from iTunes.</p> : null}
+            <p className="now-playing">
+              Source episode: <strong>{activeAudioLabel}</strong>
+            </p>
+            <audio key={sourceAudioUrl} controls src={sourceAudioUrl} className="audio-player" />
+            {!sourceAudioUrl ? <p className="tiny">This episode has no playable audio URL from iTunes.</p> : null}
           </div>
         </div>
 
-        <div className="panel ad-panel">
-          <h2>Ad remover</h2>
-          <p className="tiny">
-            Pick a local audio file and generate an ad-free copy.
-          </p>
+        <div className="panel processing-panel">
+          <h2>Server ad remover</h2>
+          <p className="tiny">Configured API base: {API_BASE}</p>
 
-          <label>
-            Selected local file
-            <input type="text" value={selectedFile} readOnly placeholder="Choose an MP3 or other audio file" />
-          </label>
+          <div className="processing-field-row">
+            <label>
+              Backend
+              <select value={backend} onChange={(event) => setBackend(event.target.value as Backend)}>
+                <option value="parakeet">Parakeet</option>
+                <option value="whisper">Whisper local</option>
+                <option value="openai-whisper">OpenAI Whisper API</option>
+              </select>
+            </label>
+            <label>
+              Detection
+              <select value={detectionMode} onChange={(event) => setDetectionMode(event.target.value as DetectionMode)}>
+                <option value="local">Local</option>
+                <option value="hybrid">Hybrid</option>
+                <option value="openai">OpenAI only</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="processing-field-row">
+            <label>
+              OpenAI model
+              <input
+                type="text"
+                value={openAiModel}
+                onChange={(event) => setOpenAiModel(event.target.value)}
+                placeholder="gpt-4o-mini"
+              />
+            </label>
+            <label>
+              OpenAI key (optional)
+              <input
+                type="password"
+                placeholder="sk-..."
+                value={openAiKey}
+                onChange={(event) => setOpenAiKey(event.target.value)}
+              />
+            </label>
+          </div>
 
           <div className="button-row">
-            <button type="button" onClick={pickAudioFile}>Choose file</button>
-            <button type="button" onClick={runProcessing} disabled={!canRunDesktopJob}>
-              {isRunning ? 'Processing...' : 'Remove ads'}
+            <button
+              type="button"
+              disabled={!canSubmit || isPreparingPlayback}
+              onClick={() => {
+                if (!activeEpisode) return
+                void submitEpisodeForProcessing(activeEpisode, activeEpisode.trackName)
+              }}
+            >
+              {isSubmitting ? 'Processing...' : 'Remove ads from selected episode'}
             </button>
           </div>
 
-          <label>
-            Backend
-            <select value={backend} onChange={(e) => setBackend(e.target.value as 'parakeet' | 'whisper' | 'openai-whisper')}>
-              <option value="parakeet">Parakeet</option>
-              <option value="whisper">Whisper local</option>
-              <option value="openai-whisper">OpenAI Whisper API</option>
-            </select>
-          </label>
-
-          <label>
-            Detection mode
-            <select value={detectionMode} onChange={(e) => setDetectionMode(e.target.value as 'local' | 'hybrid' | 'openai')}>
-              <option value="local">Local</option>
-              <option value="hybrid">Hybrid</option>
-              <option value="openai">OpenAI only</option>
-            </select>
-          </label>
-
-          <label>
-            OpenAI API key (optional)
-            <input
-              type="password"
-              placeholder="sk-..."
-              value={openAiKey}
-              onChange={(e) => setOpenAiKey(e.target.value)}
-            />
-          </label>
-
-          <label className="inline-toggle">
-            <input
-              type="checkbox"
-              checked={removeOriginal}
-              onChange={(e) => setRemoveOriginal(e.target.checked)}
-            />
-            Remove original file after export
-          </label>
-
           <div className="status-stack">
-            <span className={isDesktop ? 'status on' : 'status off'}>
-              {isDesktop ? 'Desktop bridge connected' : 'Desktop bridge offline'}
-            </span>
+            <span className="status on">Default backend: Parakeet</span>
             <span className={isOpenAiEnabled ? 'status on' : 'status neutral'}>
               {isOpenAiEnabled ? 'OpenAI key loaded' : 'OpenAI optional'}
             </span>
+            {jobStatus ? (
+              <span className={jobStatus.status === 'completed' ? 'status on' : 'status neutral'}>
+                Job {jobStatus.status} ({Math.round(jobStatus.progress)}%)
+              </span>
+            ) : null}
           </div>
 
-          {desktopRoot ? <p className="tiny">Engine: {desktopRoot}</p> : null}
           {runError ? <p className="error-text">{runError}</p> : null}
-          {lastResult ? (
+
+          {jobStatus ? (
             <div className="result-panel">
-              <p><strong>Backend:</strong> {lastResult.backend}</p>
-              <p><strong>Output folder:</strong> {lastResult.outputDir || 'Not reported'}</p>
-              <p><strong>Edited audio:</strong> {lastResult.editedAudio || 'No cut audio produced'}</p>
-              <p><strong>Run summary:</strong> {lastResult.runSummary || 'Not reported'}</p>
+              <p><strong>Job id:</strong> {jobStatus.job_id}</p>
+              <p><strong>Backend:</strong> {jobStatus.backend}</p>
+              <p><strong>Detection:</strong> {jobStatus.detection_mode}</p>
+              <p><strong>Status:</strong> {jobStatus.status}</p>
             </div>
+          ) : null}
+
+          <h3>Processed output</h3>
+          {isPreparingPlayback ? <p className="tiny">Preparing playback stream...</p> : null}
+          {processedAudioUrl ? <audio controls src={processedAudioUrl} className="audio-player" /> : null}
+          {directDownloadUrl ? (
+            <p className="tiny">
+              <a href={directDownloadUrl} target="_blank" rel="noreferrer">Download processed episode</a>
+            </p>
           ) : null}
 
           <h3>Live process log</h3>
           <div className="log-panel">
-            {logLines.length === 0 ? 'No process output yet.' : logLines.join('\n')}
+            {logLines.length === 0 ? 'No process output yet.' : [...logLines].reverse().join('\n')}
           </div>
         </div>
       </section>
 
+      {liveJobs.length > 0 ? (
+        <section className="live-section">
+          <h2 className="section-heading">Active conversions</h2>
+          <div className="live-jobs-list">
+            {liveJobs.map((job) => (
+              <div key={job.job_id} className="live-job-card">
+                <div className="live-job-top">
+                  <span className={`status ${job.status === 'running' ? 'on' : 'neutral'}`}>
+                    {job.status}
+                  </span>
+                  <span className="live-job-id">{job.job_id.slice(0, 8)}…</span>
+                  <span className="tiny">{job.backend} / {job.detection_mode}</span>
+                  <span className="live-job-pct">{Math.round(job.progress)}%</span>
+                  <button
+                    type="button"
+                    className="kill-btn"
+                    title="Kill this job"
+                    onClick={() => void killJob(job.job_id)}
+                  >
+                    Kill
+                  </button>
+                </div>
+                {job.started_at ? (
+                  <div className="live-job-started tiny">Started: {formatTimestamp(job.started_at)}</div>
+                ) : job.created_at ? (
+                  <div className="live-job-started tiny">Queued: {formatTimestamp(job.created_at)}</div>
+                ) : null}
+                <div className="progress-bar-track">
+                  <div
+                    className="progress-bar-fill"
+                    style={{ width: `${Math.max(2, Math.round(job.progress))}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <section className="history-section">
+        <div className="history-section-header">
+          <h2 className="section-heading">Ad-free episodes</h2>
+          {completedJobs.length > 0 ? (
+            <button type="button" className="clear-all-btn" onClick={() => void clearAllJobs('completed')}>
+              Clear completed
+            </button>
+          ) : null}
+        </div>
+        {completedJobs.length === 0 ? (
+          <p className="tiny">No completed conversions yet.</p>
+        ) : (
+          <div className="history-list">
+            {completedJobs.map((job) => (
+              <div key={job.job_id} className="history-item-wrap">
+                <button
+                  type="button"
+                  className="history-item"
+                  onClick={() => setSelectedHistoryJob(job)}
+                >
+                  <div className="history-item-main">
+                    {job.podcast_name ? <span className="history-podcast-name">{job.podcast_name}</span> : null}
+                    <strong className="history-episode-title">
+                      {job.episode_title ?? (() => { try { return job.source_url ? new URL(job.source_url).hostname : null } catch { return null } })() ?? 'Unknown episode'}
+                    </strong>
+                  </div>
+                  <div className="history-item-meta">
+                    <span className="tiny">{formatTimestamp(job.created_at)}</span>
+                    {job.duration_seconds != null ? (
+                      <span className="tiny">{formatSecondsToHMS(job.duration_seconds)}</span>
+                    ) : null}
+                    <span className="tiny history-job-id">{job.job_id.slice(0, 8)}</span>
+                    {job.download_url ? (
+                      <span className="status on">Ready</span>
+                    ) : (
+                      <span className="status neutral">No file</span>
+                    )}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  className="delete-job-btn"
+                  title="Delete this job"
+                  onClick={() => void deleteJobById(job.job_id)}
+                >✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {failedJobs.length > 0 ? (
+        <section className="history-section log-section">
+          <div className="history-section-header">
+            <h2 className="section-heading">Conversion log</h2>
+            <button type="button" className="clear-all-btn" onClick={() => void clearAllJobs('all')}>
+              Clear all
+            </button>
+          </div>
+          <div className="history-list">
+            {failedJobs.map((job) => (
+              <div key={job.job_id} className="history-item-wrap">
+                <button
+                  type="button"
+                  className="history-item history-item-failed"
+                  onClick={() => setSelectedHistoryJob(job)}
+                >
+                  <div className="history-item-main">
+                    {job.podcast_name ? <span className="history-podcast-name">{job.podcast_name}</span> : null}
+                    <strong className="history-episode-title">
+                      {job.episode_title ?? (() => { try { return job.source_url ? new URL(job.source_url).hostname : null } catch { return null } })() ?? 'Unknown episode'}
+                    </strong>
+                    {job.error_message ? <span className="history-error-msg">{job.error_message}</span> : null}
+                  </div>
+                  <div className="history-item-meta">
+                    <span className={`status ${job.status === 'cancelled' ? 'neutral' : 'off'}`}>{job.status}</span>
+                    <span className="tiny">{formatTimestamp(job.created_at)}</span>
+                    <span className="tiny history-job-id">{job.job_id.slice(0, 8)}</span>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  className="delete-job-btn"
+                  title="Delete this record"
+                  onClick={() => void deleteJobById(job.job_id)}
+                >✕</button>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {selectedHistoryJob ? (
+        <div
+          className="detail-overlay"
+          role="dialog"
+          aria-modal="true"
+          onClick={(e) => { if (e.target === e.currentTarget) setSelectedHistoryJob(null) }}
+        >
+          <div className="detail-modal">
+            <div className="detail-modal-header">
+              <h2>Episode detail</h2>
+              <button type="button" className="close-btn" onClick={() => setSelectedHistoryJob(null)}>✕</button>
+            </div>
+
+            {selectedHistoryJob.episode_title ? (
+              <p><strong>{selectedHistoryJob.episode_title}</strong></p>
+            ) : null}
+            {selectedHistoryJob.podcast_name ? (
+              <p className="tiny">{selectedHistoryJob.podcast_name}</p>
+            ) : null}
+
+            <div className="result-panel">
+              <p><strong>Job ID:</strong> {selectedHistoryJob.job_id}</p>
+              <p><strong>Backend:</strong> {selectedHistoryJob.backend} / {selectedHistoryJob.detection_mode}</p>
+              <p><strong>Status:</strong> {selectedHistoryJob.status}</p>
+              {selectedHistoryJob.duration_seconds != null ? (
+                <p><strong>Processing time:</strong> {formatSecondsToHMS(selectedHistoryJob.duration_seconds)}</p>
+              ) : null}
+              <p><strong>Queued:</strong> {formatTimestamp(selectedHistoryJob.created_at)}</p>
+              <p><strong>Started:</strong> {formatTimestamp(selectedHistoryJob.started_at)}</p>
+              <p><strong>Finished:</strong> {formatTimestamp(selectedHistoryJob.finished_at)}</p>
+              {selectedHistoryJob.source_url ? (
+                <p><strong>Source:</strong> <span className="tiny">{selectedHistoryJob.source_url}</span></p>
+              ) : null}
+            </div>
+
+            <div className="detail-links">
+              {selectedHistoryJob.download_url ? (
+                <a
+                  href={toAbsoluteUrl(selectedHistoryJob.download_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="detail-link-btn"
+                >
+                  Download ad-free audio
+                </a>
+              ) : null}
+              {selectedHistoryJob.transcript_url ? (
+                <a
+                  href={toAbsoluteUrl(selectedHistoryJob.transcript_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="detail-link-btn secondary"
+                >
+                  View transcript
+                </a>
+              ) : null}
+              {selectedHistoryJob.timestamps_url ? (
+                <a
+                  href={toAbsoluteUrl(selectedHistoryJob.timestamps_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="detail-link-btn secondary"
+                >
+                  Ad timestamps (JSON)
+                </a>
+              ) : null}
+              {selectedHistoryJob.stats_url ? (
+                <a
+                  href={toAbsoluteUrl(selectedHistoryJob.stats_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="detail-link-btn secondary"
+                >
+                  Processing stats
+                </a>
+              ) : null}
+            </div>
+
+            {selectedHistoryJob.download_url ? (
+              <audio
+                controls
+                src={toAbsoluteUrl(selectedHistoryJob.download_url)}
+                className="audio-player"
+              />
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       <footer className="footer-note">
-        This is a Windows desktop app. Podcast search uses iTunes public API, and ad removal runs locally via AdCutForge.
+        This web app is wired to the Linux API worker stack and defaults to Parakeet + local detection.
+        {' · '}Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
       </footer>
     </div>
   )

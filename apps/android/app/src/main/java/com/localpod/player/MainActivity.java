@@ -93,6 +93,7 @@ public class MainActivity extends Activity {
     private static final int BG = 0xfff4f7fb;
     private static final int SURFACE = 0xffffffff;
     private static final int BLUE = 0xff1769aa;
+    private static final int BROWN = 0xff8b5e3c;
     private static final int TEAL = 0xff0f766e;
     private static final int CORAL = 0xffd94f70;
     private static final int INK = 0xff202124;
@@ -110,6 +111,11 @@ public class MainActivity extends Activity {
     private static final double AD_PADDING_AFTER_SECONDS = 4.0;
     private static final double MIN_KEEP_RANGE_SECONDS = 0.75;
     private static final String SAMPLE_FEED_URL = "https://www.omnycontent.com/d/playlist/e73c998e-6e60-432f-8610-ae210140c5b1/2e824128-fbd5-4c9e-9a57-ae2f0056b0c4/66d98a23-900c-44b0-a40b-ae2f0056b0db/podcast.rss";
+    private static final String CURRENT_AD_API_HOST = "adsbegone.sitesindevelopment.com";
+    private static final String LEGACY_AD_API_HOST = "agitated-engelbart.74-208-203-194.plesk.page";
+    private static final String DEFAULT_AD_API_BASE_URL = "https://" + CURRENT_AD_API_HOST + "/adfree-api";
+    private static final int REMOTE_JOB_POLL_INTERVAL_MS = 10000;
+    private static final int REMOTE_JOB_MAX_POLLS = 360;
     private static final String[] FILTERS = {"All", "New", "In progress", "Downloaded", "Not downloaded", "Listened", "Unlistened"};
 
     private static final String NOTIF_CH_REMOVAL = "ad_removal";
@@ -187,6 +193,9 @@ public class MainActivity extends Activity {
         TextView h = text(title, 30, INK, true);
         h.setPadding(0, dp(4), 0, dp(8));
         root.addView(h);
+        TextView buildInfo = text("v" + BuildConfig.VERSION_NAME + " | " + BuildConfig.BUILD_TIMESTAMP_UTC, 10, MUTED, false);
+        buildInfo.setPadding(0, 0, 0, dp(6));
+        root.addView(buildInfo);
         LinearLayout nav = row();
         nav.setBackground(rounded(0xffffffff, dp(22), LINE));
         nav.setPadding(dp(4), dp(4), dp(4), dp(4));
@@ -606,16 +615,16 @@ public class MainActivity extends Activity {
         autoplay.setChecked(settingBool("autoplay_next", false));
         autoplay.setOnCheckedChangeListener((b, checked) -> db.setSetting("autoplay_next", checked ? "1" : "0"));
         root.addView(autoplay);
-        section("Ad Removal — Transcription Engine");
+        section("Ad Removal — Server Engine");
         String curEngine = db.setting("transcription_engine", ENGINE_VOSK);
-        root.addView(text("Choose how episodes are transcribed before ad detection. Local options run fully on this device and need no API key. OpenAI Whisper is the most accurate but costs API credits.", 14, MUTED, false));
+        root.addView(text("Choose which server transcription backend to use when you tap Remove ads. Parakeet is the default and works without an OpenAI key.", 14, MUTED, false));
         LinearLayout engineRow = new LinearLayout(this);
         engineRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         String[][] engineOpts = {
-            {ENGINE_VOSK,   "Vosk\n(local ~40 MB)"},
-            {ENGINE_WHISPER, "Whisper\n(local ~142 MB)"},
-            {ENGINE_OPENAI, "OpenAI\nWhisper"}
+            {ENGINE_VOSK,   "Parakeet\n(server default)"},
+            {ENGINE_WHISPER, "Whisper\n(server)"},
+            {ENGINE_OPENAI, "OpenAI\nWhisper server"}
         };
         for (String[] opt : engineOpts) {
             Button btn = new Button(this);
@@ -636,15 +645,17 @@ public class MainActivity extends Activity {
         }
         root.addView(engineRow);
         if (ENGINE_VOSK.equals(curEngine)) {
-            root.addView(text("Vosk runs offline. On first use the app downloads a ~40 MB English model and stores it on the device.", 13, MUTED, false));
+            root.addView(text("Parakeet runs on your server worker and is the recommended default.", 13, MUTED, false));
         } else if (ENGINE_WHISPER.equals(curEngine)) {
-            String whisperStatus = WhisperEngine.isAvailable() ? "Whisper (whisper.cpp) runs offline. On first use the app downloads a ~142 MB model." : "Whisper native library not detected. Build the app with NDK support enabled, or choose Vosk instead.";
-            root.addView(text(whisperStatus, 13, WhisperEngine.isAvailable() ? MUTED : CORAL, false));
+            root.addView(text("Whisper backend runs server-side. Use this if you prefer Whisper over Parakeet.", 13, MUTED, false));
         } else {
-            root.addView(text("OpenAI Whisper sends audio to OpenAI's servers. Requires an API key and internet. Most accurate.", 13, MUTED, false));
+            root.addView(text("OpenAI Whisper backend uses OpenAI transcription. Requires an OpenAI API key.", 13, MUTED, false));
         }
-        section("Ad Detection");
-        root.addView(text("If an OpenAI API key is set, GPT-4o-mini scans the transcript for ad breaks (best accuracy). Without a key, a built-in keyword scan is used for local engines.", 14, MUTED, false));
+        section("Ad Removal API");
+        root.addView(text("Set the base URL for your hosted ad-removal API. The app uploads downloaded audio, polls job status, and downloads the ad-free result.", 14, MUTED, false));
+        settingText("Ad API base URL", "ad_api_base_url", DEFAULT_AD_API_BASE_URL);
+        section("OpenAI Options");
+        root.addView(text("Optional. If provided, the key/model are forwarded to the server API for OpenAI-based processing and detection.", 14, MUTED, false));
         settingText("OpenAI API key", "openai_api_key", "");
         settingText("OpenAI model", "openai_model", "gpt-4o-mini");
         settingNumber("Download retention days", "download_retention_days", 30);
@@ -709,9 +720,27 @@ public class MainActivity extends Activity {
         wrapper.setPadding(0, dp(4), 0, dp(4));
         wrapper.addView(text(label, 15, INK, false));
         EditText value = input(def);
-        value.setText(db.setting(key, def));
+        String existing = db.setting(key, def);
+        if ("ad_api_base_url".equals(key)) {
+            existing = normalizeApiBaseUrl(existing);
+            if (TextUtils.isEmpty(existing)) {
+                existing = normalizeApiBaseUrl(DEFAULT_AD_API_BASE_URL);
+            }
+        }
+        value.setText(existing);
         wrapper.addView(value);
-        wrapper.addView(button("Save", v -> db.setSetting(key, value.getText().toString().trim())));
+        wrapper.addView(button("Save", v -> {
+            String saved = value.getText().toString().trim();
+            if ("ad_api_base_url".equals(key)) {
+                saved = normalizeApiBaseUrl(saved);
+                if (TextUtils.isEmpty(saved)) {
+                    saved = normalizeApiBaseUrl(DEFAULT_AD_API_BASE_URL);
+                }
+                value.setText(saved);
+                setStatus("Ad API base URL saved.");
+            }
+            db.setSetting(key, saved);
+        }));
         root.addView(wrapper);
     }
 
@@ -860,23 +889,23 @@ public class MainActivity extends Activity {
 
     private void removeAds(Episode e) {
         if (!e.downloaded()) {
-            showError("Download required", "Download the episode first so the app can process the file locally.");
+            showError("Download required", "Download the episode first so the app can resolve the episode URL and save the ad-free copy offline.");
             return;
         }
         String engine = db.setting("transcription_engine", ENGINE_VOSK);
         if (ENGINE_OPENAI.equals(engine) && TextUtils.isEmpty(db.setting("openai_api_key", ""))) {
-            showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to a local transcription engine (Vosk or Whisper).");
+            showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to Parakeet/Whisper server processing.");
             return;
         }
-        // Force-refresh clears cached transcript so the whole run starts fresh
+        // Refresh re-queues processing and replaces any prior ad-free output.
         boolean isRefresh = "processed".equals(e.adSupportedStatus) || "no_ads_found".equals(e.adSupportedStatus);
         queueAdRemoval(e, isRefresh);
     }
 
     private String engineLabel(String engine) {
-        if (ENGINE_WHISPER.equals(engine)) return "Whisper local";
-        if (ENGINE_OPENAI.equals(engine)) return "OpenAI Whisper";
-        return "Vosk local";
+        if (ENGINE_WHISPER.equals(engine)) return "Whisper server";
+        if (ENGINE_OPENAI.equals(engine)) return "OpenAI Whisper server";
+        return "Parakeet server";
     }
 
     private void runAndroidAdRemoval(String episodeId) {
@@ -895,149 +924,392 @@ public class MainActivity extends Activity {
             handleAdError(); return;
         }
 
-        String engine   = localDb.setting("transcription_engine", ENGINE_VOSK);
-        String apiKey   = localDb.setting("openai_api_key", "").trim();
-        String gptModel = localDb.setting("openai_model", "gpt-4o-mini").trim();
-        boolean hasKey  = !TextUtils.isEmpty(apiKey);
-        int chunkSeconds = ENGINE_OPENAI.equals(engine) ? OPENAI_CHUNK_SECONDS : LOCAL_CHUNK_SECONDS;
+        String engine = localDb.setting("transcription_engine", ENGINE_VOSK);
+        String apiKey = localDb.setting("openai_api_key", "").trim();
+        String openAiModel = localDb.setting("openai_model", "gpt-4o-mini").trim();
+        String backend = apiBackendForEngine(engine);
+        String detectionMode = apiDetectionModeForEngine(engine, !TextUtils.isEmpty(apiKey));
+        String apiBase = apiBaseUrlSetting(localDb);
+        String sourceUrl = normalizeUrl(episode.enclosureUrl);
 
-        double audioSeconds = audioDurationSeconds(source, Math.max(1, episode.durationSeconds));
-        adCurrentEst = estimateRemovalTime(engine, audioSeconds);
-        long tTotal = System.currentTimeMillis();
-        long tStep;
-
-        // ── Step 1: Transcription (resumable via disk cache) ────────────────
-        File cacheFile = transcriptCacheFile(episode.id, engine);
-        ArrayList<TranscriptSegment> segments = null;
-        long transcriptionSec = 0;
-
-        if (cacheFile.exists()) {
-            ArrayList<TranscriptSegment> cached = loadTranscriptCache(cacheFile);
-            if (cached != null && !cached.isEmpty()) {
-                segments = cached;
-                addCallLog("TRANSCRIPT CACHE HIT", cacheFile.getName(), "", 0,
-                    "engine=" + engine, "Loaded " + segments.size() + " cached segments — skipping re-transcription.", 0);
-                adCurrentStatus = "Transcript loaded from cache (" + segments.size() + " segments)";
-                postUi(() -> refreshAdBusyPanel());
-                updateAdNotification();
-            } else {
-                cacheFile.delete();
+        String jobId = "";
+        try {
+            if (adCancelled.get()) throw new AdRemovalCancelledException();
+            if (TextUtils.isEmpty(sourceUrl)) {
+                throw new RuntimeException("Episode source URL is missing.");
             }
-        }
 
-        if (segments == null) {
-            if (adCancelled.get()) { handleCancelled(); return; }
-            adCurrentStatus = "Chunking audio for transcription...";
+            adCurrentStatus = "Queueing server job with episode URL...";
             postUi(() -> refreshAdBusyPanel());
             updateAdNotification();
 
-            File chunkDir = new File(getCacheDir(), "adfree-" + episode.id);
-            try {
-                ArrayList<File> chunks = createTranscriptionChunks(source, chunkDir, chunkSeconds);
-                tStep = System.currentTimeMillis();
-
-                try {
-                    switch (engine) {
-                        case ENGINE_OPENAI:  segments = transcribeChunksWithOpenAi(chunks, apiKey);  break;
-                        case ENGINE_WHISPER: segments = transcribeChunksWithWhisperCpp(chunks);       break;
-                        default:             segments = transcribeChunksWithVosk(chunks);             break;
-                    }
-                } catch (AdRemovalCancelledException ex) {
-                    deleteRecursively(chunkDir);
-                    handleCancelled();
-                    return;
-                }
-
-                if (adCancelled.get()) { deleteRecursively(chunkDir); handleCancelled(); return; }
-                if (segments.isEmpty()) throw new RuntimeException("No timestamped transcript segments were returned.");
-
-                transcriptionSec = (System.currentTimeMillis() - tStep) / 1000;
-                saveTranscriptCache(cacheFile, segments);
-                addCallLog("TRANSCRIPT COMPLETE", "", "", 0,
-                    "engine=" + engine, "Saved " + segments.size() + " segments to cache. Took " + transcriptionSec + "s.", 0);
-            } catch (AdRemovalCancelledException ex) {
-                deleteRecursively(chunkDir);
-                handleCancelled(); return;
-            } catch (Exception ex) {
-                deleteRecursively(chunkDir);
-                String body = TextUtils.isEmpty(ex.getMessage()) ? "Transcription failed." : ex.getMessage();
-                postUi(() -> showError("Ad removal failed", body));
-                handleAdError(); return;
-            } finally {
-                deleteRecursively(chunkDir);
+            JSONObject created = createRemoteAdRemovalJob(apiBase, sourceUrl, backend, detectionMode, apiKey, openAiModel);
+            jobId = created.optString("job_id", "").trim();
+            if (TextUtils.isEmpty(jobId)) {
+                throw new RuntimeException("Server did not return a job id.");
             }
-        }
 
-        if (adCancelled.get()) { handleCancelled(); return; }
+            addCallLog("API CREATE JOB", resolveApiUrl(apiBase, "/api/jobs"), "", 201,
+                "backend=" + backend + ", detection_mode=" + detectionMode,
+                "job_id=" + jobId, 0);
 
-        // ── Step 2: Ad detection ────────────────────────────────────────────
-        tStep = System.currentTimeMillis();
-        ArrayList<TranscriptAdRange> adRanges;
-        try {
-            if (hasKey) {
-                adCurrentStatus = "Finding ad ranges with OpenAI...";
-                postUi(() -> refreshAdBusyPanel()); updateAdNotification();
-                adRanges = detectAdRangesWithOpenAi(segments, apiKey,
-                    TextUtils.isEmpty(gptModel) ? "gpt-4o-mini" : gptModel);
-            } else {
-                adCurrentStatus = "Finding ad ranges (local keyword scan)...";
-                postUi(() -> refreshAdBusyPanel()); updateAdNotification();
-                adRanges = detectAdRangesLocally(segments);
+            adCurrentStatus = "Server job queued (" + jobId.substring(0, Math.min(8, jobId.length())) + "...)";
+            postUi(() -> refreshAdBusyPanel());
+            updateAdNotification();
+
+            JSONObject done = waitForRemoteJobCompletion(apiBase, jobId);
+            String finalState = done.optString("status", "");
+            if (!"completed".equals(finalState)) {
+                String err = done.optString("error_message", "");
+                if (TextUtils.isEmpty(err)) err = "Server job ended with status: " + finalState;
+                throw new RuntimeException(err);
             }
-        } catch (Exception ex) {
-            String body = TextUtils.isEmpty(ex.getMessage()) ? "Ad detection failed." : ex.getMessage();
-            postUi(() -> showError("Ad removal failed", body));
-            handleAdError(); return;
-        }
-        long detectionSec = (System.currentTimeMillis() - tStep) / 1000;
-        addCallLog("AD DETECTION", "", "", 0, "engine=" + engine,
-            adRanges.size() + " raw ranges found in " + detectionSec + "s.", 0);
 
-        adRanges = mergeRanges(adRanges, 4.0, 8.0);
-        if (adRanges.isEmpty()) {
-            localDb.setAdStatus(episode.id, "no_ads_found");
-            cacheFile.delete();
-            synchronized (completionCards) { completionCards.add(new String[]{episode.id, episode.title, "no_ads"}); }
-            postCompletionNotification("No ads found: " + episode.title, "Finished processing. No ad ranges detected.");
-            postUi(() -> { refreshAdBusyPanel(); showEpisode(episode.id); });
-            processNextFromQueue(); return;
-        }
+            String downloadPath = done.optString("download_url", "").trim();
+            if (TextUtils.isEmpty(downloadPath)) {
+                downloadPath = "/api/jobs/" + jobId + "/download";
+            }
 
-        if (adCancelled.get()) { handleCancelled(); return; }
-
-        // ── Step 3: Render ──────────────────────────────────────────────────
-        tStep = System.currentTimeMillis();
-        try {
-            adCurrentStatus = "Rendering ad-free audio (" + adRanges.size() + " ad segments cut)...";
-            postUi(() -> refreshAdBusyPanel()); updateAdNotification();
+            adCurrentStatus = "Downloading ad-free audio...";
+            postUi(() -> refreshAdBusyPanel());
+            updateAdNotification();
 
             File output = buildProcessedAudioPath(source);
             File renderTarget = source.getAbsolutePath().equals(output.getAbsolutePath())
                 ? buildProcessedStagingPath(source) : output;
-            double durationSeconds = audioDurationSeconds(source, Math.max(1, episode.durationSeconds));
-            renderAdFreeAudio(source, renderTarget, adRanges, durationSeconds);
+            downloadRemoteAudioFromApi(apiBase, downloadPath, renderTarget);
             output = finalizeProcessedAudioOutput(source, output, renderTarget);
+
             localDb.setProcessedAudio(episode.id, output.getAbsolutePath(), "processed");
-            cacheFile.delete();
+
+            synchronized (completionCards) { completionCards.add(new String[]{episode.id, episode.title, "ok"}); }
+            postCompletionNotification("Ad removal complete", episode.title + " is ready to play ad-free.");
+            final String doneId = episode.id;
+            postUi(() -> { refreshAdBusyPanel(); showEpisode(doneId); });
+            processNextFromQueue();
+        } catch (AdRemovalCancelledException cancelled) {
+            if (!TextUtils.isEmpty(jobId)) cancelRemoteJobQuietly(apiBase, jobId);
+            handleCancelled();
         } catch (Exception ex) {
-            String body = TextUtils.isEmpty(ex.getMessage()) ? "Rendering failed." : ex.getMessage();
-            postUi(() -> showError("Ad removal failed", body));
-            handleAdError(); return;
+            String body = TextUtils.isEmpty(ex.getMessage()) ? "Server ad removal failed." : ex.getMessage();
+            if (isDnsLookupFailure(body)) {
+                String savedApiBase = apiBaseUrlSetting(localDb);
+                body = "DNS lookup failed for your Ad API host.\n\n"
+                    + "Saved Ad API base URL:\n"
+                    + savedApiBase
+                    + "\n\nOpen Settings -> Ad API base URL, tap Save, and retry. "
+                    + "If it still fails, set Android Private DNS to Automatic or Off.";
+            }
+            final String finalBody = body;
+            postUi(() -> showError("Ad removal failed", finalBody));
+            if (adCancelled.get() && !TextUtils.isEmpty(jobId)) cancelRemoteJobQuietly(apiBase, jobId);
+            handleAdError();
         }
-        long renderSec = (System.currentTimeMillis() - tStep) / 1000;
-        long totalSec  = (System.currentTimeMillis() - tTotal) / 1000;
-        addCallLog("RENDER COMPLETE", "", "", 0, "",
-            "Rendered in " + renderSec + "s. Total job: " + totalSec + "s.", 0);
+    }
 
-        // Save timing record for future estimates
-        localDb.ensureTimingTable();
-        localDb.saveTimingRecord(engine, (long) audioSeconds, transcriptionSec, detectionSec, renderSec, totalSec);
+    private String apiBackendForEngine(String engine) {
+        if (ENGINE_OPENAI.equals(engine)) return "openai-whisper";
+        if (ENGINE_WHISPER.equals(engine)) return "whisper";
+        return "parakeet";
+    }
 
-        synchronized (completionCards) { completionCards.add(new String[]{episode.id, episode.title, "ok"}); }
-        postCompletionNotification("Ad removal complete", episode.title + " is ready to play ad-free.");
-        final String doneId = episode.id;
-        postUi(() -> { refreshAdBusyPanel(); showEpisode(doneId); });
-        processNextFromQueue();
+    private String apiDetectionModeForEngine(String engine, boolean hasOpenAiKey) {
+        if (ENGINE_OPENAI.equals(engine)) return "openai";
+        return hasOpenAiKey ? "hybrid" : "local";
+    }
+
+    private String apiBaseUrlSetting(Db localDb) {
+        String configured = localDb.setting("ad_api_base_url", DEFAULT_AD_API_BASE_URL);
+        String normalized = normalizeApiBaseUrl(configured);
+        if (TextUtils.isEmpty(normalized)) {
+            normalized = normalizeApiBaseUrl(DEFAULT_AD_API_BASE_URL);
+        }
+        if (!TextUtils.equals(configured, normalized)) {
+            localDb.setSetting("ad_api_base_url", normalized);
+        }
+        return normalized;
+    }
+
+    private boolean isDnsLookupFailure(String message) {
+        if (TextUtils.isEmpty(message)) return false;
+        String lower = message.toLowerCase(Locale.US);
+        return lower.contains("unable to resolve host")
+            || lower.contains("no address associated with hostname")
+            || lower.contains("name or service not known");
+    }
+
+    private String normalizeApiBaseUrl(String configured) {
+        if (configured == null) return "";
+        String cleaned = configured
+            .replace('\u2010', '-')
+            .replace('\u2011', '-')
+            .replace('\u2012', '-')
+            .replace('\u2013', '-')
+            .replace('\u2014', '-')
+            .replace('\u2015', '-')
+            .replace('\u2212', '-')
+            .replace('\uFE63', '-')
+            .replace('\uFF0D', '-')
+            .replace("\u200B", "")
+            .replace("\u200C", "")
+            .replace("\u200D", "")
+            .replace("\uFEFF", "")
+            .replace('\u00A0', ' ')
+            .trim();
+
+        if (TextUtils.isEmpty(cleaned)) return "";
+
+        cleaned = stripWrappingQuotes(cleaned);
+        cleaned = cleaned.replace(" ", "");
+
+        if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
+            cleaned = "https://" + cleaned;
+        }
+
+        while (cleaned.endsWith("/")) {
+            cleaned = cleaned.substring(0, cleaned.length() - 1);
+        }
+
+        try {
+            Uri parsed = Uri.parse(cleaned);
+            String scheme = parsed.getScheme();
+            String host = parsed.getHost();
+            if (TextUtils.isEmpty(scheme) || TextUtils.isEmpty(host)) {
+                return cleaned;
+            }
+
+            if (LEGACY_AD_API_HOST.equalsIgnoreCase(host)) {
+                host = CURRENT_AD_API_HOST;
+            }
+
+            StringBuilder rebuilt = new StringBuilder();
+            rebuilt.append(scheme.toLowerCase(Locale.US)).append("://").append(host.toLowerCase(Locale.US));
+            if (parsed.getPort() > 0) {
+                rebuilt.append(':').append(parsed.getPort());
+            }
+
+            String path = parsed.getEncodedPath();
+            if (!TextUtils.isEmpty(path)) {
+                while (path.endsWith("/")) {
+                    path = path.substring(0, path.length() - 1);
+                }
+                rebuilt.append(path);
+            }
+            return rebuilt.toString();
+        } catch (Exception ignored) {
+            return cleaned;
+        }
+    }
+
+    private String stripWrappingQuotes(String text) {
+        String out = text;
+        if (out.length() >= 2) {
+            char first = out.charAt(0);
+            char last = out.charAt(out.length() - 1);
+            boolean wrapped = (first == '"' && last == '"')
+                || (first == '\'' && last == '\'')
+                || (first == '\u201C' && last == '\u201D')
+                || (first == '\u2018' && last == '\u2019');
+            if (wrapped) {
+                out = out.substring(1, out.length() - 1).trim();
+            }
+        }
+        return out;
+    }
+
+    private String resolveApiUrl(String apiBase, String pathOrUrl) {
+        if (TextUtils.isEmpty(pathOrUrl)) return apiBase;
+        if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+            return pathOrUrl;
+        }
+        if (!pathOrUrl.startsWith("/")) {
+            return apiBase + "/" + pathOrUrl;
+        }
+        try {
+            URL base = new URL(apiBase);
+            String basePath = base.getPath();
+            if (pathOrUrl.equals(basePath) || pathOrUrl.startsWith(basePath + "/")) {
+                String host = base.getProtocol() + "://" + base.getHost();
+                if (base.getPort() > 0) host += ":" + base.getPort();
+                return host + pathOrUrl;
+            }
+        } catch (Exception ignored) {}
+        return apiBase + pathOrUrl;
+    }
+
+    private JSONObject createRemoteAdRemovalJob(String apiBase, String sourceUrl, String backend, String detectionMode, String apiKey, String openAiModel) throws Exception {
+        String url = resolveApiUrl(apiBase, "/api/jobs");
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(30000);
+        connection.setReadTimeout(300000);
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+        connection.setRequestProperty("User-Agent", "AdFreePodAndroid/1.0");
+
+        StringBuilder form = new StringBuilder();
+        appendFormField(form, "source_url", sourceUrl);
+        appendFormField(form, "backend", backend);
+        appendFormField(form, "detection_mode", detectionMode);
+        appendFormField(form, "openai_model", TextUtils.isEmpty(openAiModel) ? "gpt-4o-mini" : openAiModel);
+        if (!TextUtils.isEmpty(apiKey)) {
+            appendFormField(form, "openai_api_key", apiKey);
+        }
+
+        try (OutputStream output = connection.getOutputStream()) {
+            output.write(form.toString().getBytes(StandardCharsets.UTF_8));
+            output.flush();
+        }
+
+        String body = readConnectionBody(connection);
+        int code = connection.getResponseCode();
+        if (code >= 400) {
+            throw new RuntimeException("Create job failed: " + summarizeApiError(body, code));
+        }
+        return parseJsonObject(body, "create job response");
+    }
+
+    private JSONObject fetchRemoteJobStatus(String apiBase, String jobId) throws Exception {
+        String url = resolveApiUrl(apiBase, "/api/jobs/" + URLEncoder.encode(jobId, "UTF-8"));
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(20000);
+        connection.setReadTimeout(120000);
+        connection.setRequestMethod("GET");
+        connection.setRequestProperty("User-Agent", "AdFreePodAndroid/1.0");
+        String body = readConnectionBody(connection);
+        int code = connection.getResponseCode();
+        if (code >= 400) {
+            throw new RuntimeException("Status check failed: " + summarizeApiError(body, code));
+        }
+        return parseJsonObject(body, "job status response");
+    }
+
+    private JSONObject waitForRemoteJobCompletion(String apiBase, String jobId) throws Exception {
+        for (int poll = 0; poll < REMOTE_JOB_MAX_POLLS; poll++) {
+            if (adCancelled.get()) throw new AdRemovalCancelledException();
+
+            JSONObject status = fetchRemoteJobStatus(apiBase, jobId);
+            String state = status.optString("status", "");
+            double progress = status.optDouble("progress", 0);
+            String step = lastLogLine(status.optString("logs", ""));
+            String text = "Server " + (TextUtils.isEmpty(state) ? "running" : state) + " (" + (int)Math.round(progress) + "%)";
+            if (!TextUtils.isEmpty(step)) {
+                text += " - " + step;
+            }
+            adCurrentStatus = text;
+            final String uiStatus = text;
+            postUi(() -> {
+                refreshAdBusyPanel();
+                setStatus(uiStatus);
+            });
+            updateAdNotification();
+
+            if ("completed".equals(state) || "failed".equals(state) || "cancelled".equals(state)) {
+                return status;
+            }
+
+            Thread.sleep(REMOTE_JOB_POLL_INTERVAL_MS);
+        }
+        throw new RuntimeException("Timed out waiting for server processing to finish.");
+    }
+
+    private void cancelRemoteJobQuietly(String apiBase, String jobId) {
+        try {
+            String url = resolveApiUrl(apiBase, "/api/jobs/" + URLEncoder.encode(jobId, "UTF-8") + "/cancel");
+            HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(60000);
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty("User-Agent", "AdFreePodAndroid/1.0");
+            try (OutputStream ignored = connection.getOutputStream()) { }
+            readConnectionBody(connection);
+        } catch (Exception ignored) {}
+    }
+
+    private void downloadRemoteAudioFromApi(String apiBase, String downloadPath, File target) throws Exception {
+        String url = resolveApiUrl(apiBase, downloadPath);
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(30000);
+        connection.setReadTimeout(300000);
+        connection.setRequestMethod("GET");
+        connection.setRequestProperty("User-Agent", "AdFreePodAndroid/1.0");
+        int code = connection.getResponseCode();
+        if (code >= 400) {
+            String body = readConnectionBody(connection);
+            throw new RuntimeException("Download failed: " + summarizeApiError(body, code));
+        }
+
+        File parent = target.getParentFile();
+        if (parent != null && !parent.exists()) parent.mkdirs();
+        long total = connection.getContentLengthLong();
+        long downloaded = 0;
+        long lastUiUpdate = 0;
+
+        try (InputStream in = new BufferedInputStream(connection.getInputStream());
+             FileOutputStream out = new FileOutputStream(target)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                if (adCancelled.get()) throw new AdRemovalCancelledException();
+                out.write(buf, 0, n);
+                downloaded += n;
+                long now = System.currentTimeMillis();
+                if (total > 0 && now - lastUiUpdate > 500) {
+                    long pct = downloaded * 100 / total;
+                    adCurrentStatus = "Downloading ad-free audio... " + pct + "%";
+                    postUi(() -> refreshAdBusyPanel());
+                    updateAdNotification();
+                    lastUiUpdate = now;
+                }
+            }
+        }
+
+        if (!target.exists() || target.length() <= 0) {
+            throw new RuntimeException("Server download produced an empty file.");
+        }
+    }
+
+    private String summarizeApiError(String body, int statusCode) {
+        if (!TextUtils.isEmpty(body)) {
+            try {
+                JSONObject obj = new JSONObject(body);
+                String error = obj.optString("error", "");
+                String detail = obj.optString("detail", "");
+                if (!TextUtils.isEmpty(error) && !TextUtils.isEmpty(detail)) return error + " (" + detail + ")";
+                if (!TextUtils.isEmpty(error)) return error;
+                if (!TextUtils.isEmpty(detail)) return detail;
+            } catch (Exception ignored) {}
+            return body;
+        }
+        return "HTTP " + statusCode;
+    }
+
+    private void appendFormField(StringBuilder form, String key, String value) throws Exception {
+        if (form.length() > 0) form.append('&');
+        form.append(URLEncoder.encode(key, "UTF-8"));
+        form.append('=');
+        form.append(URLEncoder.encode(value == null ? "" : value, "UTF-8"));
+    }
+
+    private String lastLogLine(String logs) {
+        if (TextUtils.isEmpty(logs)) return "";
+        String[] lines = logs.split("\\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String line = lines[i] == null ? "" : lines[i].trim();
+            if (!TextUtils.isEmpty(line)) {
+                return line.length() > 140 ? line.substring(0, 137) + "..." : line;
+            }
+        }
+        return "";
+    }
+
+    private JSONObject parseJsonObject(String body, String label) throws Exception {
+        try {
+            return new JSONObject(body);
+        } catch (Exception ex) {
+            throw new RuntimeException("Could not parse " + label + ": " + body, ex);
+        }
     }
 
     private void handleCancelled() {
@@ -1966,7 +2238,7 @@ public class MainActivity extends Activity {
         return b;
     }
     private Button navButton(String s, View.OnClickListener l) {
-        Button b = styledButton(s, l, SOFT_BLUE, BLUE, 0);
+        Button b = styledButton(s, l, SOFT_BLUE, BROWN, 0);
         b.setMinHeight(dp(38));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1);
         lp.setMargins(dp(2), 0, dp(2), 0);

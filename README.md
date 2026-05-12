@@ -27,6 +27,10 @@ ad-free-podcast-player/
 │   │   ├── app/              # Main Android module
 │   │   ├── gradle/           # Gradle wrapper
 │   │   └── build.gradle      # Android build config
+│   ├── server/               # PHP API + worker processing stack
+│   │   ├── api/              # PHP upload/job API
+│   │   ├── worker/           # Linux worker (ffmpeg/AdCutForge)
+│   │   └── docker-compose.yml
 │   └── web/                  # Web/Vite project template
 ├── package.json              # Root workspace config
 ├── packages/                 # Shared packages (if any)
@@ -50,6 +54,12 @@ ad-free-podcast-player/
 - **Transcription**: OpenAI Whisper API
 - **Ad Detection**: Python-based processing via local service
 - **State**: SQLite database
+
+### Web Server
+- **API**: PHP 8.3 + SQLite
+- **Worker**: Python 3.11
+- **Media Runtime**: ffmpeg (default test mode) or AdCutForge
+- **Deployment**: Docker Compose (`apps/server/docker-compose.yml`)
 
 ### Shared
 - **Ad Removal Engine**: Python (`ad_cut_forge.py`)
@@ -127,6 +137,17 @@ adb install apps/android/Ad Free Podcast Player-debug.apk
 # Launch
 adb shell am start -n com.localpod.player/.MainActivity
 ```
+
+### Web Server API + Worker
+```bash
+# from repo root
+npm run server:up
+
+# API UI at
+http://localhost:8080
+```
+
+Server usage details live in `apps/server/README.md`.
 
 ## Project Status
 

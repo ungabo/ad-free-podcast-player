@@ -1,17 +1,57 @@
+import java.util.Properties
+import java.util.TimeZone
+
 plugins {
     id "com.android.application"
+}
+
+def versionStateFile = rootProject.file("version.properties")
+def versionState = new Properties()
+if (versionStateFile.exists()) {
+    versionStateFile.withInputStream { stream ->
+        versionState.load(stream)
+    }
+}
+
+def lastBuildNumber = Integer.parseInt(versionState.getProperty("LAST_BUILD_NUMBER", "0"))
+def lastVersionCode = Integer.parseInt(versionState.getProperty("LAST_VERSION_CODE", "3"))
+def nextBuildNumber = lastBuildNumber + 1
+def nextVersionCode = lastVersionCode + 1
+def nextVersionName = String.format("0.0.%03d", nextBuildNumber)
+def buildTimestampUtc = new Date().format("yyyy-MM-dd HH:mm:ss 'UTC'", TimeZone.getTimeZone("UTC"))
+
+def persistVersionState = {
+    versionState.setProperty("LAST_BUILD_NUMBER", String.valueOf(nextBuildNumber))
+    versionState.setProperty("LAST_VERSION_CODE", String.valueOf(nextVersionCode))
+    versionStateFile.withOutputStream { stream ->
+        versionState.store(stream, "Auto-managed build version state")
+    }
+}
+
+tasks.configureEach { task ->
+    def name = task.name.toLowerCase()
+    if (name.startsWith("assemble") || name.startsWith("bundle")) {
+        task.doLast {
+            persistVersionState.call()
+        }
+    }
 }
 
 android {
     namespace "com.adfreepod.player"
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId "com.adfreepod.player"
         minSdk 23
         targetSdk 35
-        versionCode 3
-        versionName "0.3.0"
+        versionCode nextVersionCode
+        versionName nextVersionName
+        buildConfigField "String", "BUILD_TIMESTAMP_UTC", "\"${buildTimestampUtc}\""
 
         ndk {
             abiFilters "arm64-v8a", "armeabi-v7a"
