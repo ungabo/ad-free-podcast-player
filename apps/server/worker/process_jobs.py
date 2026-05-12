@@ -25,6 +25,9 @@ ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", str(APP_STORAGE / "artifacts")))
 SOURCE_CACHE_DIR = Path(
     os.getenv("SOURCE_CACHE_DIR", str(APP_STORAGE / "source-cache"))
 ).resolve()
+HEARTBEAT_PATH = Path(
+    os.getenv("WORKER_HEARTBEAT", str(APP_STORAGE / "worker-heartbeat.json"))
+).resolve()
 BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
 BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
 BUNDLED_ADCUTFORGE_ROOT = BASE_DIR / "adcutforge"
@@ -55,12 +58,10 @@ ADCUTFORGE_ROOT = os.getenv(
 ).strip()
 ADCUTFORGE_PYTHON = os.getenv("ADCUTFORGE_PYTHON", "python3").strip()
 ADCUTFORGE_SCRIPT = os.getenv("ADCUTFORGE_SCRIPT", "").strip()
-PARAKEET_PYTHON = os.getenv("PARAKEET_PYTHON", "").strip()
-PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "nvidia/parakeet-tdt-0.6b-v3").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 MAX_LOG_CHARS = 60000
-PROGRESS_RE = re.compile(r"(\d+(?:\.\d+)?)%\s*$")
+PROGRESS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)%")
 
 
 def utc_now() -> str:
@@ -82,6 +83,21 @@ def ensure_directories() -> None:
         SOURCE_CACHE_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def write_heartbeat(state: str = "running") -> None:
+    payload = {
+        "state": state,
+        "time": utc_now(),
+        "mode": PROCESSOR_MODE,
+        "queue_dir": str(QUEUE_DIR),
+        "output_dir": str(OUTPUT_DIR),
+    }
+    try:
+        HEARTBEAT_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def open_db() -> sqlite3.Connection:
@@ -113,6 +129,7 @@ def mark_running(job_id: str) -> None:
 
 
 def mark_runtime(job_id: str, progress: float, logs: str) -> None:
+    write_heartbeat("running")
     capped = max(5.0, min(95.0, progress))
     now = utc_now()
     with open_db() as connection:
@@ -481,13 +498,13 @@ def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -
     job_artifacts_dir = ARTIFACTS_DIR / job_id
     job_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    requested_backend = str(payload.get("backend", "parakeet")).strip().lower()
-    backend = "whisper" if requested_backend == "openai-whisper" else requested_backend
-    if backend not in ("parakeet", "whisper"):
-        backend = "parakeet"
+    backend = str(payload.get("backend", "openai-whisper")).strip().lower()
+    if backend not in ("whisper", "openai-whisper"):
+        backend = "openai-whisper"
 
     command = [
         ADCUTFORGE_PYTHON,
+        "-u",
         str(script),
         "--cli",
         "--overwrite",
@@ -508,12 +525,6 @@ def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -
     openai_model = str(payload.get("openai_model", "")).strip()
     if openai_model:
         command.extend(["--openai-model", openai_model])
-
-    if backend == "parakeet":
-        if PARAKEET_PYTHON:
-            command.extend(["--parakeet-python", PARAKEET_PYTHON])
-        if PARAKEET_MODEL:
-            command.extend(["--parakeet-model", PARAKEET_MODEL])
 
     command.append(str(input_path))
     command_cwd = Path(ADCUTFORGE_ROOT).resolve() if ADCUTFORGE_ROOT else script.parent
@@ -536,7 +547,21 @@ def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -
     emit_runtime_update(job_id, logs_list, 40.0, "40% Running AdCutForge")
     exit_code, logs, edited_audio = run_command(command, cwd=command_cwd, on_line=on_line)
     if exit_code != 0:
-        raise RuntimeError(f"AdCutForge failed with exit code {exit_code}")
+        lines = [line.strip() for line in logs.strip().splitlines() if line.strip()]
+        detail = next(
+            (
+                line
+                for line in lines
+                if "selected, but" in line.lower()
+                or "not available" in line.lower()
+                or "not installed" in line.lower()
+                or "no openai api key" in line.lower()
+                or "failed" in line.lower()
+            ),
+            lines[-1] if lines else "",
+        )
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"AdCutForge failed with exit code {exit_code}{suffix}")
 
     rendered = find_rendered_audio(input_path, edited_audio)
     if rendered is None:
@@ -545,12 +570,21 @@ def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -
     emit_runtime_update(job_id, logs_list, 95.0, "95% Finalizing processed output")
     shutil.copy2(rendered, output_path)
 
+    transcript_path: Optional[str] = None
     timestamps_path: Optional[str] = None
+    transcript_candidate = job_artifacts_dir / "transcript.txt"
+    if transcript_candidate.exists():
+        transcript_path = str(transcript_candidate)
+    else:
+        transcript_candidate = job_artifacts_dir / "transcript_timestamped.txt"
+        if transcript_candidate.exists():
+            transcript_path = str(transcript_candidate)
+
     timestamps_candidate = job_artifacts_dir / "timestamps.json"
     if timestamps_candidate.exists():
         timestamps_path = str(timestamps_candidate)
 
-    return str(output_path), logs, timestamps_path
+    return str(output_path), logs, timestamps_path, transcript_path
 
 
 def process_job_file(queue_file: Path) -> None:
@@ -587,9 +621,10 @@ def process_job_file(queue_file: Path) -> None:
         emit_runtime_update(job_id, logs_list, 8.0, "8% Preparing source audio")
         prepare_input_audio(job_id, payload, logs_list)
 
+        transcript_path: Optional[str] = None
         timestamps_path: Optional[str] = None
         if PROCESSOR_MODE == "adcutforge":
-            output_path, _, timestamps_path = run_adcutforge(job_id, payload, logs_list)
+            output_path, _, timestamps_path, transcript_path = run_adcutforge(job_id, payload, logs_list)
         elif PROCESSOR_MODE == "ffmpeg-copy":
             output_path, _ = run_ffmpeg_copy(job_id, payload, logs_list)
         else:
@@ -597,7 +632,14 @@ def process_job_file(queue_file: Path) -> None:
 
         finished_at = time.time()
         duration_seconds = save_job_stats(job_id, payload, started_at, finished_at)
-        mark_completed(job_id, output_path, "\n".join(logs_list), duration_seconds, timestamps_path=timestamps_path)
+        mark_completed(
+            job_id,
+            output_path,
+            "\n".join(logs_list),
+            duration_seconds,
+            transcript_path=transcript_path,
+            timestamps_path=timestamps_path,
+        )
         print(f"[worker] Completed job {job_id}")
     except Exception as exception:
         mark_failed(job_id, str(exception), "\n".join(logs_list))
@@ -609,6 +651,7 @@ def process_job_file(queue_file: Path) -> None:
 
 
 def process_queue_once() -> bool:
+    write_heartbeat("polling")
     processed = False
     for queue_file in sorted(QUEUE_DIR.glob("*.json")):
         working_file = queue_file.with_suffix(".working")
@@ -639,14 +682,17 @@ def main() -> None:
         "[worker] Starting with "
         f"mode={PROCESSOR_MODE}, queue={QUEUE_DIR}, output={OUTPUT_DIR}, cache={SOURCE_CACHE_DIR}"
     )
+    write_heartbeat("started")
 
     if args.once:
         process_queue_once()
+        write_heartbeat("idle")
         return
 
     while True:
         did_work = process_queue_once()
         if not did_work:
+            write_heartbeat("idle")
             time.sleep(POLL_SECONDS)
 
 

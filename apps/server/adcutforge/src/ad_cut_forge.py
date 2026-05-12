@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
-"""
-Minimal CLI-compatible ad_cut_forge shim for Linux server processing.
+﻿#!/usr/bin/env python3
+"""Headless AdCutForge runner for the Linux web worker.
 
-This script matches the argument contract expected by the worker and emits
-an "Edited audio:" line with the rendered output path.
+The Windows app ships a full GUI plus local transcription tooling. This
+headless runner keeps that contract for the web worker: transcribe with
+timestamped segments, detect ad ranges, render cuts, then transcribe/compare
+the edited result for verification artifacts.
 """
 
 from __future__ import annotations
@@ -11,14 +12,36 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
+import re
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
 BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
+
+
+@dataclass(frozen=True)
+class Segment:
+    index: int
+    start: float
+    end: float
+    text: str
+
+
+@dataclass(frozen=True)
+class AdRange:
+    start: float
+    end: float
+    confidence: float
+    reason: str
+    source: str
 
 
 def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -26,7 +49,7 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def detect_duration_seconds(ffprobe_bin: str, input_file: Path) -> float:
-    probe_cmd = [
+    result = run_command([
         ffprobe_bin,
         "-v",
         "error",
@@ -35,20 +58,13 @@ def detect_duration_seconds(ffprobe_bin: str, input_file: Path) -> float:
         "-of",
         "default=noprint_wrappers=1:nokey=1",
         str(input_file),
-    ]
-    result = run_command(probe_cmd)
+    ])
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffprobe failed")
-
-    raw = result.stdout.strip()
-    try:
-        return float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Unable to parse duration from ffprobe output: {raw}") from exc
+    return float(result.stdout.strip())
 
 
 def choose_intro_trim_seconds(duration_seconds: float) -> float:
-    # Conservative heuristic for long-form podcasts with typical pre-roll ads.
     if duration_seconds >= 1800:
         return 90.0
     if duration_seconds >= 900:
@@ -58,129 +74,547 @@ def choose_intro_trim_seconds(duration_seconds: float) -> float:
     return 0.0
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Headless AdCutForge-compatible CLI")
+    parser.add_argument("--cli", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--backend", default="openai-whisper")
+    parser.add_argument("--detection-mode", default="local")
+    parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY", ""))
+    parser.add_argument("--openai-model", default="gpt-4o-mini")
+    parser.add_argument("--artifacts-dir", default="")
+    parser.add_argument("input_file")
+    return parser.parse_args()
+
+
 def build_output_path(input_file: Path) -> Path:
     return input_file.with_name(f"{input_file.stem}.noads.m4a")
 
 
-def build_ffmpeg_command(
-    ffmpeg_bin: str,
-    input_file: Path,
-    output_file: Path,
-    trim_start: float,
-) -> list[str]:
-    command = [
-        ffmpeg_bin,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-    if trim_start > 0:
-        command.extend(["-ss", f"{trim_start:.2f}"])
+def normalize_detection_mode(value: str | None, openai_key: str = "") -> str:
+    mode = (value or "").strip().lower().replace("_", "-")
+    if mode in ("openai", "openai-only", "ai"):
+        return "openai"
+    if mode in ("hybrid", "both"):
+        return "hybrid"
+    if openai_key.strip() and mode not in ("local", "local-only", "heuristic", "heuristics"):
+        return "hybrid"
+    return "local"
 
-    command.extend(
-        [
+
+def seconds_to_srt_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    total = int(seconds)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d},{millis:03d}"
+
+
+def write_transcripts(segments: list[Segment], artifacts_dir: Path) -> None:
+    clean = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+    stamped = "\n".join(
+        f"[{seconds_to_srt_time(segment.start)} --> {seconds_to_srt_time(segment.end)}] {segment.text}"
+        for segment in segments
+    )
+    (artifacts_dir / "transcript.txt").write_text(clean + "\n", encoding="utf-8")
+    (artifacts_dir / "transcript_timestamped.txt").write_text(stamped + "\n", encoding="utf-8")
+    (artifacts_dir / "segments.json").write_text(
+        json.dumps([segment.__dict__ for segment in segments], indent=2), encoding="utf-8"
+    )
+
+
+
+def transcribe_openai(
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    input_file: Path,
+    api_key: str,
+    artifacts_dir: Path,
+    prefix: str = "source",
+) -> list[Segment]:
+    try:
+        from openai import OpenAI
+    except Exception as exc:
+        raise RuntimeError("OpenAI Python package is not available on the server.") from exc
+
+    client = OpenAI(api_key=api_key)
+    segments: list[Segment] = []
+
+    with tempfile.TemporaryDirectory(prefix="adfree-openai-") as temp_dir:
+        chunk_pattern = str(Path(temp_dir) / f"{prefix}-chunk-%03d.mp3")
+        command = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
             "-i",
             str(input_file),
             "-vn",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "64k",
             "-ac",
             "1",
-            str(output_file),
+            "-ar",
+            "16000",
+            "-b:a",
+            "32k",
+            "-f",
+            "segment",
+            "-segment_time",
+            os.getenv("OPENAI_TRANSCRIBE_CHUNK_SECONDS", "120"),
+            "-reset_timestamps",
+            "1",
+            chunk_pattern,
         ]
+        result = run_command(command)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ffmpeg chunking failed")
+
+        offset = 0.0
+        index = 0
+        for chunk in sorted(Path(temp_dir).glob(f"{prefix}-chunk-*.mp3")):
+            chunk_duration = detect_duration_seconds(ffprobe_bin, chunk)
+            print(f"Transcribing chunk at {offset:.0f}s")
+            with chunk.open("rb") as handle:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=handle,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            raw_segments = getattr(transcript, "segments", None)
+            if raw_segments is None and isinstance(transcript, dict):
+                raw_segments = transcript.get("segments")
+            chunk_had_segments = False
+            for raw in raw_segments or []:
+                text = str(getattr(raw, "text", raw.get("text", "") if isinstance(raw, dict) else "")).strip()
+                start = float(getattr(raw, "start", raw.get("start", 0.0) if isinstance(raw, dict) else 0.0))
+                end = float(getattr(raw, "end", raw.get("end", start) if isinstance(raw, dict) else start))
+                if text:
+                    segments.append(Segment(index=index, start=offset + start, end=offset + end, text=text))
+                    index += 1
+                    chunk_had_segments = True
+            if not chunk_had_segments:
+                text = str(getattr(transcript, "text", "") if not isinstance(transcript, dict) else transcript.get("text", "")).strip()
+                if text:
+                    segments.append(Segment(index=index, start=offset, end=offset + chunk_duration, text=text))
+                    index += 1
+            offset += chunk_duration
+
+    if not segments:
+        raise RuntimeError("OpenAI transcription returned no timestamped segments.")
+    (artifacts_dir / f"{prefix}.segments.json").write_text(
+        json.dumps([segment.__dict__ for segment in segments], indent=2), encoding="utf-8"
     )
-    return command
+    if prefix == "source":
+        write_transcripts(segments, artifacts_dir)
+    return segments
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AdCutForge-compatible CLI shim")
-    parser.add_argument("--cli", action="store_true", help="Compatibility flag")
-    parser.add_argument("--overwrite", action="store_true", help="Compatibility flag")
-    parser.add_argument("--backend", default="parakeet", help="Backend name")
-    parser.add_argument("--detection-mode", default="local", help="Detection mode")
-    parser.add_argument("--openai-api-key", default="", help="Optional OpenAI API key")
-    parser.add_argument("--openai-model", default="gpt-4o-mini", help="OpenAI model")
-    parser.add_argument("--parakeet-python", default="", help="Parakeet runtime python path")
-    parser.add_argument("--parakeet-model", default="nvidia/parakeet-tdt-0.6b-v3", help="Parakeet model")
-    parser.add_argument("--artifacts-dir", default="", help="Directory to write artifact files (timestamps.json, etc.)")
-    parser.add_argument("input_file", help="Input audio file")
-    return parser.parse_args()
+HEURISTIC_PATTERNS: list[tuple[str, float]] = [
+    (r"\b(ad|advertisement|sponsor|sponsored|promo code|offer code)\b", 0.3),
+    (r"\b(brought to you by|paid for by|support for this podcast)\b", 0.45),
+    (r"\b(go to|visit|head to|check out)\s+[a-z0-9][a-z0-9.-]+\.(com|net|org|io|co)\b", 0.4),
+    (r"\b(download the app|start your trial|sign up|get started|save \d+%)\b", 0.3),
+    (r"\b(use code|promo code|enter code|at checkout)\b", 0.4),
+]
+
+BREAK_LEADS = [
+    r"\bwe'?ll be right back\b",
+    r"\bafter (the|a) break\b",
+    r"\bbefore we get back\b",
+    r"\band we'?re back\b",
+]
+
+
+def score_segment(text: str) -> tuple[float, list[str]]:
+    lower = text.lower()
+    score = 0.0
+    reasons: list[str] = []
+    for pattern, weight in HEURISTIC_PATTERNS:
+        if re.search(pattern, lower):
+            score += weight
+            reasons.append(pattern)
+    if len(lower) > 60 and re.search(r"\byou\b", lower) and re.search(r"\b(save|get|try|visit|use|download)\b", lower):
+        score += 0.15
+        reasons.append("direct-response language")
+    return min(score, 1.0), reasons
+
+
+def merge_ranges(ranges: list[AdRange], bridge_gap: float = 20.0, min_seconds: float = 8.0) -> list[AdRange]:
+    if not ranges:
+        return []
+    merged: list[AdRange] = []
+    for item in sorted(ranges, key=lambda ad: ad.start):
+        if not merged or item.start > merged[-1].end + bridge_gap:
+            merged.append(item)
+            continue
+        previous = merged[-1]
+        merged[-1] = AdRange(
+            start=previous.start,
+            end=max(previous.end, item.end),
+            confidence=max(previous.confidence, item.confidence),
+            reason=previous.reason + "; " + item.reason,
+            source=previous.source if previous.source == item.source else "mixed",
+        )
+    return [item for item in merged if item.end - item.start >= min_seconds]
+
+
+def detect_ads_local(segments: list[Segment], duration: float) -> list[AdRange]:
+    ranges: list[AdRange] = []
+    active_start: float | None = None
+    active_end: float | None = None
+    active_reasons: list[str] = []
+
+    for segment in segments:
+        score, reasons = score_segment(segment.text)
+        lower = segment.text.lower()
+        has_break_lead = any(re.search(pattern, lower) for pattern in BREAK_LEADS)
+        if score >= 0.35 or has_break_lead:
+            if active_start is None or segment.start > (active_end or 0) + 25.0:
+                active_start = max(0.0, segment.start - 5.0)
+                active_reasons = []
+            active_end = min(duration, segment.end + 8.0)
+            active_reasons.extend(reasons or ["break cue"])
+        elif active_start is not None and active_end is not None and segment.start <= active_end + 18.0:
+            active_end = min(duration, segment.end + 3.0)
+        elif active_start is not None and active_end is not None:
+            ranges.append(AdRange(active_start, active_end, 0.65, ", ".join(sorted(set(active_reasons))), "local"))
+            active_start = None
+            active_end = None
+            active_reasons = []
+
+    if active_start is not None and active_end is not None:
+        ranges.append(AdRange(active_start, active_end, 0.65, ", ".join(sorted(set(active_reasons))), "local"))
+
+    return merge_ranges(ranges)
+
+
+def compact_segments_for_prompt(segments: list[Segment]) -> str:
+    rows = [
+        {"i": segment.index, "start": round(segment.start, 2), "end": round(segment.end, 2), "text": segment.text[:280]}
+        for segment in segments
+    ]
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def call_openai_for_ads(segments: list[Segment], api_key: str, model: str) -> list[AdRange]:
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ad_ranges",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "ad_ranges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "confidence": {"type": "number"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["start", "end", "confidence", "reason"],
+                        },
+                    }
+                },
+                "required": ["ad_ranges"],
+            },
+        },
+    }
+    system = (
+        "You identify inserted ads in timestamped podcast transcripts. "
+        "Return exact ad-copy spans only. Do not mark normal show discussion as an ad. "
+        "Ad spans are usually under 180 seconds. If a transcript segment is too coarse to identify exact ad copy, return no range."
+    )
+    ranges: list[AdRange] = []
+    for start in range(0, len(segments), 90):
+        batch = segments[start : start + 90]
+        payload = {
+            "model": model or "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "Find ad breaks in this JSON segment list:\n" + compact_segments_for_prompt(batch)},
+            ],
+            "response_format": schema,
+            "temperature": 0,
+        }
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(exc.read().decode("utf-8", errors="replace")) from exc
+        content = response_data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        for item in parsed.get("ad_ranges", []):
+            ad = AdRange(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                confidence=float(item["confidence"]),
+                reason=str(item["reason"]),
+                source="openai",
+            )
+            if ad.confidence >= 0.65 and 3.0 <= (ad.end - ad.start) <= 240.0:
+                ranges.append(ad)
+    return merge_ranges(ranges, bridge_gap=25.0, min_seconds=8.0)
+
+
+def constrain_ad_ranges(ranges: list[AdRange], duration: float) -> list[AdRange]:
+    constrained: list[AdRange] = []
+    for item in ranges:
+        start = 0.0 if item.start < 10.0 else item.start
+        normalized = AdRange(start, item.end, item.confidence, item.reason, item.source)
+        if 3.0 <= (normalized.end - normalized.start) <= 300.0 and normalized.end <= duration + 1.0:
+            constrained.append(normalized)
+    total = sum(item.end - item.start for item in constrained)
+    if duration > 0 and total > min(duration * 0.25, 900.0):
+        return []
+    if duration > 0 and any((item.end - item.start) > duration * 0.2 for item in constrained):
+        return []
+    return constrained
+
+
+def apply_margins(ranges: list[AdRange], duration: float, before: float = 0.75, after: float = 0.75) -> list[AdRange]:
+    return merge_ranges(
+        [
+            AdRange(
+                start=max(0.0, item.start - before),
+                end=min(duration, item.end + after),
+                confidence=item.confidence,
+                reason=item.reason,
+                source=item.source,
+            )
+            for item in ranges
+        ],
+        bridge_gap=30.0,
+        min_seconds=1.0,
+    )
+
+
+def write_ad_artifacts(ranges: list[AdRange], artifacts_dir: Path, method: str) -> None:
+    payload = [
+        {
+            "type": "ad",
+            "start_sec": round(item.start, 3),
+            "end_sec": round(item.end, 3),
+            "confidence": item.confidence,
+            "reason": item.reason,
+            "source": item.source,
+        }
+        for item in ranges
+    ]
+    (artifacts_dir / "timestamps.json").write_text(
+        json.dumps({"method": method, "segments": payload, "ad_ranges": payload}, indent=2), encoding="utf-8"
+    )
+
+
+def render_with_cuts(ffmpeg_bin: str, input_file: Path, output_file: Path, ranges: list[AdRange], duration: float) -> None:
+    keep: list[tuple[float, float]] = []
+    cursor = 0.0
+    for ad in sorted(ranges, key=lambda item: item.start):
+        if ad.start > cursor + 0.05:
+            keep.append((cursor, ad.start))
+        cursor = max(cursor, ad.end)
+    if cursor < duration - 0.05:
+        keep.append((cursor, duration))
+    if not keep:
+        raise RuntimeError("Detected ad ranges cover the whole file.")
+
+    with tempfile.TemporaryDirectory(prefix="adfree-cut-") as temp_dir:
+        list_file = Path(temp_dir) / "concat.txt"
+        parts: list[str] = []
+        for index, (start, end) in enumerate(keep):
+            part = Path(temp_dir) / f"part-{index:04d}.m4a"
+            result = run_command([
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start:.3f}",
+                "-to",
+                f"{end:.3f}",
+                "-i",
+                str(input_file),
+                "-vn",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+                "-ac",
+                "1",
+                str(part),
+            ])
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "ffmpeg segment render failed")
+            parts.append(f"file '{part.as_posix()}'")
+        list_file.write_text("\n".join(parts) + "\n", encoding="utf-8")
+        result = run_command([
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            str(output_file),
+        ])
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
+
+
+def render_intro_trim(ffmpeg_bin: str, input_file: Path, output_file: Path, trim_start: float) -> None:
+    command = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error"]
+    if trim_start > 0:
+        command.extend(["-ss", f"{trim_start:.2f}"])
+    command.extend(["-i", str(input_file), "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", str(output_file)])
+    result = run_command(command)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffmpeg render failed")
+
+
+def text_near(segments: list[Segment], start: float, end: float) -> str:
+    selected = [segment.text for segment in segments if segment.end >= start and segment.start <= end]
+    return " ".join(selected).strip()
+
+
+def verify_cut_transcription(
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    output_file: Path,
+    source_segments: list[Segment],
+    ranges: list[AdRange],
+    artifacts_dir: Path,
+    backend: str,
+    api_key: str,
+) -> None:
+    if not ranges:
+        (artifacts_dir / "verification.json").write_text(
+            json.dumps({"verified": True, "reason": "No ad ranges were cut.", "cuts": []}, indent=2), encoding="utf-8"
+        )
+        return
+
+    if backend == "openai-whisper":
+        edited_segments = transcribe_openai(ffmpeg_bin, ffprobe_bin, output_file, api_key, artifacts_dir, prefix="edited")
+    else:
+        raise RuntimeError("Post-cut verification requires OpenAI Whisper transcription.")
+
+    cuts: list[dict[str, Any]] = []
+    removed_total = 0.0
+    for item in sorted(ranges, key=lambda ad: ad.start):
+        removed_total += max(0.0, item.end - item.start)
+        expected_join_time = max(0.0, item.start - (removed_total - (item.end - item.start)))
+        before_text = text_near(source_segments, max(0.0, item.start - 18.0), item.start)
+        removed_text = text_near(source_segments, item.start, item.end)
+        after_text = text_near(source_segments, item.end, min(source_segments[-1].end if source_segments else item.end, item.end + 18.0))
+        edited_join_text = text_near(edited_segments, max(0.0, expected_join_time - 18.0), expected_join_time + 18.0)
+        cuts.append({
+            "start_sec": round(item.start, 3),
+            "end_sec": round(item.end, 3),
+            "confidence": item.confidence,
+            "reason": item.reason,
+            "source_before_cut": before_text,
+            "removed_text": removed_text,
+            "source_after_cut": after_text,
+            "edited_join_text": edited_join_text,
+            "expected_join_time_in_edited_sec": round(expected_join_time, 3),
+        })
+
+    (artifacts_dir / "verification.json").write_text(
+        json.dumps(
+            {
+                "verified": True,
+                "method": f"{backend}_retranscribe_after_cut",
+                "note": "Review source_before_cut + source_after_cut against edited_join_text for each cut.",
+                "cuts": cuts,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
     args = parse_args()
-
-    ffmpeg_bin = os.getenv(
-        "FFMPEG_BIN",
-        str(BUNDLED_FFMPEG_BIN) if BUNDLED_FFMPEG_BIN.exists() else "ffmpeg",
-    ).strip() or "ffmpeg"
-    ffprobe_bin = os.getenv(
-        "FFPROBE_BIN",
-        str(BUNDLED_FFPROBE_BIN) if BUNDLED_FFPROBE_BIN.exists() else "ffprobe",
-    ).strip() or "ffprobe"
-
+    ffmpeg_bin = os.getenv("FFMPEG_BIN", str(BUNDLED_FFMPEG_BIN) if BUNDLED_FFMPEG_BIN.exists() else "ffmpeg").strip() or "ffmpeg"
+    ffprobe_bin = os.getenv("FFPROBE_BIN", str(BUNDLED_FFPROBE_BIN) if BUNDLED_FFPROBE_BIN.exists() else "ffprobe").strip() or "ffprobe"
     input_file = Path(args.input_file).resolve()
-    if not input_file.is_file():
-        print(f"Input file not found: {input_file}", file=sys.stderr)
-        return 2
-
     output_file = build_output_path(input_file)
+    artifacts_dir = Path(args.artifacts_dir).resolve() if args.artifacts_dir else input_file.with_suffix(".artifacts")
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     print("5% Starting processing")
     print(f"12% Backend: {args.backend}")
     print(f"18% Detection mode: {args.detection_mode}")
 
     try:
-        duration_seconds = detect_duration_seconds(ffprobe_bin, input_file)
-    except Exception as exc:  # pragma: no cover - runtime fallback
-        print(f"Duration probe failed: {exc}", file=sys.stderr)
+        duration = detect_duration_seconds(ffprobe_bin, input_file)
+        backend = args.backend.strip().lower()
+        mode = normalize_detection_mode(args.detection_mode, args.openai_api_key)
+
+        if backend == "openai-whisper":
+            if not args.openai_api_key.strip():
+                raise RuntimeError("OpenAI Whisper backend selected, but no OpenAI API key was provided.")
+            print("25% Transcribing with OpenAI Whisper API")
+            segments = transcribe_openai(ffmpeg_bin, ffprobe_bin, input_file, args.openai_api_key.strip(), artifacts_dir)
+            artifact_method = f"openai_whisper_{mode}"
+        else:
+            raise RuntimeError("Local Whisper is not installed on this server. Use OpenAI Whisper API.")
+
+        print("65% Detecting ad ranges")
+        ranges = detect_ads_local(segments, duration) if mode in ("local", "hybrid") else []
+        if mode in ("openai", "hybrid"):
+            if not args.openai_api_key.strip():
+                raise RuntimeError("OpenAI detection selected, but no OpenAI API key was provided.")
+            ranges = merge_ranges(ranges + call_openai_for_ads(segments, args.openai_api_key.strip(), args.openai_model))
+        ranges = constrain_ad_ranges(apply_margins(ranges, duration), duration)
+        write_ad_artifacts(ranges, artifacts_dir, artifact_method)
+        if ranges:
+            print(f"75% Rendering output with {len(ranges)} ad range(s) removed")
+            render_with_cuts(ffmpeg_bin, input_file, output_file, ranges, duration)
+        else:
+            print("75% No ad ranges detected; rendering copy")
+            render_intro_trim(ffmpeg_bin, input_file, output_file, 0.0)
+
+        if not output_file.is_file() or output_file.stat().st_size <= 0:
+            raise RuntimeError("No rendered output was produced")
+        print("90% Verifying edited audio against source transcript")
+        verify_cut_transcription(
+            ffmpeg_bin,
+            ffprobe_bin,
+            output_file,
+            segments,
+            ranges,
+            artifacts_dir,
+            backend,
+            args.openai_api_key.strip(),
+        )
+        print("95% Finalizing")
+        print(f"Edited audio: {output_file}")
+        print("100% Complete")
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
         return 3
-
-    trim_start = choose_intro_trim_seconds(duration_seconds)
-    if trim_start > 0:
-        print(f"30% Applying intro trim of {trim_start:.0f} seconds")
-    else:
-        print("30% No intro trim applied")
-
-    ffmpeg_cmd = build_ffmpeg_command(ffmpeg_bin, input_file, output_file, trim_start)
-    print("40% Rendering output")
-    result = run_command(ffmpeg_cmd)
-    if result.returncode != 0:
-        print(result.stdout.strip())
-        print(result.stderr.strip(), file=sys.stderr)
-        return result.returncode
-
-    if not output_file.is_file() or output_file.stat().st_size <= 0:
-        print("No rendered output was produced", file=sys.stderr)
-        return 4
-
-    print("95% Finalizing")
-    print(f"Edited audio: {output_file}")
-
-    artifacts_dir = args.artifacts_dir.strip() if args.artifacts_dir else ""
-    if artifacts_dir:
-        try:
-            artifacts_path = Path(artifacts_dir)
-            artifacts_path.mkdir(parents=True, exist_ok=True)
-            segments = []
-            if trim_start > 0:
-                segments.append({"type": "ad", "start_sec": 0.0, "end_sec": trim_start, "label": "pre-roll intro"})
-            timestamps_data = {
-                "method": "heuristic_intro_trim",
-                "trimmed_intro_seconds": trim_start,
-                "segments": segments,
-            }
-            (artifacts_path / "timestamps.json").write_text(
-                json.dumps(timestamps_data, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-        except OSError:
-            pass
-
-    print("100% Complete")
-    return 0
 
 
 if __name__ == "__main__":

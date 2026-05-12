@@ -11,10 +11,8 @@ declare global {
         settings: {
           openAiApiKey: string
           openAiModel: string
-          transcriptionBackend: 'parakeet' | 'whisper' | 'openai-whisper'
+          transcriptionBackend: 'whisper' | 'openai-whisper'
           detectionMode: 'local' | 'hybrid' | 'openai'
-          parakeetPythonPath: string
-          parakeetModel: string
           removeOriginalAfterExport: boolean
           cacheTtlDays: number
         }

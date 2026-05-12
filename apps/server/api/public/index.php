@@ -48,6 +48,10 @@ try {
         listJobs($pdo, $config);
     }
 
+    if ($method === 'GET' && $uri === '/api/worker/status') {
+        getWorkerStatus($config);
+    }
+
     if ($method === 'POST' && $uri === '/api/jobs') {
         createJob($pdo, $config);
     }
@@ -60,7 +64,7 @@ try {
         downloadJobOutput($pdo, $matches[1]);
     }
 
-    if ($method === 'GET' && preg_match('#^/api/jobs/([a-f0-9]{32})/artifact/(transcript|timestamps|stats)$#', $uri, $matches) === 1) {
+    if ($method === 'GET' && preg_match('#^/api/jobs/([a-f0-9]{32})/artifact/(transcript|timestamped-transcript|timestamps|verification|stats)$#', $uri, $matches) === 1) {
         serveJobArtifact($pdo, $config, $matches[1], $matches[2]);
     }
 
@@ -124,6 +128,8 @@ function loadConfig(): array
         'input_dir' => envOrDefault('INPUT_DIR', joinPath($storageRoot, 'input')),
         'output_dir' => envOrDefault('OUTPUT_DIR', joinPath($storageRoot, 'output')),
         'artifacts_dir' => envOrDefault('ARTIFACTS_DIR', joinPath($storageRoot, 'artifacts')),
+        'worker_heartbeat' => envOrDefault('WORKER_HEARTBEAT', joinPath($storageRoot, 'worker-heartbeat.json')),
+        'worker_lock_dir' => envOrDefault('WORKER_LOCK_DIR', joinPath(dirname($storageRoot), 'worker.lock')),
         'base_path' => envOrDefault('APP_BASE_PATH', $inferredBasePath),
     ];
 }
@@ -333,13 +339,12 @@ function createJob(PDO $pdo, array $config): void
         throw new RuntimeException('Provide either multipart file field audio or source_url.');
     }
 
-    $backend = validateBackend((string)($_POST['backend'] ?? 'parakeet'));
+    $backend = validateBackend((string)($_POST['backend'] ?? 'openai-whisper'));
     $detectionMode = validateDetectionMode((string)($_POST['detection_mode'] ?? 'local'));
     $openAiModel = trim((string)($_POST['openai_model'] ?? 'gpt-4o-mini'));
     if ($openAiModel === '') {
         $openAiModel = 'gpt-4o-mini';
     }
-
     $openAiApiKey = trim((string)($_POST['openai_api_key'] ?? ''));
 
     $id = bin2hex(random_bytes(16));
@@ -616,7 +621,7 @@ function getJob(PDO $pdo, array $config, string $id): void
         jsonResponse(404, ['error' => 'Job not found']);
     }
 
-    jsonResponse(200, normalizeJob($job, (string)$config['base_path']));
+    jsonResponse(200, normalizeJob($job, (string)$config['base_path'], (string)$config['artifacts_dir']));
 }
 
 function downloadJobOutput(PDO $pdo, string $id): void
@@ -652,7 +657,7 @@ function cancelJob(PDO $pdo, array $config, string $id): void
 
     $status = (string)($job['status'] ?? '');
     if (in_array($status, ['completed', 'failed', 'cancelled'], true)) {
-        jsonResponse(200, normalizeJob($job, (string)$config['base_path']));
+        jsonResponse(200, normalizeJob($job, (string)$config['base_path'], (string)$config['artifacts_dir']));
     }
 
     $now = gmdate(DATE_ATOM);
@@ -683,7 +688,7 @@ function cancelJob(PDO $pdo, array $config, string $id): void
         200,
         $updatedJob === null
             ? ['job_id' => $id, 'status' => 'cancelled']
-            : normalizeJob($updatedJob, (string)$config['base_path'])
+            : normalizeJob($updatedJob, (string)$config['base_path'], (string)$config['artifacts_dir'])
     );
 }
 
@@ -731,7 +736,45 @@ function listJobs(PDO $pdo, array $config): void
     $basePath = (string)$config['base_path'];
 
     jsonResponse(200, [
-        'jobs' => array_map(fn($row) => normalizeJob($row, $basePath), is_array($rows) ? $rows : []),
+        'jobs' => array_map(fn($row) => normalizeJob($row, $basePath, (string)$config['artifacts_dir']), is_array($rows) ? $rows : []),
+    ]);
+}
+
+function getWorkerStatus(array $config): void
+{
+    $heartbeatPath = (string)($config['worker_heartbeat'] ?? '');
+    $lockDir = (string)($config['worker_lock_dir'] ?? '');
+    $queueDir = (string)($config['queue_dir'] ?? '');
+
+    $heartbeat = null;
+    $heartbeatAgeSeconds = null;
+    if ($heartbeatPath !== '' && is_file($heartbeatPath)) {
+        $raw = file_get_contents($heartbeatPath);
+        $decoded = is_string($raw) ? json_decode($raw, true) : null;
+        $heartbeat = is_array($decoded) ? $decoded : null;
+        $mtime = filemtime($heartbeatPath);
+        if ($mtime !== false) {
+            $heartbeatAgeSeconds = max(0, time() - $mtime);
+        }
+    }
+
+    $queueCount = 0;
+    if ($queueDir !== '' && is_dir($queueDir)) {
+        $files = glob(joinPath($queueDir, '*.json'));
+        $queueCount = is_array($files) ? count($files) : 0;
+    }
+
+    $lockPresent = $lockDir !== '' && is_dir($lockDir);
+    $running = $lockPresent && $heartbeatAgeSeconds !== null && $heartbeatAgeSeconds <= 20;
+
+    jsonResponse(200, [
+        'running' => $running,
+        'lock_present' => $lockPresent,
+        'heartbeat_age_seconds' => $heartbeatAgeSeconds,
+        'heartbeat' => $heartbeat,
+        'queue_count' => $queueCount,
+        'start_command' => 'ssh agitated-engelbart_9pw3g4pzt1v@74.208.203.194 "nohup /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1 &"',
+        'watchdog_command' => '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1',
     ]);
 }
 
@@ -747,7 +790,6 @@ function serveJobArtifact(PDO $pdo, array $config, string $id, string $type): vo
     if ($type === 'transcript') {
         $filePath = (string)($job['transcript_path'] ?? '');
         if ($filePath === '' || !is_file($filePath)) {
-            // Fall back to artifacts dir
             $filePath = joinPath($artifactsDir, 'transcript.txt');
         }
         if (!is_file($filePath)) {
@@ -798,6 +840,29 @@ function serveJobArtifact(PDO $pdo, array $config, string $id, string $type): vo
         exit;
     }
 
+    if ($type === 'timestamped-transcript') {
+        $filePath = joinPath($artifactsDir, 'transcript_timestamped.txt');
+        if (!is_file($filePath)) {
+            jsonResponse(404, ['error' => 'Timestamped transcript not available for this job']);
+        }
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Content-Length: ' . (string)filesize($filePath));
+        header('Content-Disposition: inline; filename="timestamped-transcript-' . $id . '.txt"');
+        readfile($filePath);
+        exit;
+    }
+
+    if ($type === 'verification') {
+        $verificationPath = joinPath($artifactsDir, 'verification.json');
+        if (!is_file($verificationPath)) {
+            jsonResponse(404, ['error' => 'Verification artifact not available for this job']);
+        }
+        header('Content-Type: application/json');
+        header('Content-Length: ' . (string)filesize($verificationPath));
+        readfile($verificationPath);
+        exit;
+    }
+
     jsonResponse(400, ['error' => 'Unknown artifact type']);
 }
 
@@ -809,7 +874,7 @@ function fetchJob(PDO $pdo, string $id): ?array
     return is_array($result) ? $result : null;
 }
 
-function normalizeJob(array $job, string $basePath = ''): array
+function normalizeJob(array $job, string $basePath = '', string $artifactsRoot = ''): array
 {
     $outputPath = (string)($job['output_path'] ?? '');
     $jobId = (string)$job['id'];
@@ -844,10 +909,16 @@ function normalizeJob(array $job, string $basePath = ''): array
         'transcript_url' => ($transcriptPath !== '' && is_file($transcriptPath))
             ? withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/transcript')
             : null,
+        'timestamped_transcript_url' => ($artifactsRoot !== '' && is_file(joinPath(joinPath($artifactsRoot, $jobId), 'transcript_timestamped.txt')))
+            ? withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/timestamped-transcript')
+            : null,
         'timestamps_url' => ($timestampsPath !== '' && is_file($timestampsPath))
             ? withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/timestamps')
             : null,
         'stats_url' => withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/stats'),
+        'verification_url' => ($artifactsRoot !== '' && is_file(joinPath(joinPath($artifactsRoot, $jobId), 'verification.json')))
+            ? withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/verification')
+            : null,
         'user_id' => isset($job['user_id']) ? (string)$job['user_id'] : null,
     ];
 }
@@ -865,9 +936,9 @@ function withBasePath(string $basePath, string $path): string
 function validateBackend(string $backend): string
 {
     $normalized = strtolower(trim($backend));
-    $allowed = ['parakeet', 'whisper', 'openai-whisper'];
+    $allowed = ['whisper', 'openai-whisper'];
     if (!in_array($normalized, $allowed, true)) {
-        throw new RuntimeException('Unsupported backend. Allowed values: parakeet, whisper, openai-whisper.');
+        throw new RuntimeException('Unsupported backend. Allowed values: whisper, openai-whisper.');
     }
     return $normalized;
 }

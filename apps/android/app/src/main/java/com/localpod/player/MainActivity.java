@@ -616,15 +616,15 @@ public class MainActivity extends Activity {
         autoplay.setOnCheckedChangeListener((b, checked) -> db.setSetting("autoplay_next", checked ? "1" : "0"));
         root.addView(autoplay);
         section("Ad Removal — Server Engine");
-        String curEngine = db.setting("transcription_engine", ENGINE_VOSK);
-        root.addView(text("Choose which server transcription backend to use when you tap Remove ads. Parakeet is the default and works without an OpenAI key.", 14, MUTED, false));
+        String curEngine = db.setting("transcription_engine", ENGINE_OPENAI);
+        if (ENGINE_VOSK.equals(curEngine)) curEngine = ENGINE_OPENAI;
+        root.addView(text("Choose which server transcription backend to use when you tap Remove ads. OpenAI Whisper is the default cloud path and produces transcript verification artifacts on the server.", 14, MUTED, false));
         LinearLayout engineRow = new LinearLayout(this);
         engineRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         String[][] engineOpts = {
-            {ENGINE_VOSK,   "Parakeet\n(server default)"},
             {ENGINE_WHISPER, "Whisper\n(server)"},
-            {ENGINE_OPENAI, "OpenAI\nWhisper server"}
+            {ENGINE_OPENAI, "OpenAI\nWhisper"}
         };
         for (String[] opt : engineOpts) {
             Button btn = new Button(this);
@@ -644,10 +644,8 @@ public class MainActivity extends Activity {
             engineRow.addView(btn);
         }
         root.addView(engineRow);
-        if (ENGINE_VOSK.equals(curEngine)) {
-            root.addView(text("Parakeet runs on your server worker and is the recommended default.", 13, MUTED, false));
-        } else if (ENGINE_WHISPER.equals(curEngine)) {
-            root.addView(text("Whisper backend runs server-side. Use this if you prefer Whisper over Parakeet.", 13, MUTED, false));
+        if (ENGINE_WHISPER.equals(curEngine)) {
+            root.addView(text("Local Whisper requires a compatible server-side install before it can run.", 13, MUTED, false));
         } else {
             root.addView(text("OpenAI Whisper backend uses OpenAI transcription. Requires an OpenAI API key.", 13, MUTED, false));
         }
@@ -892,9 +890,9 @@ public class MainActivity extends Activity {
             showError("Download required", "Download the episode first so the app can resolve the episode URL and save the ad-free copy offline.");
             return;
         }
-        String engine = db.setting("transcription_engine", ENGINE_VOSK);
+        String engine = db.setting("transcription_engine", ENGINE_OPENAI);
         if (ENGINE_OPENAI.equals(engine) && TextUtils.isEmpty(db.setting("openai_api_key", ""))) {
-            showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to Parakeet/Whisper server processing.");
+            showError("OpenAI key required", "Save an OpenAI API key in Settings, or switch to Local Whisper after it is installed on the server.");
             return;
         }
         // Refresh re-queues processing and replaces any prior ad-free output.
@@ -905,7 +903,7 @@ public class MainActivity extends Activity {
     private String engineLabel(String engine) {
         if (ENGINE_WHISPER.equals(engine)) return "Whisper server";
         if (ENGINE_OPENAI.equals(engine)) return "OpenAI Whisper server";
-        return "Parakeet server";
+        return "OpenAI Whisper server";
     }
 
     private void runAndroidAdRemoval(String episodeId) {
@@ -924,7 +922,7 @@ public class MainActivity extends Activity {
             handleAdError(); return;
         }
 
-        String engine = localDb.setting("transcription_engine", ENGINE_VOSK);
+        String engine = localDb.setting("transcription_engine", ENGINE_OPENAI);
         String apiKey = localDb.setting("openai_api_key", "").trim();
         String openAiModel = localDb.setting("openai_model", "gpt-4o-mini").trim();
         String backend = apiBackendForEngine(engine);
@@ -1010,7 +1008,7 @@ public class MainActivity extends Activity {
     private String apiBackendForEngine(String engine) {
         if (ENGINE_OPENAI.equals(engine)) return "openai-whisper";
         if (ENGINE_WHISPER.equals(engine)) return "whisper";
-        return "parakeet";
+        return "openai-whisper";
     }
 
     private String apiDetectionModeForEngine(String engine, boolean hasOpenAiKey) {

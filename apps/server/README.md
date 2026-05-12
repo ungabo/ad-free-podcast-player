@@ -49,7 +49,7 @@ API will be available at `http://localhost:8080`.
 - Fields:
   - `audio` (optional file)
   - `source_url` (optional URL to a remote audio file)
-  - `backend` (optional): `parakeet`, `whisper`, `openai-whisper`
+  - `backend` (optional): `openai-whisper`, `whisper`
   - `detection_mode` (optional): `local`, `hybrid`, `openai`
   - `openai_model` (optional, default `gpt-4o-mini`)
   - `openai_api_key` (optional)
@@ -61,13 +61,13 @@ Example:
 ```bash
 curl -X POST http://localhost:8080/api/jobs \
   -F "audio=@/path/to/episode.mp3" \
-  -F "backend=parakeet" \
+  -F "backend=openai-whisper" \
   -F "detection_mode=hybrid"
 
 curl -X POST http://localhost:8080/api/jobs \
   -F "source_url=https://example.com/episode.mp3" \
-  -F "backend=parakeet" \
-  -F "detection_mode=local"
+  -F "backend=openai-whisper" \
+  -F "detection_mode=hybrid"
 ```
 
 ### Get Job Status

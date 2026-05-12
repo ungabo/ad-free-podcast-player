@@ -47,7 +47,7 @@ function setEpisodeCache(collectionId: number, data: EpisodeResult[]): void {
 }
 
 type DetectionMode = 'local' | 'hybrid' | 'openai'
-type Backend = 'parakeet' | 'whisper' | 'openai-whisper'
+type Backend = 'whisper' | 'openai-whisper'
 
 type SavedSettings = {
   openAiKey: string
@@ -104,8 +104,10 @@ type JobRecord = JobStatusResponse & {
   podcast_name: string | null
   duration_seconds: number | null
   transcript_url: string | null
+  timestamped_transcript_url: string | null
   timestamps_url: string | null
   stats_url: string | null
+  verification_url: string | null
   user_id: string | null
 }
 
@@ -125,6 +127,20 @@ type Subscription = {
   artwork_url: string | null
   collection_id: number | null
   added_at: string
+}
+
+type WorkerStatus = {
+  running: boolean
+  lock_present: boolean
+  heartbeat_age_seconds: number | null
+  queue_count: number
+  start_command: string
+  watchdog_command: string
+  heartbeat?: {
+    state?: string
+    time?: string
+    mode?: string
+  } | null
 }
 
 function loadSavedSettings(): SavedSettings | null {
@@ -198,8 +214,10 @@ function App() {
 
   const [openAiKey, setOpenAiKey] = useState(savedSettings?.openAiKey ?? '')
   const [openAiModel, setOpenAiModel] = useState(savedSettings?.openAiModel ?? 'gpt-4o-mini')
-  const [detectionMode, setDetectionMode] = useState<DetectionMode>(savedSettings?.detectionMode ?? 'local')
-  const [backend, setBackend] = useState<Backend>(savedSettings?.backend ?? 'parakeet')
+  const [detectionMode, setDetectionMode] = useState<DetectionMode>(savedSettings?.detectionMode ?? 'hybrid')
+  const [backend, setBackend] = useState<Backend>(
+    savedSettings?.backend === 'whisper' ? 'whisper' : 'openai-whisper'
+  )
 
   const [searchTerm, setSearchTerm] = useState('smartless')
   const [isSearching, setIsSearching] = useState(false)
@@ -233,6 +251,7 @@ function App() {
     () => window.localStorage.getItem(USER_KEY) ?? ''
   )
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
+  const [workerStatus, setWorkerStatus] = useState<WorkerStatus | null>(null)
 
   const processedUrlRef = useRef<string | null>(null)
 
@@ -435,6 +454,17 @@ function App() {
     }
   }
 
+  async function fetchWorkerStatus(): Promise<void> {
+    try {
+      const response = await fetch(apiUrl('/api/worker/status'))
+      if (!response.ok) return
+      const data = (await response.json()) as WorkerStatus
+      setWorkerStatus(data)
+    } catch {
+      // Best-effort daemon status
+    }
+  }
+
   async function killJob(jobId: string): Promise<void> {
     try {
       await fetch(apiUrl(`/api/jobs/${jobId}/cancel`), { method: 'POST' })
@@ -606,7 +636,11 @@ function App() {
     throw new Error('Timed out waiting for the processing job to finish.')
   }
 
-  async function submitEpisodeForProcessing(episode: EpisodeResult, sourceLabel: string): Promise<void> {
+  async function submitEpisodeForProcessing(
+    episode: EpisodeResult,
+    sourceLabel: string,
+    options?: { backend?: Backend; detectionMode?: DetectionMode; podcast?: PodcastResult | null }
+  ): Promise<void> {
     const mediaUrl = episodePlayableUrl(episode)
     if (!mediaUrl) {
       setRunError('This episode does not expose an audio URL from iTunes.')
@@ -621,13 +655,16 @@ function App() {
     setLogLines([])
     setActiveJob('')
 
-    appendLog(`Submitting ${sourceLabel} with backend ${backend} and detection ${detectionMode}.`)
+    const effectiveBackend = options?.backend ?? backend
+    const effectiveDetectionMode = options?.detectionMode ?? detectionMode
+
+    appendLog(`Submitting ${sourceLabel} with backend ${effectiveBackend} and detection ${effectiveDetectionMode}.`)
 
     try {
       const form = new FormData()
       form.append('source_url', mediaUrl)
-      form.append('backend', backend)
-      form.append('detection_mode', detectionMode)
+      form.append('backend', effectiveBackend)
+      form.append('detection_mode', effectiveDetectionMode)
       form.append('openai_model', openAiModel.trim() || 'gpt-4o-mini')
       if (openAiKey.trim()) {
         form.append('openai_api_key', openAiKey.trim())
@@ -636,11 +673,10 @@ function App() {
         form.append('user_id', currentUserId)
       }
       // Pass episode metadata so the server can store it on the job.
-      if (activeEpisode) {
-        form.append('episode_title', activeEpisode.trackName)
-      }
-      if (activePodcast) {
-        form.append('podcast_name', activePodcast.collectionName)
+      form.append('episode_title', episode.trackName)
+      const podcastForJob = options?.podcast ?? activePodcast
+      if (podcastForJob) {
+        form.append('podcast_name', podcastForJob.collectionName)
       }
 
       const response = await fetch(apiUrl('/api/jobs'), {
@@ -669,30 +705,45 @@ function App() {
     }
   }
 
-  async function runSmartlessRoutine(): Promise<void> {
-    setBackend('parakeet')
-    setDetectionMode('local')
-    setSearchTerm('smartless')
-    appendLog('Running SmartLess latest-episode routine with Parakeet defaults.')
+  async function runLatestPodcastRoutine(term: string, displayName: string): Promise<void> {
+    setBackend('openai-whisper')
+    setDetectionMode('hybrid')
+    setSearchTerm(term)
+    appendLog(`Running ${displayName} latest-episode routine with OpenAI Whisper verification.`)
 
-    const results = await runPodcastSearch('smartless')
+    const results = await runPodcastSearch(term)
     if (results.length === 0) {
-      setRunError('No podcasts matched SmartLess.')
+      setRunError(`No podcasts matched ${displayName}.`)
       return
     }
 
-    const smartless =
-      results.find((item) => item.collectionName.toLowerCase().includes('smartless')) ?? results[0]
+    const normalizedTerm = term.toLowerCase()
+    const selected =
+      results.find((item) => item.collectionName.toLowerCase() === normalizedTerm) ??
+      results.find((item) => item.collectionName.toLowerCase().includes(normalizedTerm)) ??
+      results[0]
 
-    const loaded = await selectPodcast(smartless)
+    const loaded = await selectPodcast(selected)
     const latestPlayable = loaded.find((item) => episodePlayableUrl(item).length > 0)
     if (!latestPlayable) {
-      setRunError('Could not find a playable episode URL for SmartLess.')
+      setRunError(`Could not find a playable episode URL for ${displayName}.`)
       return
     }
 
     chooseEpisode(latestPlayable)
-    await submitEpisodeForProcessing(latestPlayable, 'SmartLess latest episode')
+    await submitEpisodeForProcessing(latestPlayable, `${displayName} latest episode`, {
+      backend: 'openai-whisper',
+      detectionMode: 'hybrid',
+      podcast: selected,
+    })
+  }
+
+  async function runSmartlessRoutine(): Promise<void> {
+    await runLatestPodcastRoutine('smartless', 'SmartLess')
+  }
+
+  async function runStuffYouShouldKnowRoutine(): Promise<void> {
+    await runLatestPodcastRoutine('stuff you should know', 'Stuff You Should Know')
   }
 
   useEffect(() => {
@@ -702,8 +753,13 @@ function App() {
 
   useEffect(() => {
     void fetchLiveJobs()
+    void fetchWorkerStatus()
     const interval = setInterval(() => void fetchLiveJobs(), 5000)
-    return () => clearInterval(interval)
+    const workerInterval = setInterval(() => void fetchWorkerStatus(), 10000)
+    return () => {
+      clearInterval(interval)
+      clearInterval(workerInterval)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -753,7 +809,7 @@ function App() {
         <p className="kicker">Linux Web Interface</p>
         <h1>Ad Free Podcast Player</h1>
         <p className="lede">
-          Search for podcasts, pick the most recent episode, and run server-side ad removal with Parakeet by default.
+          Search for podcasts, pick the most recent episode, and run server-side ad removal with transcript verification.
         </p>
         {users.length > 0 ? (
           <div className="user-selector-row">
@@ -816,6 +872,9 @@ function App() {
             <button type="button" onClick={() => void runSmartlessRoutine()} disabled={isSubmitting || isSearching}>
               Run latest SmartLess now
             </button>
+            <button type="button" onClick={() => void runStuffYouShouldKnowRoutine()} disabled={isSubmitting || isSearching}>
+              Run latest SYSK now
+            </button>
           </div>
 
           {searchError ? <p className="error-text">{searchError}</p> : null}
@@ -860,8 +919,8 @@ function App() {
                   onClick={() => void toggleSubscription(activePodcast)}
                 >
                   {subscriptions.some((s) => s.collection_id === activePodcast.collectionId || s.feed_url === activePodcast.feedUrl)
-                    ? '★ Favorited'
-                    : '☆ Favorite'}
+                    ? '* Favorited'
+                    : '+ Favorite'}
                 </button>
               ) : null}
             </div>
@@ -881,7 +940,7 @@ function App() {
                 <strong>{episode.trackName}</strong>
                 <small>
                   {episode.releaseDate ? new Date(episode.releaseDate).toLocaleDateString() : 'Date unknown'}
-                  {' · '}
+                  {' - '}
                   {formatDuration(episode.trackTimeMillis)}
                 </small>
               </button>
@@ -894,14 +953,14 @@ function App() {
                 className="page-btn"
                 disabled={episodePage === 0}
                 onClick={() => setEpisodePage((p) => p - 1)}
-              >← Prev</button>
+              >&lt; Prev</button>
               <span className="page-info">{episodePage + 1} / {Math.ceil(episodes.length / 10)}</span>
               <button
                 type="button"
                 className="page-btn"
                 disabled={(episodePage + 1) * 10 >= episodes.length}
                 onClick={() => setEpisodePage((p) => p + 1)}
-              >Next →</button>
+              >Next &gt;</button>
             </div>
           ) : null}
 
@@ -922,9 +981,8 @@ function App() {
             <label>
               Backend
               <select value={backend} onChange={(event) => setBackend(event.target.value as Backend)}>
-                <option value="parakeet">Parakeet</option>
-                <option value="whisper">Whisper local</option>
                 <option value="openai-whisper">OpenAI Whisper API</option>
+                <option value="whisper">Local Whisper (server install required)</option>
               </select>
             </label>
             <label>
@@ -972,16 +1030,43 @@ function App() {
           </div>
 
           <div className="status-stack">
-            <span className="status on">Default backend: Parakeet</span>
+            <span className="status on">Default backend: OpenAI Whisper</span>
             <span className={isOpenAiEnabled ? 'status on' : 'status neutral'}>
-              {isOpenAiEnabled ? 'OpenAI key loaded' : 'OpenAI optional'}
+              {isOpenAiEnabled ? 'OpenAI key loaded' : 'OpenAI key required for default backend'}
             </span>
+            {workerStatus ? (
+              <span className={workerStatus.running ? 'status on' : 'status off'}>
+                Worker {workerStatus.running ? 'running' : 'needs start'}
+              </span>
+            ) : null}
             {jobStatus ? (
               <span className={jobStatus.status === 'completed' ? 'status on' : 'status neutral'}>
                 Job {jobStatus.status} ({Math.round(jobStatus.progress)}%)
               </span>
             ) : null}
           </div>
+
+          {workerStatus ? (
+            <div className={`worker-status-card ${workerStatus.running ? 'ok' : 'warn'}`}>
+              <div className="worker-status-top">
+                <strong>{workerStatus.running ? 'Daemon online' : 'Daemon needs attention'}</strong>
+                <span className={workerStatus.running ? 'status on' : 'status off'}>
+                  {workerStatus.heartbeat?.state ?? (workerStatus.running ? 'active' : 'offline')}
+                </span>
+              </div>
+              <p className="tiny">
+                Queue: {workerStatus.queue_count}
+                {' | '}
+                Heartbeat: {workerStatus.heartbeat_age_seconds == null ? 'not seen' : `${workerStatus.heartbeat_age_seconds}s ago`}
+              </p>
+              {!workerStatus.running ? (
+                <>
+                  <p className="tiny">Start it over SSH with:</p>
+                  <code className="worker-command">{workerStatus.start_command}</code>
+                </>
+              ) : null}
+            </div>
+          ) : null}
 
           {runError ? <p className="error-text">{runError}</p> : null}
 
@@ -1020,7 +1105,7 @@ function App() {
                   <span className={`status ${job.status === 'running' ? 'on' : 'neutral'}`}>
                     {job.status}
                   </span>
-                  <span className="live-job-id">{job.job_id.slice(0, 8)}…</span>
+                  <span className="live-job-id">{job.job_id.slice(0, 8)}...</span>
                   <span className="tiny">{job.backend} / {job.detection_mode}</span>
                   <span className="live-job-pct">{Math.round(job.progress)}%</span>
                   <button
@@ -1093,7 +1178,7 @@ function App() {
                   className="delete-job-btn"
                   title="Delete this job"
                   onClick={() => void deleteJobById(job.job_id)}
-                >✕</button>
+                >x</button>
               </div>
             ))}
           </div>
@@ -1134,7 +1219,7 @@ function App() {
                   className="delete-job-btn"
                   title="Delete this record"
                   onClick={() => void deleteJobById(job.job_id)}
-                >✕</button>
+                >x</button>
               </div>
             ))}
           </div>
@@ -1151,7 +1236,7 @@ function App() {
           <div className="detail-modal">
             <div className="detail-modal-header">
               <h2>Episode detail</h2>
-              <button type="button" className="close-btn" onClick={() => setSelectedHistoryJob(null)}>✕</button>
+              <button type="button" className="close-btn" onClick={() => setSelectedHistoryJob(null)}>x</button>
             </div>
 
             {selectedHistoryJob.episode_title ? (
@@ -1197,6 +1282,16 @@ function App() {
                   View transcript
                 </a>
               ) : null}
+              {selectedHistoryJob.timestamped_transcript_url ? (
+                <a
+                  href={toAbsoluteUrl(selectedHistoryJob.timestamped_transcript_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="detail-link-btn secondary"
+                >
+                  Timestamped transcript
+                </a>
+              ) : null}
               {selectedHistoryJob.timestamps_url ? (
                 <a
                   href={toAbsoluteUrl(selectedHistoryJob.timestamps_url)}
@@ -1217,6 +1312,16 @@ function App() {
                   Processing stats
                 </a>
               ) : null}
+              {selectedHistoryJob.verification_url ? (
+                <a
+                  href={toAbsoluteUrl(selectedHistoryJob.verification_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="detail-link-btn secondary"
+                >
+                  Verification
+                </a>
+              ) : null}
             </div>
 
             {selectedHistoryJob.download_url ? (
@@ -1231,7 +1336,7 @@ function App() {
       ) : null}
 
       <footer className="footer-note">
-        This web app is wired to the Linux API worker stack and defaults to Parakeet + local detection.
+        This web app is wired to the Linux API worker stack and defaults to OpenAI Whisper + transcript verification.
         {' · '}Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
       </footer>
     </div>
