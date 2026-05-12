@@ -25,6 +25,8 @@ export PROCESSOR_MODE="${PROCESSOR_MODE:-adcutforge}"
 export ADCUTFORGE_ROOT="${ADCUTFORGE_ROOT:-$STACK_ROOT/adcutforge}"
 export ADCUTFORGE_PYTHON="${ADCUTFORGE_PYTHON:-/usr/bin/python3}"
 export ADCUTFORGE_CACHE_DIR="${ADCUTFORGE_CACHE_DIR:-$STORAGE_ROOT/adcutforge-cache}"
+export LOCAL_PROCESSOR_BASE_URL="${LOCAL_PROCESSOR_BASE_URL:-http://127.0.0.1:8081/adfree-api}"
+export LOCAL_PROCESSOR_TIMEOUT_SECONDS="${LOCAL_PROCESSOR_TIMEOUT_SECONDS:-14400}"
 
 printf '\n[%s] worker tick\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 /usr/bin/python3 "$STACK_ROOT/worker/process_jobs.py" --once

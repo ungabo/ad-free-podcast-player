@@ -47,7 +47,7 @@ function setEpisodeCache(collectionId: number, data: EpisodeResult[]): void {
 }
 
 type DetectionMode = 'local' | 'hybrid' | 'openai'
-type Backend = 'whisper' | 'openai-whisper'
+type Backend = 'whisper' | 'openai-whisper' | 'tunnel-whisper' | 'tunnel-parakeet'
 
 type SavedSettings = {
   openAiKey: string
@@ -135,6 +135,13 @@ type WorkerStatus = {
   queue_count: number
   start_command: string
   watchdog_command: string
+  local_bridge?: {
+    configured?: boolean
+    reachable?: boolean
+    url?: string
+    message?: string
+    backend_options?: string[]
+  } | null
   heartbeat?: {
     state?: string
     time?: string
@@ -186,6 +193,25 @@ function episodePlayableUrl(episode: EpisodeResult): string {
   return episode.episodeUrl || episode.previewUrl || ''
 }
 
+function isTunnelBackend(value: Backend): boolean {
+  return value === 'tunnel-whisper' || value === 'tunnel-parakeet'
+}
+
+function backendLabel(value: string): string {
+  switch (value) {
+    case 'openai-whisper':
+      return 'OpenAI Whisper API'
+    case 'whisper':
+      return 'Linux local Whisper'
+    case 'tunnel-whisper':
+      return 'Windows tunnel Whisper'
+    case 'tunnel-parakeet':
+      return 'Windows tunnel Parakeet'
+    default:
+      return value
+  }
+}
+
 function toAbsoluteUrl(url: string): string {
   if (/^https?:\/\//i.test(url)) {
     return url
@@ -215,7 +241,9 @@ function App() {
   const [openAiModel, setOpenAiModel] = useState(savedSettings?.openAiModel ?? 'gpt-4o-mini')
   const [detectionMode, setDetectionMode] = useState<DetectionMode>(savedSettings?.detectionMode ?? 'hybrid')
   const [backend, setBackend] = useState<Backend>(
-    savedSettings?.backend === 'whisper' ? 'whisper' : 'openai-whisper'
+    savedSettings?.backend && ['whisper', 'openai-whisper', 'tunnel-whisper', 'tunnel-parakeet'].includes(savedSettings.backend)
+      ? savedSettings.backend
+      : 'openai-whisper'
   )
 
   const [searchTerm, setSearchTerm] = useState('')
@@ -262,6 +290,8 @@ function App() {
 
   const canSubmit = Boolean(activeEpisode && episodePlayableUrl(activeEpisode) && !isSubmitting)
   const isOpenAiEnabled = openAiKey.trim().length > 0
+  const selectedTunnelBackend = isTunnelBackend(backend)
+  const effectiveDetectionMode: DetectionMode = selectedTunnelBackend ? 'local' : detectionMode
 
   useEffect(() => {
     const payload: SavedSettings = {
@@ -677,7 +707,7 @@ function App() {
     setActiveJob('')
 
     const effectiveBackend = options?.backend ?? backend
-    const effectiveDetectionMode = options?.detectionMode ?? detectionMode
+    const effectiveDetectionMode = isTunnelBackend(effectiveBackend) ? 'local' : (options?.detectionMode ?? detectionMode)
 
     appendLog(`Submitting ${sourceLabel} with backend ${effectiveBackend} and detection ${effectiveDetectionMode}.`)
 
@@ -686,8 +716,8 @@ function App() {
       form.append('source_url', mediaUrl)
       form.append('backend', effectiveBackend)
       form.append('detection_mode', effectiveDetectionMode)
-      form.append('openai_model', openAiModel.trim() || 'gpt-4o-mini')
-      if (openAiKey.trim()) {
+      form.append('openai_model', isTunnelBackend(effectiveBackend) ? 'local' : (openAiModel.trim() || 'gpt-4o-mini'))
+      if (!isTunnelBackend(effectiveBackend) && openAiKey.trim()) {
         form.append('openai_api_key', openAiKey.trim())
       }
       if (currentUserId) {
@@ -948,12 +978,18 @@ function App() {
               Backend
               <select value={backend} onChange={(event) => setBackend(event.target.value as Backend)}>
                 <option value="openai-whisper">OpenAI Whisper API</option>
-                <option value="whisper">Local Whisper (server install required)</option>
+                <option value="whisper">Linux local Whisper</option>
+                <option value="tunnel-whisper">Windows tunnel Whisper</option>
+                <option value="tunnel-parakeet">Windows tunnel Parakeet</option>
               </select>
             </label>
             <label>
               Detection
-              <select value={detectionMode} onChange={(event) => setDetectionMode(event.target.value as DetectionMode)}>
+              <select
+                value={effectiveDetectionMode}
+                disabled={selectedTunnelBackend}
+                onChange={(event) => setDetectionMode(event.target.value as DetectionMode)}
+              >
                 <option value="local">Local</option>
                 <option value="hybrid">Hybrid</option>
                 <option value="openai">OpenAI only</option>
@@ -967,6 +1003,7 @@ function App() {
               <input
                 type="text"
                 value={openAiModel}
+                disabled={selectedTunnelBackend}
                 onChange={(event) => setOpenAiModel(event.target.value)}
                 placeholder="gpt-4o-mini"
               />
@@ -977,6 +1014,7 @@ function App() {
                 type="password"
                 placeholder="sk-..."
                 value={openAiKey}
+                disabled={selectedTunnelBackend}
                 onChange={(event) => setOpenAiKey(event.target.value)}
               />
             </label>
@@ -996,10 +1034,17 @@ function App() {
           </div>
 
           <div className="status-stack">
-            <span className="status on">Default backend: OpenAI Whisper</span>
+            <span className="status on">Selected backend: {backendLabel(backend)}</span>
             <span className={isOpenAiEnabled ? 'status on' : 'status neutral'}>
-              {isOpenAiEnabled ? 'Browser key loaded' : 'Using server key if configured'}
+              {selectedTunnelBackend
+                ? 'No OpenAI calls for tunnel backend'
+                : (isOpenAiEnabled ? 'Browser key loaded' : 'Using server key if configured')}
             </span>
+            {workerStatus?.local_bridge ? (
+              <span className={workerStatus.local_bridge.reachable ? 'status on' : 'status off'}>
+                Windows tunnel {workerStatus.local_bridge.reachable ? 'reachable' : 'offline'}
+              </span>
+            ) : null}
             {workerStatus ? (
               <span className={workerStatus.running ? 'status on' : 'status off'}>
                 Worker {workerStatus.running ? 'running' : 'needs start'}
@@ -1025,6 +1070,17 @@ function App() {
                 {' | '}
                 Heartbeat: {workerStatus.heartbeat_age_seconds == null ? 'not seen' : `${workerStatus.heartbeat_age_seconds}s ago`}
               </p>
+              {workerStatus.local_bridge ? (
+                <p className="tiny">
+                  Windows tunnel: {workerStatus.local_bridge.reachable ? 'reachable' : 'offline'}
+                  {workerStatus.local_bridge.url ? ` at ${workerStatus.local_bridge.url}` : ''}
+                </p>
+              ) : null}
+              {workerStatus.local_bridge && !workerStatus.local_bridge.reachable ? (
+                <p className="tiny">
+                  Start WAMP, then run the Windows scheduled task named AdFree Local Reverse Tunnel.
+                </p>
+              ) : null}
               {!workerStatus.running ? (
                 <>
                   <p className="tiny">Start it over SSH with:</p>
@@ -1292,7 +1348,7 @@ function App() {
       ) : null}
 
       <footer className="footer-note">
-        This web app is wired to the Linux API worker stack and defaults to OpenAI Whisper + hybrid ad detection.
+        This web app is wired to the Linux API worker stack, with optional Windows tunnel processing for local Whisper or Parakeet.
         {' · '}Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
       </footer>
     </div>

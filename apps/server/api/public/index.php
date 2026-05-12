@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Headers: Content-Type');
+header('Access-Control-Allow-Headers: Content-Type, X-Adfree-Bridge-Token');
 header('Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS');
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
@@ -50,6 +50,22 @@ try {
 
     if ($method === 'GET' && $uri === '/api/worker/status') {
         getWorkerStatus($config);
+    }
+
+    if ($method === 'GET' && $uri === '/api/local/health') {
+        getLocalBridgeHealth($config);
+    }
+
+    if ($method === 'POST' && $uri === '/api/local/process') {
+        processLocalBridgeJob($config);
+    }
+
+    if ($method === 'GET' && preg_match('#^/api/local/jobs/([a-f0-9]{32})/download$#', $uri, $matches) === 1) {
+        serveLocalBridgeFile($config, $matches[1], 'download');
+    }
+
+    if ($method === 'GET' && preg_match('#^/api/local/jobs/([a-f0-9]{32})/artifact/(transcript|timestamped-transcript|timestamps|stats)$#', $uri, $matches) === 1) {
+        serveLocalBridgeFile($config, $matches[1], $matches[2]);
     }
 
     if ($method === 'POST' && $uri === '/api/jobs') {
@@ -131,6 +147,8 @@ function loadConfig(): array
         'worker_heartbeat' => envOrDefault('WORKER_HEARTBEAT', joinPath($storageRoot, 'worker-heartbeat.json')),
         'worker_lock_dir' => envOrDefault('WORKER_LOCK_DIR', joinPath(dirname($storageRoot), 'worker.lock')),
         'base_path' => envOrDefault('APP_BASE_PATH', $inferredBasePath),
+        'local_bridge_url' => envOrDefault('LOCAL_BRIDGE_URL', 'http://127.0.0.1:8081/adfree-api'),
+        'local_bridge_token' => envOrDefault('LOCAL_BRIDGE_TOKEN', ''),
     ];
 }
 
@@ -341,18 +359,26 @@ function createJob(PDO $pdo, array $config): void
 
     $backend = validateBackend((string)($_POST['backend'] ?? 'openai-whisper'));
     $detectionMode = validateDetectionMode((string)($_POST['detection_mode'] ?? 'local'));
+    if (isTunnelBackend($backend)) {
+        $detectionMode = 'local';
+    }
     $openAiModel = trim((string)($_POST['openai_model'] ?? 'gpt-4o-mini'));
     if ($openAiModel === '') {
         $openAiModel = 'gpt-4o-mini';
     }
     $openAiApiKey = trim((string)($_POST['openai_api_key'] ?? ''));
+    if (isTunnelBackend($backend)) {
+        $openAiApiKey = '';
+        $openAiModel = 'local';
+    }
 
     $id = bin2hex(random_bytes(16));
     $extension = $hasUpload
         ? detectUploadExtension((string)($upload['name'] ?? 'audio.m4a'))
         : detectUrlExtension($sourceUrl);
     $inputPath = joinPath($config['input_dir'], $id . '.' . $extension);
-    $outputPath = joinPath($config['output_dir'], $id . '.noads.m4a');
+    $outputExtension = isTunnelBackend($backend) ? 'mp3' : 'm4a';
+    $outputPath = joinPath($config['output_dir'], $id . '.noads.' . $outputExtension);
 
     if ($hasUpload) {
         $uploadError = (int)($upload['error'] ?? UPLOAD_ERR_OK);
@@ -386,9 +412,9 @@ function createJob(PDO $pdo, array $config): void
     // (from any account), reuse it — no need to re-process the same episode.
     if ($sourceUrl !== '') {
         $cacheCheck = $pdo->prepare(
-            "SELECT id FROM jobs WHERE source_url=? AND status='completed' LIMIT 1"
+            "SELECT id FROM jobs WHERE source_url=? AND status='completed' AND backend=? AND detection_mode=? LIMIT 1"
         );
-        $cacheCheck->execute([$sourceUrl]);
+        $cacheCheck->execute([$sourceUrl, $backend, $detectionMode]);
         $cachedId = $cacheCheck->fetchColumn();
         if ($cachedId !== false) {
             jsonResponse(200, [
@@ -444,6 +470,8 @@ function createJob(PDO $pdo, array $config): void
         'openai_model' => $openAiModel,
         'openai_api_key' => $openAiApiKey,
         'source_url' => $sourceUrl === '' ? null : $sourceUrl,
+        'episode_title' => $episodeTitle,
+        'podcast_name' => $podcastName,
         'created_at' => $now,
     ];
 
@@ -641,11 +669,21 @@ function downloadJobOutput(PDO $pdo, string $id): void
     }
 
     $filename = basename($outputPath);
-    header('Content-Type: audio/mp4');
+    header('Content-Type: ' . audioContentType($outputPath));
     header('Content-Length: ' . (string)filesize($outputPath));
     header('Content-Disposition: attachment; filename="' . $filename . '"');
     readfile($outputPath);
     exit;
+}
+
+function audioContentType(string $path): string
+{
+    return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
+        'mp3' => 'audio/mpeg',
+        'wav' => 'audio/wav',
+        'm4a', 'mp4' => 'audio/mp4',
+        default => 'application/octet-stream',
+    };
 }
 
 function cancelJob(PDO $pdo, array $config, string $id): void
@@ -773,9 +811,44 @@ function getWorkerStatus(array $config): void
         'heartbeat_age_seconds' => $heartbeatAgeSeconds,
         'heartbeat' => $heartbeat,
         'queue_count' => $queueCount,
+        'local_bridge' => probeLocalBridge($config),
         'start_command' => 'ssh agitated-engelbart_9pw3g4pzt1v@74.208.203.194 "nohup /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1 &"',
         'watchdog_command' => '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1',
     ]);
+}
+
+function probeLocalBridge(array $config): array
+{
+    $baseUrl = rtrim((string)($config['local_bridge_url'] ?? ''), '/');
+    if ($baseUrl === '') {
+        return ['configured' => false, 'reachable' => false];
+    }
+
+    $url = $baseUrl . '/api/local/health';
+    $headers = "User-Agent: AdFreePodcastPlayer/1.0\r\n";
+    $token = (string)($config['local_bridge_token'] ?? '');
+    if ($token !== '') {
+        $headers .= 'X-Adfree-Bridge-Token: ' . $token . "\r\n";
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'GET',
+            'timeout' => 2,
+            'ignore_errors' => true,
+            'header' => $headers,
+        ],
+    ]);
+    $body = @file_get_contents($url, false, $context);
+    $decoded = is_string($body) ? json_decode($body, true) : null;
+
+    return [
+        'configured' => true,
+        'reachable' => is_array($decoded) && (bool)($decoded['ok'] ?? false),
+        'url' => $baseUrl,
+        'backend_options' => is_array($decoded) ? ($decoded['backends'] ?? []) : [],
+        'message' => is_array($decoded) ? (string)($decoded['message'] ?? '') : 'Bridge health check did not return JSON.',
+    ];
 }
 
 function serveJobArtifact(PDO $pdo, array $config, string $id, string $type): void
@@ -855,6 +928,420 @@ function serveJobArtifact(PDO $pdo, array $config, string $id, string $type): vo
     jsonResponse(400, ['error' => 'Unknown artifact type']);
 }
 
+function getLocalBridgeHealth(array $config): void
+{
+    assertLocalBridgeAccess($config);
+    $root = resolveLocalAdCutForgeRoot();
+    jsonResponse(200, [
+        'ok' => true,
+        'service' => 'adfree-local-bridge',
+        'message' => 'Windows local processor bridge is reachable.',
+        'backends' => ['whisper', 'parakeet'],
+        'adcutforge_root' => $root,
+        'parakeet_available' => is_file(joinPath($root, 'parakeet-runtime/Scripts/python.exe')),
+        'time' => gmdate(DATE_ATOM),
+    ]);
+}
+
+function processLocalBridgeJob(array $config): void
+{
+    assertLocalBridgeAccess($config);
+    @set_time_limit(0);
+    @ini_set('max_execution_time', '0');
+    ignore_user_abort(true);
+
+    $body = readJsonBody();
+    $sourceUrl = trim((string)($body['source_url'] ?? ''));
+    if ($sourceUrl === '') {
+        throw new RuntimeException('source_url is required for local bridge processing.');
+    }
+    validateSourceUrl($sourceUrl);
+
+    $backend = strtolower(trim((string)($body['backend'] ?? 'whisper')));
+    if (!in_array($backend, ['whisper', 'parakeet'], true)) {
+        throw new RuntimeException('Local bridge backend must be whisper or parakeet.');
+    }
+
+    $jobId = normalizeBridgeJobId((string)($body['job_id'] ?? ''));
+    $jobDir = localBridgeJobDir($config, $jobId);
+    $cachedResult = readLocalBridgeResult($jobDir);
+    if ($cachedResult !== null) {
+        jsonResponse(200, [
+            'ok' => true,
+            'job_id' => $jobId,
+            'backend' => 'tunnel-' . $backend,
+            'detection_mode' => 'local',
+            'download_url' => '/api/local/jobs/' . $jobId . '/download',
+            'transcript_url' => '/api/local/jobs/' . $jobId . '/artifact/transcript',
+            'timestamped_transcript_url' => '/api/local/jobs/' . $jobId . '/artifact/timestamped-transcript',
+            'timestamps_url' => '/api/local/jobs/' . $jobId . '/artifact/timestamps',
+            'stats_url' => '/api/local/jobs/' . $jobId . '/artifact/stats',
+            'logs' => (string)($cachedResult['logs'] ?? 'Reusing completed Windows bridge result.'),
+        ]);
+    }
+
+    $inputDir = joinPath($jobDir, 'input');
+    ensureDirectory($inputDir);
+
+    pruneLocalBridgeJobs($config);
+
+    $extension = detectUrlExtension($sourceUrl);
+    $inputPath = joinPath($inputDir, 'source.' . $extension);
+    $started = microtime(true);
+    downloadRemoteAudio($sourceUrl, $inputPath);
+
+    $result = runLocalAdCutForge($config, $jobId, $inputPath, $backend);
+    $finished = microtime(true);
+    $statsPath = joinPath($jobDir, 'stats.json');
+    file_put_contents($statsPath, json_encode([
+        'job_id' => $jobId,
+        'status' => 'completed',
+        'backend' => 'tunnel-' . $backend,
+        'detection_mode' => 'local',
+        'source_url' => $sourceUrl,
+        'started_at' => gmdate(DATE_ATOM, (int)$started),
+        'finished_at' => gmdate(DATE_ATOM, (int)$finished),
+        'duration_seconds' => round($finished - $started, 1),
+        'adcutforge_root' => resolveLocalAdCutForgeRoot(),
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+    $resultPayload = [
+        'job_id' => $jobId,
+        'output_path' => $result['output_path'],
+        'transcript_path' => $result['transcript_path'],
+        'timestamped_transcript_path' => $result['timestamped_transcript_path'],
+        'timestamps_path' => $result['timestamps_path'],
+        'stats_path' => $statsPath,
+        'logs' => $result['logs'],
+    ];
+    file_put_contents(joinPath($jobDir, 'result.json'), json_encode($resultPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+    jsonResponse(200, [
+        'ok' => true,
+        'job_id' => $jobId,
+        'backend' => 'tunnel-' . $backend,
+        'detection_mode' => 'local',
+        'download_url' => '/api/local/jobs/' . $jobId . '/download',
+        'transcript_url' => '/api/local/jobs/' . $jobId . '/artifact/transcript',
+        'timestamped_transcript_url' => '/api/local/jobs/' . $jobId . '/artifact/timestamped-transcript',
+        'timestamps_url' => '/api/local/jobs/' . $jobId . '/artifact/timestamps',
+        'stats_url' => '/api/local/jobs/' . $jobId . '/artifact/stats',
+        'logs' => $result['logs'],
+    ]);
+}
+
+function readLocalBridgeResult(string $jobDir): ?array
+{
+    $resultPath = joinPath($jobDir, 'result.json');
+    if (!is_file($resultPath)) {
+        return null;
+    }
+
+    $decoded = json_decode((string)file_get_contents($resultPath), true);
+    if (!is_array($decoded)) {
+        return null;
+    }
+
+    $outputPath = (string)($decoded['output_path'] ?? '');
+    if ($outputPath === '' || !is_file($outputPath)) {
+        return null;
+    }
+
+    return $decoded;
+}
+
+function serveLocalBridgeFile(array $config, string $jobId, string $type): void
+{
+    assertLocalBridgeAccess($config);
+    $jobDir = localBridgeJobDir($config, $jobId);
+    $resultPath = joinPath($jobDir, 'result.json');
+    if (!is_file($resultPath)) {
+        jsonResponse(404, ['error' => 'Local bridge result not found']);
+    }
+    $result = json_decode((string)file_get_contents($resultPath), true);
+    if (!is_array($result)) {
+        jsonResponse(500, ['error' => 'Local bridge result file is invalid']);
+    }
+
+    $key = match ($type) {
+        'download' => 'output_path',
+        'transcript' => 'transcript_path',
+        'timestamped-transcript' => 'timestamped_transcript_path',
+        'timestamps' => 'timestamps_path',
+        'stats' => 'stats_path',
+        default => '',
+    };
+    $filePath = $key === '' ? '' : (string)($result[$key] ?? '');
+    if ($filePath === '' || !is_file($filePath)) {
+        jsonResponse(404, ['error' => 'Local bridge artifact is unavailable']);
+    }
+
+    $contentType = match ($type) {
+        'download' => 'audio/mpeg',
+        'timestamps', 'stats' => 'application/json',
+        default => 'text/plain; charset=utf-8',
+    };
+    header('Content-Type: ' . $contentType);
+    header('Content-Length: ' . (string)filesize($filePath));
+    header('Content-Disposition: inline; filename="' . basename($filePath) . '"');
+    readfile($filePath);
+    exit;
+}
+
+function readJsonBody(): array
+{
+    $raw = file_get_contents('php://input');
+    $decoded = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($decoded)) {
+        throw new RuntimeException('Request body must be valid JSON.');
+    }
+    return $decoded;
+}
+
+function assertLocalBridgeAccess(array $config): void
+{
+    $remote = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    if (!in_array($remote, ['127.0.0.1', '::1'], true)) {
+        jsonResponse(403, ['error' => 'Local bridge endpoints are restricted to localhost/tunnel access.']);
+    }
+
+    $expectedToken = (string)($config['local_bridge_token'] ?? '');
+    if ($expectedToken !== '') {
+        $actualToken = (string)($_SERVER['HTTP_X_ADFREE_BRIDGE_TOKEN'] ?? '');
+        if (!hash_equals($expectedToken, $actualToken)) {
+            jsonResponse(403, ['error' => 'Invalid local bridge token.']);
+        }
+    }
+}
+
+function normalizeBridgeJobId(string $value): string
+{
+    $clean = strtolower(preg_replace('/[^a-f0-9]/', '', $value) ?? '');
+    if (strlen($clean) === 32) {
+        return $clean;
+    }
+    return bin2hex(random_bytes(16));
+}
+
+function localBridgeRoot(array $config): string
+{
+    $root = envOrDefault('LOCAL_BRIDGE_STORAGE', joinPath((string)$config['storage_root'], 'local-bridge'));
+    ensureDirectory($root);
+    return $root;
+}
+
+function localBridgeJobDir(array $config, string $jobId): string
+{
+    $dir = joinPath(joinPath(localBridgeRoot($config), 'jobs'), $jobId);
+    ensureDirectory($dir);
+    return $dir;
+}
+
+function pruneLocalBridgeJobs(array $config): void
+{
+    $days = max(1, (int)envOrDefault('LOCAL_BRIDGE_RETENTION_DAYS', '3'));
+    $cutoff = time() - ($days * 24 * 3600);
+    $jobsRoot = joinPath(localBridgeRoot($config), 'jobs');
+    if (!is_dir($jobsRoot)) {
+        return;
+    }
+    $items = glob(joinPath($jobsRoot, '*'));
+    if (!is_array($items)) {
+        return;
+    }
+    foreach ($items as $item) {
+        if (is_dir($item) && (int)filemtime($item) < $cutoff) {
+            deleteDirectory($item);
+        }
+    }
+}
+
+function deleteDirectory(string $dir): void
+{
+    $items = scandir($dir);
+    if (!is_array($items)) {
+        return;
+    }
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        $path = joinPath($dir, $item);
+        if (is_dir($path)) {
+            deleteDirectory($path);
+        } else {
+            @unlink($path);
+        }
+    }
+    @rmdir($dir);
+}
+
+function resolveLocalAdCutForgeRoot(): string
+{
+    $candidates = [
+        envOrDefault('LOCAL_ADCUTFORGE_ROOT', ''),
+        envOrDefault('ADCUTFORGE_ROOT', ''),
+        'D:/__MY APPS/ad free podcast player/apps/server/windows/adcutforge',
+        'C:/Users/Gabe/Documents/Codex/2026-05-08/podcast ad remover',
+    ];
+    foreach ($candidates as $candidate) {
+        $trimmed = trim((string)$candidate);
+        if ($trimmed !== '' && is_file(joinPath($trimmed, 'src/ad_cut_forge.py'))) {
+            return str_replace('\\', '/', $trimmed);
+        }
+    }
+    throw new RuntimeException('Local AdCutForge root was not found. Set LOCAL_ADCUTFORGE_ROOT in WAMP/Apache.');
+}
+
+function runLocalAdCutForge(array $config, string $jobId, string $inputPath, string $backend): array
+{
+    $root = resolveLocalAdCutForgeRoot();
+    $script = joinPath($root, 'src/ad_cut_forge.py');
+    if (!is_file($script)) {
+        throw new RuntimeException('AdCutForge CLI script not found at ' . $script);
+    }
+
+    $parts = localPythonCommandParts();
+    $parts[] = $script;
+    $parts[] = '--cli';
+    $parts[] = '--overwrite';
+    $parts[] = '--backend';
+    $parts[] = $backend;
+    $parts[] = '--detection-mode';
+    $parts[] = 'local';
+
+    if ($backend === 'parakeet') {
+        $parakeetPython = envOrDefault('LOCAL_PARAKEET_PYTHON', joinPath($root, 'parakeet-runtime/Scripts/python.exe'));
+        if (!is_file($parakeetPython)) {
+            throw new RuntimeException('Parakeet Python was not found. Set LOCAL_PARAKEET_PYTHON or install the bundled parakeet runtime.');
+        }
+        $parts[] = '--parakeet-python';
+        $parts[] = $parakeetPython;
+        $model = envOrDefault('LOCAL_PARAKEET_MODEL', 'nvidia/parakeet-tdt-0.6b-v3');
+        if ($model !== '') {
+            $parts[] = '--parakeet-model';
+            $parts[] = $model;
+        }
+    }
+
+    $parts[] = $inputPath;
+    $command = shellCommand($parts);
+    if (PHP_OS_FAMILY === 'Windows') {
+        $command = 'set PYTHONIOENCODING=utf-8&& set PYTHONUTF8=1&& ' . $command;
+    } else {
+        $command = 'PYTHONIOENCODING=utf-8 PYTHONUTF8=1 ' . $command;
+    }
+    $descriptorSpec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $process = proc_open($command, $descriptorSpec, $pipes, $root);
+    if (!is_resource($process)) {
+        throw new RuntimeException('Failed to start local AdCutForge process.');
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+    $logs = trim((string)$stdout . "\n" . (string)$stderr);
+    if ($exitCode !== 0) {
+        throw new RuntimeException('Local AdCutForge failed with exit code ' . $exitCode . ': ' . tailText($logs, 2000));
+    }
+
+    $stem = pathinfo($inputPath, PATHINFO_FILENAME);
+    $artifactDir = joinPath(dirname($inputPath), $stem . '.adcut');
+    if (!is_dir($artifactDir)) {
+        throw new RuntimeException('Local AdCutForge did not create an artifact folder.');
+    }
+
+    $outputPath = findLocalProcessedAudio($artifactDir);
+    if ($outputPath === '') {
+        $outputPath = joinPath(localBridgeJobDir($config, $jobId), 'source.noads.' . pathinfo($inputPath, PATHINFO_EXTENSION));
+        copy($inputPath, $outputPath);
+    }
+
+    $transcriptPath = findFirstExisting([
+        joinPath($artifactDir, $stem . '.transcript.txt'),
+    ]);
+    $timestampedPath = findFirstExisting([
+        joinPath($artifactDir, $stem . '.timestamped.txt'),
+    ]);
+    $timestampsPath = findFirstExisting([
+        joinPath($artifactDir, $stem . '.ad-ranges.json'),
+        joinPath($artifactDir, $stem . '.timestamps.json'),
+    ]);
+
+    return [
+        'output_path' => $outputPath,
+        'transcript_path' => $transcriptPath,
+        'timestamped_transcript_path' => $timestampedPath,
+        'timestamps_path' => $timestampsPath,
+        'logs' => $logs,
+    ];
+}
+
+function localPythonCommandParts(): array
+{
+    $configured = trim(envOrDefault('LOCAL_ADCUTFORGE_PYTHON', ''));
+    if ($configured === '') {
+        return ['py', '-3.11'];
+    }
+    return splitCommandPrefix($configured);
+}
+
+function splitCommandPrefix(string $command): array
+{
+    $command = trim($command);
+    if ($command === '') {
+        return [];
+    }
+    if ($command[0] === '"') {
+        $end = strpos($command, '"', 1);
+        if ($end !== false) {
+            $first = substr($command, 1, $end - 1);
+            $rest = trim(substr($command, $end + 1));
+            return array_values(array_filter(array_merge([$first], preg_split('/\s+/', $rest) ?: []), fn($part) => $part !== ''));
+        }
+    }
+    return array_values(array_filter(preg_split('/\s+/', $command) ?: [], fn($part) => $part !== ''));
+}
+
+function shellCommand(array $parts): string
+{
+    return implode(' ', array_map(fn($part) => escapeshellarg((string)$part), $parts));
+}
+
+function findLocalProcessedAudio(string $artifactDir): string
+{
+    $matches = glob(joinPath($artifactDir, '*.no-ads.*'));
+    if (!is_array($matches) || count($matches) === 0) {
+        return '';
+    }
+    usort($matches, fn($a, $b) => (int)filemtime($b) <=> (int)filemtime($a));
+    return (string)$matches[0];
+}
+
+function findFirstExisting(array $paths): string
+{
+    foreach ($paths as $path) {
+        if (is_string($path) && is_file($path)) {
+            return $path;
+        }
+    }
+    return '';
+}
+
+function tailText(string $value, int $maxChars): string
+{
+    if (strlen($value) <= $maxChars) {
+        return $value;
+    }
+    return substr($value, -$maxChars);
+}
+
 function fetchJob(PDO $pdo, string $id): ?array
 {
     $query = $pdo->prepare('SELECT * FROM jobs WHERE id = :id LIMIT 1');
@@ -922,11 +1409,16 @@ function withBasePath(string $basePath, string $path): string
 function validateBackend(string $backend): string
 {
     $normalized = strtolower(trim($backend));
-    $allowed = ['whisper', 'openai-whisper'];
+    $allowed = ['whisper', 'openai-whisper', 'tunnel-whisper', 'tunnel-parakeet'];
     if (!in_array($normalized, $allowed, true)) {
-        throw new RuntimeException('Unsupported backend. Allowed values: whisper, openai-whisper.');
+        throw new RuntimeException('Unsupported backend. Allowed values: whisper, openai-whisper, tunnel-whisper, tunnel-parakeet.');
     }
     return $normalized;
+}
+
+function isTunnelBackend(string $backend): bool
+{
+    return in_array(strtolower(trim($backend)), ['tunnel-whisper', 'tunnel-parakeet'], true);
 }
 
 function validateDetectionMode(string $mode): string

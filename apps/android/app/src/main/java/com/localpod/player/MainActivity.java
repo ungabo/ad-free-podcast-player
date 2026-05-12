@@ -105,6 +105,8 @@ public class MainActivity extends Activity {
     private static final String ENGINE_VOSK   = "vosk";
     private static final String ENGINE_WHISPER = "whisper_local";
     private static final String ENGINE_OPENAI  = "openai";
+    private static final String ENGINE_TUNNEL_WHISPER = "tunnel_whisper";
+    private static final String ENGINE_TUNNEL_PARAKEET = "tunnel_parakeet";
     private static final int OPENAI_CHUNK_SECONDS = 12 * 60;
     private static final int LOCAL_CHUNK_SECONDS  = 3 * 60;
     private static final double AD_PADDING_BEFORE_SECONDS = 4.0;
@@ -618,13 +620,15 @@ public class MainActivity extends Activity {
         section("Ad Removal — Server Engine");
         String curEngine = db.setting("transcription_engine", ENGINE_OPENAI);
         if (ENGINE_VOSK.equals(curEngine)) curEngine = ENGINE_OPENAI;
-        root.addView(text("Choose which server transcription backend to use when you tap Remove ads. OpenAI Whisper is the default cloud path and produces transcript verification artifacts on the server.", 14, MUTED, false));
+        root.addView(text("Choose which server transcription backend to use when you tap Remove ads. The Windows tunnel options process on the WAMP machine through the hosted API and do not use OpenAI.", 14, MUTED, false));
         LinearLayout engineRow = new LinearLayout(this);
         engineRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         String[][] engineOpts = {
             {ENGINE_WHISPER, "Whisper\n(server)"},
-            {ENGINE_OPENAI, "OpenAI\nWhisper"}
+            {ENGINE_OPENAI, "OpenAI\nWhisper"},
+            {ENGINE_TUNNEL_WHISPER, "Win tunnel\nWhisper"},
+            {ENGINE_TUNNEL_PARAKEET, "Win tunnel\nParakeet"}
         };
         for (String[] opt : engineOpts) {
             Button btn = new Button(this);
@@ -646,6 +650,8 @@ public class MainActivity extends Activity {
         root.addView(engineRow);
         if (ENGINE_WHISPER.equals(curEngine)) {
             root.addView(text("Local Whisper requires a compatible server-side install before it can run.", 13, MUTED, false));
+        } else if (ENGINE_TUNNEL_WHISPER.equals(curEngine) || ENGINE_TUNNEL_PARAKEET.equals(curEngine)) {
+            root.addView(text("Windows tunnel processing requires WAMP and the reverse SSH tunnel on your Windows machine. Detection is local-only and no OpenAI key is sent.", 13, MUTED, false));
         } else {
             root.addView(text("OpenAI Whisper backend uses OpenAI transcription. Requires an OpenAI API key.", 13, MUTED, false));
         }
@@ -903,6 +909,8 @@ public class MainActivity extends Activity {
     private String engineLabel(String engine) {
         if (ENGINE_WHISPER.equals(engine)) return "Whisper server";
         if (ENGINE_OPENAI.equals(engine)) return "OpenAI Whisper server";
+        if (ENGINE_TUNNEL_WHISPER.equals(engine)) return "Windows tunnel Whisper";
+        if (ENGINE_TUNNEL_PARAKEET.equals(engine)) return "Windows tunnel Parakeet";
         return "OpenAI Whisper server";
     }
 
@@ -1008,11 +1016,14 @@ public class MainActivity extends Activity {
     private String apiBackendForEngine(String engine) {
         if (ENGINE_OPENAI.equals(engine)) return "openai-whisper";
         if (ENGINE_WHISPER.equals(engine)) return "whisper";
+        if (ENGINE_TUNNEL_WHISPER.equals(engine)) return "tunnel-whisper";
+        if (ENGINE_TUNNEL_PARAKEET.equals(engine)) return "tunnel-parakeet";
         return "openai-whisper";
     }
 
     private String apiDetectionModeForEngine(String engine, boolean hasOpenAiKey) {
         if (ENGINE_OPENAI.equals(engine)) return "openai";
+        if (ENGINE_TUNNEL_WHISPER.equals(engine) || ENGINE_TUNNEL_PARAKEET.equals(engine)) return "local";
         return hasOpenAiKey ? "hybrid" : "local";
     }
 
@@ -1150,7 +1161,7 @@ public class MainActivity extends Activity {
         appendFormField(form, "backend", backend);
         appendFormField(form, "detection_mode", detectionMode);
         appendFormField(form, "openai_model", TextUtils.isEmpty(openAiModel) ? "gpt-4o-mini" : openAiModel);
-        if (!TextUtils.isEmpty(apiKey)) {
+        if (!backend.startsWith("tunnel-") && !TextUtils.isEmpty(apiKey)) {
             appendFormField(form, "openai_api_key", apiKey);
         }
 

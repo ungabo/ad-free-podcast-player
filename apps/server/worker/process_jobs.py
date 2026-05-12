@@ -11,6 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
@@ -59,6 +60,13 @@ ADCUTFORGE_ROOT = os.getenv(
 ADCUTFORGE_PYTHON = os.getenv("ADCUTFORGE_PYTHON", "python3").strip()
 ADCUTFORGE_SCRIPT = os.getenv("ADCUTFORGE_SCRIPT", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+LOCAL_PROCESSOR_BASE_URL = os.getenv(
+    "LOCAL_PROCESSOR_BASE_URL", "http://127.0.0.1:8081/adfree-api"
+).rstrip("/")
+LOCAL_BRIDGE_TOKEN = os.getenv("LOCAL_BRIDGE_TOKEN", "").strip()
+LOCAL_PROCESSOR_TIMEOUT_SECONDS = max(
+    60, int(os.getenv("LOCAL_PROCESSOR_TIMEOUT_SECONDS", "14400"))
+)
 
 MAX_LOG_CHARS = 60000
 PROGRESS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)%")
@@ -483,7 +491,140 @@ def find_rendered_audio(input_path: Path, explicit_path: str) -> Optional[Path]:
     return None
 
 
-def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str, Optional[str]]:
+def is_tunnel_backend(backend: str) -> bool:
+    return backend.strip().lower() in {"tunnel-whisper", "tunnel-parakeet"}
+
+
+def tunnel_local_backend(backend: str) -> str:
+    return "parakeet" if backend.strip().lower() == "tunnel-parakeet" else "whisper"
+
+
+def bridge_headers(content_type: Optional[str] = None) -> dict[str, str]:
+    headers = {"User-Agent": "AdFreePodcastPlayer/1.0"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    if LOCAL_BRIDGE_TOKEN:
+        headers["X-Adfree-Bridge-Token"] = LOCAL_BRIDGE_TOKEN
+    return headers
+
+
+def bridge_url(path_or_url: str) -> str:
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        return path_or_url
+    path = path_or_url if path_or_url.startswith("/") else f"/{path_or_url}"
+    return f"{LOCAL_PROCESSOR_BASE_URL}{path}"
+
+
+def post_bridge_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request = Request(
+        bridge_url(path),
+        data=json.dumps(payload).encode("utf-8"),
+        headers=bridge_headers("application/json"),
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Windows bridge returned HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Windows bridge is not reachable at {LOCAL_PROCESSOR_BASE_URL}: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Windows bridge returned a non-object JSON response")
+    return decoded
+
+
+def download_bridge_file(path_or_url: str, destination: Path) -> None:
+    request = Request(bridge_url(path_or_url), headers=bridge_headers(), method="GET")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_suffix(destination.suffix + ".part")
+    tmp_path.unlink(missing_ok=True)
+    try:
+        with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
+            with tmp_path.open("wb") as output:
+                shutil.copyfileobj(response, output)
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Windows bridge download returned HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Windows bridge download failed: {exc}") from exc
+    if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("Windows bridge returned an empty file")
+    tmp_path.replace(destination)
+
+
+def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
+    backend = str(payload.get("backend", "tunnel-whisper")).strip().lower()
+    source_url = str(payload.get("source_url", "") or "").strip()
+    if not source_url:
+        raise RuntimeError("Windows tunnel processing requires source_url jobs.")
+
+    emit_runtime_update(
+        job_id,
+        logs_list,
+        38.0,
+        f"38% Sending job to Windows tunnel ({tunnel_local_backend(backend)})",
+    )
+    response = post_bridge_json(
+        "/api/local/process",
+        {
+            "job_id": job_id,
+            "source_url": source_url,
+            "backend": tunnel_local_backend(backend),
+            "detection_mode": "local",
+            "episode_title": payload.get("episode_title") or "",
+            "podcast_name": payload.get("podcast_name") or "",
+        },
+    )
+    if not response.get("ok"):
+        raise RuntimeError(str(response.get("error") or "Windows bridge processing failed"))
+
+    emit_runtime_update(job_id, logs_list, 88.0, "88% Pulling Windows tunnel output")
+    output_path = Path(str(payload["output_path"])).resolve()
+    download_url = str(response.get("download_url") or "")
+    if not download_url:
+        raise RuntimeError("Windows bridge did not return a download_url")
+    download_bridge_file(download_url, output_path)
+
+    job_artifacts_dir = ARTIFACTS_DIR / job_id
+    job_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path: Optional[str] = None
+    timestamps_path: Optional[str] = None
+
+    artifact_targets = [
+        ("transcript_url", job_artifacts_dir / "transcript.txt"),
+        ("timestamped_transcript_url", job_artifacts_dir / "transcript_timestamped.txt"),
+        ("timestamps_url", job_artifacts_dir / "timestamps.json"),
+        ("stats_url", job_artifacts_dir / "stats.json"),
+    ]
+    for key, destination in artifact_targets:
+        artifact_url = str(response.get(key) or "")
+        if not artifact_url:
+            continue
+        try:
+            download_bridge_file(artifact_url, destination)
+        except Exception as exc:
+            logs_list.append(f"Could not fetch Windows bridge artifact {key}: {exc}")
+
+    if (job_artifacts_dir / "transcript.txt").exists():
+        transcript_path = str(job_artifacts_dir / "transcript.txt")
+    if (job_artifacts_dir / "timestamps.json").exists():
+        timestamps_path = str(job_artifacts_dir / "timestamps.json")
+
+    bridge_logs = str(response.get("logs") or "").strip()
+    if bridge_logs:
+        logs_list.append("--- Windows bridge log ---")
+        logs_list.extend(bridge_logs.splitlines()[-120:])
+
+    emit_runtime_update(job_id, logs_list, 95.0, "95% Finalizing Windows tunnel output")
+    return str(output_path), bridge_logs, timestamps_path, transcript_path
+
+
+def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
     script = resolve_adcutforge_script()
     if script is None:
         raise RuntimeError(
@@ -614,17 +755,22 @@ def process_job_file(queue_file: Path) -> None:
     mark_running(job_id)
     logs_list = ["5% Starting server job"]
     input_path = Path(str(payload.get("input_path", ""))).resolve() if payload.get("input_path") else None
+    backend = str(payload.get("backend", "")).strip().lower()
     started_at = time.time()
 
     try:
         prune_expired_source_cache()
-        emit_runtime_update(job_id, logs_list, 8.0, "8% Preparing source audio")
-        prepare_input_audio(job_id, payload, logs_list)
+        if not is_tunnel_backend(backend):
+            emit_runtime_update(job_id, logs_list, 8.0, "8% Preparing source audio")
+            prepare_input_audio(job_id, payload, logs_list)
 
         transcript_path: Optional[str] = None
         timestamps_path: Optional[str] = None
         if PROCESSOR_MODE == "adcutforge":
-            output_path, _, timestamps_path, transcript_path = run_adcutforge(job_id, payload, logs_list)
+            if is_tunnel_backend(backend):
+                output_path, _, timestamps_path, transcript_path = run_tunnel_processor(job_id, payload, logs_list)
+            else:
+                output_path, _, timestamps_path, transcript_path = run_adcutforge(job_id, payload, logs_list)
         elif PROCESSOR_MODE == "ffmpeg-copy":
             output_path, _ = run_ffmpeg_copy(job_id, payload, logs_list)
         else:
