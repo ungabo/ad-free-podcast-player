@@ -1,0 +1,2 @@
+Options +SymLinksIfOwnerMatch
+DirectoryIndex index.php index.html

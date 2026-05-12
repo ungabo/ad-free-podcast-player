@@ -16,6 +16,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parents[2]
+BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
+BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
+
 
 def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
@@ -109,8 +113,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    ffmpeg_bin = os.getenv("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
-    ffprobe_bin = os.getenv("FFPROBE_BIN", "ffprobe").strip() or "ffprobe"
+    ffmpeg_bin = os.getenv(
+        "FFMPEG_BIN",
+        str(BUNDLED_FFMPEG_BIN) if BUNDLED_FFMPEG_BIN.exists() else "ffmpeg",
+    ).strip() or "ffmpeg"
+    ffprobe_bin = os.getenv(
+        "FFPROBE_BIN",
+        str(BUNDLED_FFPROBE_BIN) if BUNDLED_FFPROBE_BIN.exists() else "ffprobe",
+    ).strip() or "ffprobe"
 
     input_file = Path(args.input_file).resolve()
     if not input_file.is_file():

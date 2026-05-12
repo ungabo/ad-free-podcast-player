@@ -25,10 +25,20 @@ ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", str(APP_STORAGE / "artifacts")))
 SOURCE_CACHE_DIR = Path(
     os.getenv("SOURCE_CACHE_DIR", str(APP_STORAGE / "source-cache"))
 ).resolve()
+BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
+BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
+BUNDLED_ADCUTFORGE_ROOT = BASE_DIR / "adcutforge"
 
 POLL_SECONDS = max(1, int(os.getenv("WORKER_POLL_SECONDS", "2")))
 PROCESSOR_MODE = os.getenv("PROCESSOR_MODE", "ffmpeg-copy").strip().lower()
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip()
+FFMPEG_BIN = os.getenv(
+    "FFMPEG_BIN",
+    str(BUNDLED_FFMPEG_BIN) if BUNDLED_FFMPEG_BIN.exists() else "ffmpeg",
+).strip()
+FFPROBE_BIN = os.getenv(
+    "FFPROBE_BIN",
+    str(BUNDLED_FFPROBE_BIN) if BUNDLED_FFPROBE_BIN.exists() else "ffprobe",
+).strip()
 SOURCE_CACHE_RETENTION_DAYS = max(
     1, int(os.getenv("SOURCE_CACHE_RETENTION_DAYS", "60"))
 )
@@ -39,7 +49,10 @@ SOURCE_DOWNLOAD_TIMEOUT_SECONDS = max(
     30, int(os.getenv("SOURCE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
 )
 
-ADCUTFORGE_ROOT = os.getenv("ADCUTFORGE_ROOT", "").strip()
+ADCUTFORGE_ROOT = os.getenv(
+    "ADCUTFORGE_ROOT",
+    str(BUNDLED_ADCUTFORGE_ROOT) if BUNDLED_ADCUTFORGE_ROOT.exists() else "",
+).strip()
 ADCUTFORGE_PYTHON = os.getenv("ADCUTFORGE_PYTHON", "python3").strip()
 ADCUTFORGE_SCRIPT = os.getenv("ADCUTFORGE_SCRIPT", "").strip()
 PARAKEET_PYTHON = os.getenv("PARAKEET_PYTHON", "").strip()

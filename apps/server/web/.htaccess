@@ -1,1 +1,13 @@
-DirectoryIndex index.php index.html
+Options +SymLinksIfOwnerMatch
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  RewriteRule ^$ /adfree-web/ [R=302,L]
+
+  RewriteCond %{REQUEST_URI} !^/adfree-web(/|$)
+  RewriteCond %{REQUEST_URI} !^/adfree-api(/|$)
+  RewriteCond %{REQUEST_URI} !^/error_docs(/|$)
+  RewriteRule ^ /adfree-web/ [R=302,L]
+</IfModule>
