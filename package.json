@@ -12,7 +12,11 @@
     "android:package": "powershell -NoProfile -Command \"Set-Location '.\\apps\\android'; .\\gradlew.bat clean assembleDebug; if (-not (Test-Path '.\\app\\build\\outputs\\apk\\debug\\app-debug.apk')) { throw 'Gradle APK output is missing.' }; Copy-Item '.\\app\\build\\outputs\\apk\\debug\\app-debug.apk' '.\\Ad Free Podcast Player-debug.apk' -Force; if (-not (Test-Path '.\\Ad Free Podcast Player-debug.apk')) { throw 'Packaged APK copy is missing.' }\"",
     "windows:package": "npm run package:win -w apps/desktop",
     "windows:run": "powershell -NoProfile -Command \"Start-Process '.\\apps\\desktop\\Ad Free Podcast Player-win32-x64\\Ad Free Podcast Player.exe'\"",
-    "install:desktop": "npm install -w apps/desktop"
+    "install:desktop": "npm install -w apps/desktop",
+    "local:sync:wamp": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\server\\windows\\setup-local.ps1",
+    "local:bridge:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\server\\windows\\run-local-bridge.ps1",
+    "local:bridge:wamp-trigger:start": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\server\\windows\\run-wamp-triggered-bridge.ps1",
+    "local:bridge:install-startup": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\apps\\server\\windows\\install-bridge-startup-task.ps1"
   },
   "keywords": [],
   "author": "",

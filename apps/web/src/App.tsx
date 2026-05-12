@@ -107,7 +107,6 @@ type JobRecord = JobStatusResponse & {
   timestamped_transcript_url: string | null
   timestamps_url: string | null
   stats_url: string | null
-  verification_url: string | null
   user_id: string | null
 }
 
@@ -219,8 +218,9 @@ function App() {
     savedSettings?.backend === 'whisper' ? 'whisper' : 'openai-whisper'
   )
 
-  const [searchTerm, setSearchTerm] = useState('smartless')
+  const [searchTerm, setSearchTerm] = useState('')
   const [isSearching, setIsSearching] = useState(false)
+  const [hasSearched, setHasSearched] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [podcasts, setPodcasts] = useState<PodcastResult[]>([])
   const [activePodcast, setActivePodcast] = useState<PodcastResult | null>(null)
@@ -363,15 +363,36 @@ function App() {
     return loadPodcastEpisodes(podcast)
   }
 
+  async function selectSubscription(sub: Subscription): Promise<void> {
+    if (!sub.collection_id) {
+      setSearchError('This favorite is missing its podcast catalog ID. Search for it once and favorite it again.')
+      return
+    }
+
+    setSearchError('')
+    setPodcasts([])
+    setHasSearched(false)
+    await selectPodcast({
+      collectionId: sub.collection_id,
+      collectionName: sub.podcast_title,
+      artistName: sub.podcast_author ?? undefined,
+      feedUrl: sub.feed_url,
+      artworkUrl600: sub.artwork_url ?? undefined,
+      artworkUrl100: sub.artwork_url ?? undefined,
+    })
+  }
+
   async function runPodcastSearch(termOverride?: string): Promise<PodcastResult[]> {
     const term = (termOverride ?? searchTerm).trim()
     if (!term) {
       setSearchError('Enter a podcast name or topic.')
+      setHasSearched(true)
       return []
     }
 
     setSearchError('')
     setEpisodeError('')
+    setHasSearched(true)
     setIsSearching(true)
 
     try {
@@ -705,52 +726,6 @@ function App() {
     }
   }
 
-  async function runLatestPodcastRoutine(term: string, displayName: string): Promise<void> {
-    setBackend('openai-whisper')
-    setDetectionMode('hybrid')
-    setSearchTerm(term)
-    appendLog(`Running ${displayName} latest-episode routine with OpenAI Whisper verification.`)
-
-    const results = await runPodcastSearch(term)
-    if (results.length === 0) {
-      setRunError(`No podcasts matched ${displayName}.`)
-      return
-    }
-
-    const normalizedTerm = term.toLowerCase()
-    const selected =
-      results.find((item) => item.collectionName.toLowerCase() === normalizedTerm) ??
-      results.find((item) => item.collectionName.toLowerCase().includes(normalizedTerm)) ??
-      results[0]
-
-    const loaded = await selectPodcast(selected)
-    const latestPlayable = loaded.find((item) => episodePlayableUrl(item).length > 0)
-    if (!latestPlayable) {
-      setRunError(`Could not find a playable episode URL for ${displayName}.`)
-      return
-    }
-
-    chooseEpisode(latestPlayable)
-    await submitEpisodeForProcessing(latestPlayable, `${displayName} latest episode`, {
-      backend: 'openai-whisper',
-      detectionMode: 'hybrid',
-      podcast: selected,
-    })
-  }
-
-  async function runSmartlessRoutine(): Promise<void> {
-    await runLatestPodcastRoutine('smartless', 'SmartLess')
-  }
-
-  async function runStuffYouShouldKnowRoutine(): Promise<void> {
-    await runLatestPodcastRoutine('stuff you should know', 'Stuff You Should Know')
-  }
-
-  useEffect(() => {
-    void runPodcastSearch('smartless')
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
   useEffect(() => {
     void fetchLiveJobs()
     void fetchWorkerStatus()
@@ -809,7 +784,7 @@ function App() {
         <p className="kicker">Linux Web Interface</p>
         <h1>Ad Free Podcast Player</h1>
         <p className="lede">
-          Search for podcasts, pick the most recent episode, and run server-side ad removal with transcript verification.
+          Search for podcasts, pick an episode, and run server-side ad removal with transcripts and ad timestamps.
         </p>
         {users.length > 0 ? (
           <div className="user-selector-row">
@@ -840,7 +815,7 @@ function App() {
                     key={sub.id}
                     type="button"
                     className="sub-item"
-                    onClick={() => void runPodcastSearch(sub.podcast_title)}
+                    onClick={() => void selectSubscription(sub)}
                   >
                     {sub.artwork_url ? (
                       <img src={sub.artwork_url} alt="" className="sub-art" />
@@ -868,19 +843,10 @@ function App() {
             </button>
           </div>
 
-          <div className="button-row">
-            <button type="button" onClick={() => void runSmartlessRoutine()} disabled={isSubmitting || isSearching}>
-              Run latest SmartLess now
-            </button>
-            <button type="button" onClick={() => void runStuffYouShouldKnowRoutine()} disabled={isSubmitting || isSearching}>
-              Run latest SYSK now
-            </button>
-          </div>
-
           {searchError ? <p className="error-text">{searchError}</p> : null}
 
           <div className="podcast-list">
-            {podcasts.length === 0 ? <p className="tiny">No podcasts found yet.</p> : null}
+            {hasSearched && podcasts.length === 0 && !searchError ? <p className="tiny">No podcasts found.</p> : null}
             {podcasts.slice(0, 8).map((podcast) => (
               <button
                 key={podcast.collectionId}
@@ -1006,7 +972,7 @@ function App() {
               />
             </label>
             <label>
-              OpenAI key (optional)
+              OpenAI key (blank uses server key)
               <input
                 type="password"
                 placeholder="sk-..."
@@ -1032,7 +998,7 @@ function App() {
           <div className="status-stack">
             <span className="status on">Default backend: OpenAI Whisper</span>
             <span className={isOpenAiEnabled ? 'status on' : 'status neutral'}>
-              {isOpenAiEnabled ? 'OpenAI key loaded' : 'OpenAI key required for default backend'}
+              {isOpenAiEnabled ? 'Browser key loaded' : 'Using server key if configured'}
             </span>
             {workerStatus ? (
               <span className={workerStatus.running ? 'status on' : 'status off'}>
@@ -1312,16 +1278,6 @@ function App() {
                   Processing stats
                 </a>
               ) : null}
-              {selectedHistoryJob.verification_url ? (
-                <a
-                  href={toAbsoluteUrl(selectedHistoryJob.verification_url)}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="detail-link-btn secondary"
-                >
-                  Verification
-                </a>
-              ) : null}
             </div>
 
             {selectedHistoryJob.download_url ? (
@@ -1336,7 +1292,7 @@ function App() {
       ) : null}
 
       <footer className="footer-note">
-        This web app is wired to the Linux API worker stack and defaults to OpenAI Whisper + transcript verification.
+        This web app is wired to the Linux API worker stack and defaults to OpenAI Whisper + hybrid ad detection.
         {' · '}Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
       </footer>
     </div>

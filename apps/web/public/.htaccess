@@ -1,2 +1,8 @@
 Options +SymLinksIfOwnerMatch
 DirectoryIndex index.php index.html
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{DOCUMENT_ROOT}/adfree-web/.ui-disabled -f
+  RewriteRule ^ - [F,L]
+</IfModule>

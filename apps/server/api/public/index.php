@@ -64,7 +64,7 @@ try {
         downloadJobOutput($pdo, $matches[1]);
     }
 
-    if ($method === 'GET' && preg_match('#^/api/jobs/([a-f0-9]{32})/artifact/(transcript|timestamped-transcript|timestamps|verification|stats)$#', $uri, $matches) === 1) {
+    if ($method === 'GET' && preg_match('#^/api/jobs/([a-f0-9]{32})/artifact/(transcript|timestamped-transcript|timestamps|stats)$#', $uri, $matches) === 1) {
         serveJobArtifact($pdo, $config, $matches[1], $matches[2]);
     }
 
@@ -852,17 +852,6 @@ function serveJobArtifact(PDO $pdo, array $config, string $id, string $type): vo
         exit;
     }
 
-    if ($type === 'verification') {
-        $verificationPath = joinPath($artifactsDir, 'verification.json');
-        if (!is_file($verificationPath)) {
-            jsonResponse(404, ['error' => 'Verification artifact not available for this job']);
-        }
-        header('Content-Type: application/json');
-        header('Content-Length: ' . (string)filesize($verificationPath));
-        readfile($verificationPath);
-        exit;
-    }
-
     jsonResponse(400, ['error' => 'Unknown artifact type']);
 }
 
@@ -916,9 +905,6 @@ function normalizeJob(array $job, string $basePath = '', string $artifactsRoot =
             ? withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/timestamps')
             : null,
         'stats_url' => withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/stats'),
-        'verification_url' => ($artifactsRoot !== '' && is_file(joinPath(joinPath($artifactsRoot, $jobId), 'verification.json')))
-            ? withBasePath($basePath, '/api/jobs/' . $jobId . '/artifact/verification')
-            : null,
         'user_id' => isset($job['user_id']) ? (string)$job['user_id'] : null,
     ];
 }

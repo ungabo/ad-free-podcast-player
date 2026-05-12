@@ -36,6 +36,18 @@ docker compose up --build
 
 API will be available at `http://localhost:8080`.
 
+## Run Locally on Windows
+
+The stack also works on a Windows machine with WAMP or a similar Apache + PHP setup.
+
+- Put the built web app in `D:\wamp64\www\adfree-web`
+- Put the API entrypoint in `D:\wamp64\www\adfree-api`
+- Set the PHP env vars from `apps/server/.env.example` in your Apache vhost with `SetEnv`
+- Point the worker at the same storage folder and run it as a Windows process or service
+- Create `D:\wamp64\www\adfree-web\.ui-disabled` to turn off local UI access while keeping the API online
+
+Example vhost and sync script notes live in `apps/server/windows/README.md`.
+
 ## API Endpoints
 
 ### Health

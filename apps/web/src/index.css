@@ -355,13 +355,21 @@ h1 {
 }
 
 .podcast-item strong,
-.episode-item strong,
 .history-item-main strong,
 .sub-item span {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.episode-item strong {
+  display: block;
+  min-width: 0;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.28;
 }
 
 .podcast-item strong,

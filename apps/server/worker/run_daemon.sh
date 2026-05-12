@@ -24,6 +24,7 @@ export FFPROBE_BIN="${FFPROBE_BIN:-$STACK_ROOT/runtime/bin/ffprobe}"
 export PROCESSOR_MODE="${PROCESSOR_MODE:-adcutforge}"
 export ADCUTFORGE_ROOT="${ADCUTFORGE_ROOT:-$STACK_ROOT/adcutforge}"
 export ADCUTFORGE_PYTHON="${ADCUTFORGE_PYTHON:-/usr/bin/python3}"
+export ADCUTFORGE_CACHE_DIR="${ADCUTFORGE_CACHE_DIR:-$STORAGE_ROOT/adcutforge-cache}"
 
 printf '\n[%s] worker daemon start\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 /usr/bin/python3 "$STACK_ROOT/worker/process_jobs.py"

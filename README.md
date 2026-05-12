@@ -147,7 +147,8 @@ npm run server:up
 http://localhost:8080
 ```
 
-Server usage details live in `apps/server/README.md`.
+Server usage details live in [apps/server/README.md](apps/server/README.md).
+Windows local setup details, including the UI disable toggle, live in [apps/server/windows/README.md](apps/server/windows/README.md).
 
 ## Project Status
 
