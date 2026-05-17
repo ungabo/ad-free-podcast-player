@@ -1261,6 +1261,7 @@ function processLocalBridgeJob(array $config): void
             writeLocalBridgeStatus($jobDir, $jobId, 'running', min(90.0, $localProgress), $phase, $message, $logs);
         };
 
+        writeLocalBridgeStatus($jobDir, $jobId, 'running', 35.0, 'Starting Parakeet', 'Windows is loading Parakeet and preparing transcription.');
         $result = runLocalAdCutForge($config, $jobId, $inputPath, $backend, $detectionMode, $openAiApiKey, $openAiModel, $statusUpdater);
         $finished = microtime(true);
         writeLocalBridgeStatus($jobDir, $jobId, 'running', 95.0, 'Returning result', 'Windows finished processing and is preparing files for the server.', (string)$result['logs']);
