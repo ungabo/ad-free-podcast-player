@@ -106,9 +106,10 @@ public class MainActivity extends Activity {
     private static final String SETTING_DEVICE_SERVER_USER_NAME = "device_server_user_name";
     private static final int EPISODE_PAGE_SIZE = 40;
     private static final long PODCAST_CACHE_TTL_MS = 12L * 3600L * 1000L;
-    private static final int REMOTE_JOB_POLL_INTERVAL_MS = 10000;
+    private static final int REMOTE_JOB_POLL_INTERVAL_MS = 3000;
     private static final int REMOTE_JOB_STATUS_MAX_ERRORS = 12;
     private static final int REMOTE_JOB_LONG_NOTICE_POLLS = 60;
+    private static final long REMOTE_ADFREE_INDEX_TTL_MS = 2L * 60L * 1000L;
     private static final String[] FILTERS = {"All", "New", "In progress", "Downloaded", "Not downloaded", "Listened", "Unlistened"};
 
     private static final String NOTIF_CH_REMOVAL = "ad_removal";
@@ -163,9 +164,13 @@ public class MainActivity extends Activity {
     private final ArrayList<CallLog> callLogs = new ArrayList<>();
     private final ArrayList<Runnable> screenBackStack = new ArrayList<>();
     private final ArrayList<ServerUser> serverUsers = new ArrayList<>();
+    private final Map<String, RemoteAdFreeInfo> remoteAdFreeByUrl = new HashMap<>();
+    private final Map<String, RemoteAdFreeInfo> remoteAdFreeByTitlePodcast = new HashMap<>();
     private Runnable currentScreenAction;
     private volatile boolean serverUsersLoaded;
     private volatile boolean serverUsersLoading;
+    private volatile boolean remoteAdFreeLoading;
+    private volatile long remoteAdFreeLoadedAt;
     private long lastBackPressedAt;
     private final Runnable tick = new Runnable() {
         @Override public void run() {
@@ -184,6 +189,14 @@ public class MainActivity extends Activity {
             this.id = id == null ? "" : id;
             this.name = name == null ? "" : name;
         }
+    }
+
+    private static class RemoteAdFreeInfo {
+        String jobId = "";
+        String title = "";
+        String podcast = "";
+        String downloadUrl = "";
+        String finishedAt = "";
     }
 
     @Override public void onCreate(Bundle b) {
@@ -1028,7 +1041,7 @@ public class MainActivity extends Activity {
         LinearLayout meta = new LinearLayout(this);
         meta.setOrientation(LinearLayout.VERTICAL);
         TextView title = text(p.title, 15, INK, true);
-        title.setMaxLines(2);
+        title.setMaxLines(3);
         title.setEllipsize(TextUtils.TruncateAt.END);
         title.setTextColor(BLUE);
         title.setClickable(true);
@@ -1138,6 +1151,9 @@ public class MainActivity extends Activity {
             filters.addView(filterRow);
         }
         renderEpisodeList(list, p, "All", 0);
+        if (!serverPodcast) {
+            refreshRemoteAdFreeIndex(() -> renderEpisodeList(list, p, "All", 0));
+        }
     }
 
     private Button filterButton(String label, View.OnClickListener listener) {
@@ -1256,6 +1272,99 @@ public class MainActivity extends Activity {
         return link;
     }
 
+    private void refreshRemoteAdFreeIndex(Runnable afterLoad) {
+        long now = System.currentTimeMillis();
+        if (now - remoteAdFreeLoadedAt < REMOTE_ADFREE_INDEX_TTL_MS && !remoteAdFreeByUrl.isEmpty()) {
+            if (afterLoad != null) postUi(afterLoad);
+            return;
+        }
+        if (remoteAdFreeLoading) return;
+        remoteAdFreeLoading = true;
+        String apiBase = normalizeApiBaseUrl(db.setting("ad_api_base_url", DEFAULT_AD_API_BASE_URL));
+        io.execute(() -> {
+            try {
+                JSONObject parsed = fetchApiJsonWithFallback(apiBase, "/api/jobs?status=completed&limit=200", "Ad-free index failed", "server ad-free index");
+                JSONArray jobs = parsed.optJSONArray("jobs");
+                HashMap<String, RemoteAdFreeInfo> byUrl = new HashMap<>();
+                HashMap<String, RemoteAdFreeInfo> byTitle = new HashMap<>();
+                if (jobs != null) {
+                    for (int i = 0; i < jobs.length(); i++) {
+                        JSONObject job = jobs.optJSONObject(i);
+                        if (job == null || TextUtils.isEmpty(job.optString("download_url", ""))) continue;
+                        RemoteAdFreeInfo info = new RemoteAdFreeInfo();
+                        info.jobId = job.optString("job_id", "");
+                        info.title = job.optString("episode_title", "");
+                        info.podcast = job.optString("podcast_name", "");
+                        info.downloadUrl = job.optString("download_url", "");
+                        info.finishedAt = remoteJobProcessedAt(job);
+                        String source = job.optString("source_url", "");
+                        String fullKey = mediaUrlKey(source, false);
+                        String shortKey = mediaUrlKey(source, true);
+                        if (!TextUtils.isEmpty(fullKey)) byUrl.put(fullKey, info);
+                        if (!TextUtils.isEmpty(shortKey)) byUrl.put(shortKey, info);
+                        String titleKey = titlePodcastKey(info.title, info.podcast);
+                        if (!TextUtils.isEmpty(titleKey)) byTitle.put(titleKey, info);
+                    }
+                }
+                synchronized (remoteAdFreeByUrl) {
+                    remoteAdFreeByUrl.clear();
+                    remoteAdFreeByUrl.putAll(byUrl);
+                    remoteAdFreeByTitlePodcast.clear();
+                    remoteAdFreeByTitlePodcast.putAll(byTitle);
+                    remoteAdFreeLoadedAt = System.currentTimeMillis();
+                }
+                if (afterLoad != null) postUi(afterLoad);
+            } catch (Exception ignored) {
+                if (afterLoad != null) postUi(afterLoad);
+            } finally {
+                remoteAdFreeLoading = false;
+            }
+        });
+    }
+
+    private RemoteAdFreeInfo remoteAdFreeInfo(Episode e) {
+        if (e == null) return null;
+        String fullKey = mediaUrlKey(e.enclosureUrl, false);
+        String shortKey = mediaUrlKey(e.enclosureUrl, true);
+        String podcastName = db == null ? "" : db.podcastTitle(e.podcastId);
+        String titleKey = titlePodcastKey(e.title, podcastName);
+        synchronized (remoteAdFreeByUrl) {
+            RemoteAdFreeInfo found = TextUtils.isEmpty(fullKey) ? null : remoteAdFreeByUrl.get(fullKey);
+            if (found != null) return found;
+            found = TextUtils.isEmpty(shortKey) ? null : remoteAdFreeByUrl.get(shortKey);
+            if (found != null) return found;
+            return TextUtils.isEmpty(titleKey) ? null : remoteAdFreeByTitlePodcast.get(titleKey);
+        }
+    }
+
+    private String mediaUrlKey(String url, boolean stripQuery) {
+        String normalized = normalizeUrl(url);
+        if (TextUtils.isEmpty(normalized)) return "";
+        try {
+            URL parsed = new URL(normalized);
+            StringBuilder key = new StringBuilder();
+            key.append(parsed.getProtocol().toLowerCase(Locale.US)).append("://");
+            key.append(parsed.getHost().toLowerCase(Locale.US));
+            if (parsed.getPort() > 0) key.append(':').append(parsed.getPort());
+            key.append(parsed.getPath() == null ? "" : parsed.getPath());
+            if (!stripQuery && !TextUtils.isEmpty(parsed.getQuery())) key.append('?').append(parsed.getQuery());
+            String out = key.toString();
+            while (out.endsWith("/") && out.length() > 1) out = out.substring(0, out.length() - 1);
+            return out;
+        } catch (Exception ignored) {
+            String out = stripQuery ? normalized.split("\\?")[0] : normalized;
+            while (out.endsWith("/") && out.length() > 1) out = out.substring(0, out.length() - 1);
+            return out.toLowerCase(Locale.US);
+        }
+    }
+
+    private String titlePodcastKey(String title, String podcast) {
+        String t = nullToEmpty(title).toLowerCase(Locale.US).replaceAll("\\s+", " ").trim();
+        String p = nullToEmpty(podcast).toLowerCase(Locale.US).replaceAll("\\s+", " ").trim();
+        if (TextUtils.isEmpty(t) || TextUtils.isEmpty(p)) return "";
+        return p + "\n" + t;
+    }
+
     private void showPodcastById(String podcastId) {
         Podcast p = db == null ? null : db.podcastById(podcastId);
         if (p == null) {
@@ -1304,13 +1413,13 @@ public class MainActivity extends Activity {
             }
         }
         TextView title = text(e.title, 14, INK, true);
-        title.setMaxLines(2);
+        title.setMaxLines(3);
         title.setEllipsize(TextUtils.TruncateAt.END);
         card.addView(title);
         String releaseDate = e.id.startsWith("server:") ? "" : displayReleaseDate(e.pubDate);
         String meta = (TextUtils.isEmpty(releaseDate) ? "" : releaseDate + "  ") + indicators(e);
         TextView metaView = text(meta.trim(), 11, MUTED, false);
-        metaView.setMaxLines(2);
+        metaView.setMaxLines(3);
         metaView.setEllipsize(TextUtils.TruncateAt.END);
         card.addView(metaView);
         LinearLayout actions = row();
@@ -1323,19 +1432,25 @@ public class MainActivity extends Activity {
             if (!openable) showEpisode(e.id);
         }));
         boolean processed = "processed".equals(e.adSupportedStatus);
+        boolean serverAdFree = !processed && remoteAdFreeInfo(e) != null;
         if (!hideDownload && !processed) {
             actions.addView(iconActionButton(e.downloaded() ? R.drawable.ic_trash : R.drawable.ic_download, e.downloaded() ? "Remove download" : "Download", v -> {
                 if (e.downloaded()) removeDownload(e); else downloadEpisode(e);
             }));
         }
-        if (processed) {
+        if (processed || serverAdFree) {
             TextView pill = text("Ad-free", 12, TEAL, false);
             pill.setSingleLine(true);
             pill.setPadding(dp(10), dp(6), dp(10), dp(6));
             pill.setBackground(rounded(SOFT_GREEN, dp(20), 0));
             actions.addView(pill);
-        } else {
-            actions.addView(iconActionButton(R.drawable.ic_adfree, adQueue.contains(e.id) || e.id.equals(adCurrentId) ? "Queued..." : "Remove ads", v -> removeAds(e)));
+        }
+        if (!processed) {
+            actions.addView(iconActionButton(
+                    R.drawable.ic_adfree,
+                    adQueue.contains(e.id) || e.id.equals(adCurrentId) ? "Queued..." : (serverAdFree ? "Get ad-free" : "Remove ads"),
+                    v -> removeAds(e)
+            ));
         }
         if (db.isSaved(e.id) || e.id.startsWith("server:") || processed) {
             actions.addView(iconActionButton(R.drawable.ic_trash, "Remove from playlist", v -> {
@@ -1383,19 +1498,25 @@ public class MainActivity extends Activity {
             showEpisode(e.id);
         }));
         boolean processed = "processed".equals(e.adSupportedStatus);
+        boolean serverAdFree = !processed && remoteAdFreeInfo(e) != null;
         if (!processed) {
             actions.addView(iconActionButton(e.downloaded() ? R.drawable.ic_trash : R.drawable.ic_download, e.downloaded() ? "Remove download" : "Download", v -> {
                 if (e.downloaded()) removeDownload(e); else downloadEpisode(e);
             }));
         }
-        if (processed) {
+        if (processed || serverAdFree) {
             TextView pill = text("Ad-free", 13, TEAL, false);
             pill.setSingleLine(true);
             pill.setPadding(dp(12), dp(7), dp(12), dp(7));
             pill.setBackground(rounded(SOFT_GREEN, dp(20), 0));
             actions.addView(pill);
-        } else {
-            actions.addView(iconActionButton(R.drawable.ic_adfree, adQueue.contains(e.id) || e.id.equals(adCurrentId) ? "Queued..." : "Remove ads", v -> removeAds(e)));
+        }
+        if (!processed) {
+            actions.addView(iconActionButton(
+                    R.drawable.ic_adfree,
+                    adQueue.contains(e.id) || e.id.equals(adCurrentId) ? "Queued..." : (serverAdFree ? "Get ad-free" : "Remove ads"),
+                    v -> removeAds(e)
+            ));
         }
         if (db.isSaved(e.id) || e.id.startsWith("server:") || processed) {
             actions.addView(iconActionButton(R.drawable.ic_trash, "Remove from playlist", v -> {
@@ -3319,7 +3440,18 @@ public class MainActivity extends Activity {
         return id > 0 ? getResources().getDimensionPixelSize(id) : dp(20);
     }
     private void hideKeyboard(View v) { ((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(v.getWindowToken(), 0); }
-    private String indicators(Episode e) { ArrayList<String> a = new ArrayList<>(); if (e.isNew) a.add("New"); if (e.isListened) a.add("Listened"); else if (e.positionSeconds > 0) a.add("In progress"); if (e.downloaded()) a.add("Saved"); if ("processed".equals(e.adSupportedStatus)) a.add("Ad free"); else if ("no_ads_found".equals(e.adSupportedStatus)) a.add("No ads found"); else if ("supported".equals(e.adSupportedStatus)) a.add("AD"); return TextUtils.join("  |  ", a); }
+    private String indicators(Episode e) {
+        ArrayList<String> a = new ArrayList<>();
+        if (e.isNew) a.add("New");
+        if (e.isListened) a.add("Listened");
+        else if (e.positionSeconds > 0) a.add("In progress");
+        if (db != null && db.isSaved(e.id)) a.add("Saved");
+        if (e.downloaded()) a.add("Downloaded");
+        if ("processed".equals(e.adSupportedStatus) || remoteAdFreeInfo(e) != null) a.add("Ad-free");
+        else if ("no_ads_found".equals(e.adSupportedStatus)) a.add("No ads found");
+        else if ("supported".equals(e.adSupportedStatus)) a.add("AD");
+        return TextUtils.join("  |  ", a);
+    }
     private ImageButton playerIconButton(int icon, String description, View.OnClickListener listener, int bg, int fg, int sizeDp) {
         ImageButton button = new ImageButton(this);
         button.setImageResource(icon);

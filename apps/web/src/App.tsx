@@ -3,6 +3,7 @@
 const STORAGE_KEY = 'adfree-web-settings'
 const USER_KEY = 'adfree-user-id'
 const ACTIVE_JOB_KEY = 'adfree-active-job-id'
+const EPISODE_STATE_KEY = 'adfree-web-episode-state'
 const DEFAULT_REMOTE_API_BASE = 'https://adsbegone.sitesindevelopment.com/adfree-api'
 const isLocalDevHost =
   typeof window !== 'undefined' && ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
@@ -13,7 +14,7 @@ const DEFAULT_BACKEND: Backend = 'tunnel-parakeet'
 const SETTINGS_VERSION = 2
 const OPENAI_MODEL = 'gpt-5.5'
 const APP_ICON_URL = './app-icon.svg'
-const JOB_POLL_INTERVAL_MS = 5000
+const JOB_POLL_INTERVAL_MS = 2000
 const JOB_SLOW_NOTICE_MS = 10 * 60 * 1000
 const JOB_STATUS_TRANSIENT_RETRIES = 12
 
@@ -59,6 +60,59 @@ function setEpisodeCache(collectionId: number, data: EpisodeResult[]): void {
   } catch { /* ignore quota errors */ }
 }
 
+function loadEpisodeStates(): Record<string, EpisodePlaybackState> {
+  try {
+    const raw = window.localStorage.getItem(EPISODE_STATE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, EpisodePlaybackState> : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveEpisodeStates(states: Record<string, EpisodePlaybackState>): void {
+  try {
+    window.localStorage.setItem(EPISODE_STATE_KEY, JSON.stringify(states))
+  } catch {
+    // Best-effort browser state only.
+  }
+}
+
+function episodeStateKey(podcast: PodcastResult | null, episode: EpisodeResult): string {
+  const podcastKey = podcast?.collectionId ? String(podcast.collectionId) : 'podcast'
+  return `${podcastKey}:${episode.trackId}`
+}
+
+function canonicalMediaUrl(url: string | null | undefined): string {
+  const trimmed = (url ?? '').trim()
+  if (!trimmed) return ''
+  try {
+    const parsed = new URL(trimmed)
+    parsed.hash = ''
+    return parsed.toString().replace(/\/$/, '').toLowerCase()
+  } catch {
+    return trimmed.replace(/\/$/, '').toLowerCase()
+  }
+}
+
+function mediaUrlWithoutQuery(url: string | null | undefined): string {
+  const trimmed = (url ?? '').trim()
+  if (!trimmed) return ''
+  try {
+    const parsed = new URL(trimmed)
+    parsed.hash = ''
+    parsed.search = ''
+    return parsed.toString().replace(/\/$/, '').toLowerCase()
+  } catch {
+    return trimmed.split('?')[0].replace(/\/$/, '').toLowerCase()
+  }
+}
+
+function normalizedTitleKey(value: string | null | undefined): string {
+  return (value ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
 function deferEffect(callback: () => void | Promise<void>): number {
   return window.setTimeout(() => {
     void callback()
@@ -92,6 +146,14 @@ type EpisodeResult = {
   episodeUrl?: string
   previewUrl?: string
   trackTimeMillis?: number
+}
+
+type EpisodePlaybackState = {
+  positionSeconds?: number
+  durationSeconds?: number
+  listened?: boolean
+  saved?: boolean
+  updatedAt?: number
 }
 
 type CreateJobResponse = {
@@ -286,6 +348,7 @@ function App() {
   const [episodeError, setEpisodeError] = useState('')
   const [activeEpisode, setActiveEpisode] = useState<EpisodeResult | null>(null)
   const [sourceAudioUrl, setSourceAudioUrl] = useState('')
+  const [episodeStates, setEpisodeStates] = useState<Record<string, EpisodePlaybackState>>(() => loadEpisodeStates())
 
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isPreparingPlayback, setIsPreparingPlayback] = useState(false)
@@ -551,6 +614,85 @@ function App() {
   function chooseEpisode(episode: EpisodeResult): void {
     setActiveEpisode(episode)
     setSourceAudioUrl(episodePlayableUrl(episode))
+  }
+
+  function stateForEpisode(episode: EpisodeResult): EpisodePlaybackState {
+    return episodeStates[episodeStateKey(activePodcast, episode)] ?? {}
+  }
+
+  function updateEpisodeState(episode: EpisodeResult, patch: EpisodePlaybackState): void {
+    const key = episodeStateKey(activePodcast, episode)
+    setEpisodeStates((current) => {
+      const next = {
+        ...current,
+        [key]: {
+          ...(current[key] ?? {}),
+          ...patch,
+          updatedAt: Date.now(),
+        },
+      }
+      saveEpisodeStates(next)
+      return next
+    })
+  }
+
+  function toggleSavedEpisode(episode: EpisodeResult): void {
+    const current = stateForEpisode(episode)
+    updateEpisodeState(episode, { saved: !current.saved })
+  }
+
+  function adFreeJobForEpisode(episode: EpisodeResult): JobRecord | null {
+    const mediaUrl = episodePlayableUrl(episode)
+    const canonical = canonicalMediaUrl(mediaUrl)
+    const noQuery = mediaUrlWithoutQuery(mediaUrl)
+    const episodeTitle = normalizedTitleKey(episode.trackName)
+    const podcastTitle = normalizedTitleKey(activePodcast?.collectionName)
+
+    return visibleCompletedJobs.find((job) => {
+      if (!job.download_url) return false
+      const jobUrl = canonicalMediaUrl(job.source_url)
+      const jobNoQuery = mediaUrlWithoutQuery(job.source_url)
+      if (canonical && jobUrl && canonical === jobUrl) return true
+      if (noQuery && jobNoQuery && noQuery === jobNoQuery) return true
+      return Boolean(
+        episodeTitle &&
+        podcastTitle &&
+        normalizedTitleKey(job.episode_title) === episodeTitle &&
+        normalizedTitleKey(job.podcast_name) === podcastTitle
+      )
+    }) ?? null
+  }
+
+  function badgesForEpisode(episode: EpisodeResult): string[] {
+    const state = stateForEpisode(episode)
+    const badges: string[] = []
+    if (state.listened) {
+      badges.push('Listened')
+    } else if ((state.positionSeconds ?? 0) > 10) {
+      badges.push('In progress')
+    }
+    if (state.saved) badges.push('Saved')
+    if (adFreeJobForEpisode(episode)) badges.push('Ad-free')
+    return badges
+  }
+
+  function handleSourceAudioTimeUpdate(audio: HTMLAudioElement): void {
+    if (!activeEpisode) return
+    const durationSeconds = Number.isFinite(audio.duration) ? Math.max(0, audio.duration) : 0
+    const positionSeconds = Number.isFinite(audio.currentTime) ? Math.max(0, audio.currentTime) : 0
+    if (positionSeconds < 5 && durationSeconds <= 0) return
+    const listened = durationSeconds > 0 && positionSeconds / durationSeconds >= 0.95
+    updateEpisodeState(activeEpisode, {
+      positionSeconds,
+      durationSeconds,
+      listened: listened || stateForEpisode(activeEpisode).listened,
+    })
+  }
+
+  function handleSourceAudioEnded(): void {
+    if (!activeEpisode) return
+    const durationSeconds = activeEpisode.trackTimeMillis ? activeEpisode.trackTimeMillis / 1000 : undefined
+    updateEpisodeState(activeEpisode, { listened: true, durationSeconds })
   }
 
   async function prepareProcessedPlayback(downloadPath: string): Promise<void> {
@@ -1199,21 +1341,55 @@ function App() {
           {isLoadingEpisodes ? <p className="tiny">Loading episodes...</p> : null}
 
           <div className="episode-list">
-            {visibleEpisodes.map((episode) => (
-              <button
-                key={episode.trackId}
-                type="button"
-                className={`episode-item ${activeEpisode?.trackId === episode.trackId ? 'active' : ''}`}
-                onClick={() => chooseEpisode(episode)}
-              >
-                <strong>{episode.trackName}</strong>
-                <small>
-                  {episode.releaseDate ? new Date(episode.releaseDate).toLocaleDateString() : 'Date unknown'}
-                  {' - '}
-                  {formatDuration(episode.trackTimeMillis)}
-                </small>
-              </button>
-            ))}
+            {visibleEpisodes.map((episode) => {
+              const state = stateForEpisode(episode)
+              const badges = badgesForEpisode(episode)
+              return (
+                <div
+                  key={episode.trackId}
+                  className={`episode-item ${activeEpisode?.trackId === episode.trackId ? 'active' : ''}`}
+                >
+                  <div
+                    className="episode-item-main"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => chooseEpisode(episode)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        chooseEpisode(episode)
+                      }
+                    }}
+                  >
+                    <strong>{episode.trackName}</strong>
+                    <small>
+                      {episode.releaseDate ? new Date(episode.releaseDate).toLocaleDateString() : 'Date unknown'}
+                      {' - '}
+                      {formatDuration(episode.trackTimeMillis)}
+                    </small>
+                    {badges.length > 0 ? (
+                      <div className="episode-badges">
+                        {badges.map((badge) => (
+                          <span key={badge} className={`episode-badge ${badge.toLowerCase().replace(/\s+/g, '-')}`}>
+                            {badge}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                  <button
+                    type="button"
+                    className={`episode-save-btn ${state.saved ? 'saved' : ''}`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      toggleSavedEpisode(episode)
+                    }}
+                  >
+                    {state.saved ? 'Saved' : 'Save'}
+                  </button>
+                </div>
+              )
+            })}
           </div>
           {episodes.length > EPISODE_PAGE_SIZE ? (
             <>
@@ -1253,7 +1429,14 @@ function App() {
             <p className="now-playing">
               Source episode: <strong>{activeAudioLabel}</strong>
             </p>
-            <audio key={sourceAudioUrl} controls src={sourceAudioUrl} className="audio-player" />
+            <audio
+              key={sourceAudioUrl}
+              controls
+              src={sourceAudioUrl}
+              className="audio-player"
+              onTimeUpdate={(event) => handleSourceAudioTimeUpdate(event.currentTarget)}
+              onEnded={handleSourceAudioEnded}
+            />
             {!sourceAudioUrl ? <p className="tiny">This episode has no playable audio URL from iTunes.</p> : null}
           </div>
         </div>

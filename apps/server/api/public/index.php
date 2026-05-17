@@ -1256,9 +1256,9 @@ function processLocalBridgeJob(array $config): void
         writeLocalBridgeStatus($jobDir, $jobId, 'running', 20.0, 'Source ready', 'Source audio is ready for transcription.');
 
         $statusUpdater = function (float $cliProgress, string $message, string $logs) use ($jobDir, $jobId): void {
-            $localProgress = 20.0 + (max(0.0, min(100.0, $cliProgress)) * 0.70);
+            $localProgress = mapLocalCliProgressToBridgeProgress($cliProgress);
             $phase = localBridgePhaseFromMessage($message);
-            writeLocalBridgeStatus($jobDir, $jobId, 'running', min(90.0, $localProgress), $phase, $message, $logs);
+            writeLocalBridgeStatus($jobDir, $jobId, 'running', min(95.0, $localProgress), $phase, $message, $logs);
         };
 
         writeLocalBridgeStatus($jobDir, $jobId, 'running', 35.0, 'Starting Parakeet', 'Windows is loading Parakeet and preparing transcription.');
@@ -1425,6 +1425,25 @@ function localBridgePhaseFromMessage(string $message): string
     if (str_contains($lower, 'final')) return 'Finalizing output';
     if (str_contains($lower, 'complete')) return 'Complete';
     return 'Processing audio';
+}
+
+function mapLocalCliProgressToBridgeProgress(float $cliProgress): float
+{
+    $progress = max(0.0, min(100.0, $cliProgress));
+
+    if ($progress <= 25.0) {
+        return 20.0 + ($progress / 25.0) * 15.0;
+    }
+    if ($progress <= 60.0) {
+        return 35.0 + (($progress - 25.0) / 35.0) * 45.0;
+    }
+    if ($progress <= 65.0) {
+        return 80.0 + (($progress - 60.0) / 5.0) * 5.0;
+    }
+    if ($progress <= 75.0) {
+        return 85.0 + (($progress - 65.0) / 10.0) * 5.0;
+    }
+    return 90.0 + (($progress - 75.0) / 25.0) * 5.0;
 }
 
 function jobHasHeuristicArtifact(PDO $pdo, array $config, string $jobId): bool

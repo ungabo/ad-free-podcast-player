@@ -495,11 +495,16 @@ def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[s
     bridge_thread = threading.Thread(target=run_bridge_call, daemon=True)
     bridge_thread.start()
     last_status_line = ""
+    bridge_started_at = time.monotonic()
+    last_status_at = bridge_started_at
+    last_overall_progress = 38.0
+    last_estimate_bucket = -1
     while bridge_thread.is_alive():
-        status = get_bridge_json(f"/api/local/jobs/{job_id}/status")
+        emitted_status_update = False
+        status = get_bridge_json(f"/api/local/jobs/{job_id}/status", timeout=3)
         if status:
             local_progress = max(0.0, min(100.0, float(status.get("progress") or 0.0)))
-            overall_progress = 38.0 + (local_progress * 0.50)
+            overall_progress = max(last_overall_progress, 38.0 + (local_progress * 0.50))
             phase = str(status.get("phase") or "Windows processing").strip()
             message = str(status.get("message") or "").strip()
             line = f"{round(overall_progress)}% {phase}"
@@ -507,6 +512,9 @@ def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[s
                 line = f"{line}: {message}"
             if line != last_status_line:
                 emit_runtime_update(job_id, logs_list, overall_progress, line)
+                last_status_at = time.monotonic()
+                last_overall_progress = overall_progress
+                emitted_status_update = True
                 bridge_logs = str(status.get("logs") or "").strip()
                 if bridge_logs:
                     for bridge_line in bridge_logs.splitlines()[-4:]:
@@ -514,7 +522,21 @@ def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[s
                             logs_list.append(f"Windows: {bridge_line.strip()}")
                     mark_runtime(job_id, overall_progress, "\n".join(logs_list))
                 last_status_line = line
-        bridge_thread.join(timeout=2.0)
+        quiet_for = time.monotonic() - last_status_at
+        elapsed = time.monotonic() - bridge_started_at
+        if not emitted_status_update and quiet_for >= 5.0 and elapsed >= 10.0:
+            estimated_progress = min(86.0, max(last_overall_progress, 56.0 + ((elapsed - 10.0) * 0.45)))
+            estimate_bucket = int(estimated_progress)
+            if estimate_bucket > last_estimate_bucket:
+                last_estimate_bucket = estimate_bucket
+                last_overall_progress = estimated_progress
+                emit_runtime_update(
+                    job_id,
+                    logs_list,
+                    estimated_progress,
+                    f"{estimate_bucket}% Parakeet running: loading model or transcribing chunks",
+                )
+        bridge_thread.join(timeout=1.0)
 
     if "error" in error_holder:
         raise error_holder["error"]
