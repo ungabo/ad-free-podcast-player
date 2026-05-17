@@ -103,9 +103,15 @@ a {
 .topbar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
+  align-items: start;
   gap: 16px;
   margin-bottom: 18px;
+}
+
+.topbar .kicker,
+.topbar h1,
+.topbar .lede {
+  grid-column: 1;
 }
 
 .kicker {
@@ -132,6 +138,9 @@ h1 {
 
 .user-selector-row {
   display: flex;
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  justify-self: end;
   align-items: center;
   gap: 8px;
   color: var(--muted);
@@ -175,11 +184,14 @@ h1 {
 
 .search-panel,
 .processing-panel {
-  position: sticky;
-  top: 16px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.processing-panel {
+  position: sticky;
+  top: 16px;
 }
 
 .episode-panel {
@@ -198,6 +210,44 @@ h1 {
 
 .search-row input {
   flex: 1;
+}
+
+.search-input-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.search-input-wrap input {
+  padding-right: 38px;
+}
+
+.search-clear-btn {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.9rem;
+  line-height: 1;
+  transform: translateY(-50%);
+}
+
+.search-clear-btn:hover:not(:disabled),
+.search-clear-btn:focus-visible {
+  color: var(--accent);
+  border-color: #c6d8f5;
+  background: var(--accent-soft);
 }
 
 .button-row {
@@ -771,6 +821,12 @@ h1 {
   .topbar {
     grid-template-columns: 1fr;
     align-items: start;
+  }
+
+  .user-selector-row {
+    grid-column: 1;
+    grid-row: auto;
+    justify-self: start;
   }
 
   h1 {

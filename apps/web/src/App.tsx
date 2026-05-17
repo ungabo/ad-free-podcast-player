@@ -3,7 +3,15 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 const STORAGE_KEY = 'adfree-web-settings'
 const USER_KEY = 'adfree-user-id'
 const ACTIVE_JOB_KEY = 'adfree-active-job-id'
-const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '/adfree-api').replace(/\/$/, '')
+const DEFAULT_REMOTE_API_BASE = 'https://adsbegone.sitesindevelopment.com/adfree-api'
+const isLocalDevHost =
+  typeof window !== 'undefined' && ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
+const API_BASE = (
+  import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV && isLocalDevHost ? DEFAULT_REMOTE_API_BASE : '/adfree-api')
+).replace(/\/$/, '')
+const DEFAULT_BACKEND: Backend = 'tunnel-parakeet'
+const SETTINGS_VERSION = 2
+const OPENAI_MODEL = 'gpt-5.5'
 
 const SEARCH_CACHE_TTL = 24 * 60 * 60 * 1000
 const EPISODE_CACHE_TTL = 6 * 60 * 60 * 1000
@@ -46,12 +54,17 @@ function setEpisodeCache(collectionId: number, data: EpisodeResult[]): void {
   } catch { /* ignore quota errors */ }
 }
 
-type DetectionMode = 'local' | 'hybrid' | 'openai'
-type Backend = 'whisper' | 'openai-whisper' | 'tunnel-whisper' | 'tunnel-parakeet'
+function deferEffect(callback: () => void | Promise<void>): number {
+  return window.setTimeout(() => {
+    void callback()
+  }, 0)
+}
+
+type DetectionMode = 'openai'
+type Backend = 'tunnel-parakeet'
 
 type SavedSettings = {
-  openAiKey: string
-  openAiModel: string
+  settingsVersion?: number
   detectionMode: DetectionMode
   backend: Backend
 }
@@ -149,16 +162,6 @@ type WorkerStatus = {
   } | null
 }
 
-function loadSavedSettings(): SavedSettings | null {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    return JSON.parse(raw) as SavedSettings
-  } catch {
-    return null
-  }
-}
-
 function formatDuration(ms?: number): string {
   if (!ms || ms <= 0) return 'Unknown length'
   const totalSeconds = Math.floor(ms / 1000)
@@ -181,7 +184,7 @@ function formatSecondsToHMS(seconds: number): string {
 }
 
 function formatTimestamp(iso: string | null): string {
-  if (!iso) return '—'
+  if (!iso) return '-'
   try {
     return new Date(iso).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) + ' ET'
   } catch {
@@ -191,25 +194,6 @@ function formatTimestamp(iso: string | null): string {
 
 function episodePlayableUrl(episode: EpisodeResult): string {
   return episode.episodeUrl || episode.previewUrl || ''
-}
-
-function isTunnelBackend(value: Backend): boolean {
-  return value === 'tunnel-whisper' || value === 'tunnel-parakeet'
-}
-
-function backendLabel(value: string): string {
-  switch (value) {
-    case 'openai-whisper':
-      return 'OpenAI Whisper API'
-    case 'whisper':
-      return 'Linux local Whisper'
-    case 'tunnel-whisper':
-      return 'Windows tunnel Whisper'
-    case 'tunnel-parakeet':
-      return 'Windows tunnel Parakeet'
-    default:
-      return value
-  }
 }
 
 function toAbsoluteUrl(url: string): string {
@@ -228,6 +212,49 @@ function apiUrl(path: string): string {
   return `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`
 }
 
+function cleanJobText(value: string | null | undefined): string {
+  const text = (value ?? '').trim()
+  if (!text || /^(null|undefined|unknown episode)$/i.test(text)) return ''
+  return text
+    .replace(/^(after|before|ad[-\s]*free)[\s:_-]+/i, '')
+    .trim()
+}
+
+function isHostOnlyTitle(value: string): boolean {
+  const text = value.trim().toLowerCase()
+  if (!text) return true
+  if (/^(podtrac\.com|mgln\.ai|prfx\.byspotify\.com|traffic\.megaphone\.fm)$/i.test(text)) return true
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(text)
+}
+
+function jobDisplayTitle(job: JobRecord): string {
+  return cleanJobText(job.episode_title)
+}
+
+function jobDisplayPodcast(job: JobRecord): string {
+  return cleanJobText(job.podcast_name)
+}
+
+function completedJobKey(job: JobRecord): string {
+  const title = jobDisplayTitle(job).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  const podcast = jobDisplayPodcast(job).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  return `${podcast}|${title}`
+}
+
+function cleanCompletedJobs(jobs: JobRecord[]): JobRecord[] {
+  const seen = new Set<string>()
+  return [...jobs]
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .filter((job) => {
+      const title = jobDisplayTitle(job)
+      if (!job.download_url || !title || isHostOnlyTitle(title)) return false
+      const key = completedJobKey(job)
+      if (!key.replace('|', '').trim() || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms)
@@ -235,16 +262,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 function App() {
-  const savedSettings = loadSavedSettings()
-
-  const [openAiKey, setOpenAiKey] = useState(savedSettings?.openAiKey ?? '')
-  const [openAiModel, setOpenAiModel] = useState(savedSettings?.openAiModel ?? 'gpt-4o-mini')
-  const [detectionMode, setDetectionMode] = useState<DetectionMode>(savedSettings?.detectionMode ?? 'hybrid')
-  const [backend, setBackend] = useState<Backend>(
-    savedSettings?.backend && ['whisper', 'openai-whisper', 'tunnel-whisper', 'tunnel-parakeet'].includes(savedSettings.backend)
-      ? savedSettings.backend
-      : 'openai-whisper'
-  )
+  const [detectionMode] = useState<DetectionMode>('openai')
+  const [backend] = useState<Backend>(DEFAULT_BACKEND)
 
   const [searchTerm, setSearchTerm] = useState('')
   const [isSearching, setIsSearching] = useState(false)
@@ -272,6 +291,7 @@ function App() {
   const [liveJobs, setLiveJobs] = useState<JobRecord[]>([])
   const [completedJobs, setCompletedJobs] = useState<JobRecord[]>([])
   const [failedJobs, setFailedJobs] = useState<JobRecord[]>([])
+  const visibleCompletedJobs = useMemo(() => cleanCompletedJobs(completedJobs), [completedJobs])
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<JobRecord | null>(null)
 
   const [users, setUsers] = useState<User[]>([])
@@ -282,6 +302,7 @@ function App() {
   const [workerStatus, setWorkerStatus] = useState<WorkerStatus | null>(null)
 
   const processedUrlRef = useRef<string | null>(null)
+  const searchRequestRef = useRef(0)
 
   const activeAudioLabel = useMemo(() => {
     if (!activeEpisode) return 'No episode selected'
@@ -289,19 +310,16 @@ function App() {
   }, [activeEpisode])
 
   const canSubmit = Boolean(activeEpisode && episodePlayableUrl(activeEpisode) && !isSubmitting)
-  const isOpenAiEnabled = openAiKey.trim().length > 0
-  const selectedTunnelBackend = isTunnelBackend(backend)
-  const effectiveDetectionMode: DetectionMode = selectedTunnelBackend ? 'local' : detectionMode
+  const windowsBridgeUnavailable = workerStatus?.local_bridge ? !workerStatus.local_bridge.reachable : false
 
   useEffect(() => {
     const payload: SavedSettings = {
-      openAiKey,
-      openAiModel,
+      settingsVersion: SETTINGS_VERSION,
       detectionMode,
       backend,
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
-  }, [openAiKey, openAiModel, detectionMode, backend])
+  }, [detectionMode, backend])
 
   useEffect(() => {
     return () => {
@@ -412,6 +430,15 @@ function App() {
     })
   }
 
+  function clearPodcastSearch(): void {
+    searchRequestRef.current += 1
+    setSearchTerm('')
+    setSearchError('')
+    setPodcasts([])
+    setHasSearched(false)
+    setIsSearching(false)
+  }
+
   async function runPodcastSearch(termOverride?: string): Promise<PodcastResult[]> {
     const term = (termOverride ?? searchTerm).trim()
     if (!term) {
@@ -424,6 +451,8 @@ function App() {
     setEpisodeError('')
     setHasSearched(true)
     setIsSearching(true)
+    const requestId = searchRequestRef.current + 1
+    searchRequestRef.current = requestId
 
     try {
       const cached = getSearchCache(term)
@@ -442,6 +471,10 @@ function App() {
         setSearchCache(term, list)
       }
 
+      if (requestId !== searchRequestRef.current) {
+        return []
+      }
+
       setPodcasts(list)
 
       if (list.length > 0) {
@@ -455,10 +488,14 @@ function App() {
 
       return list
     } catch (error) {
-      setSearchError(error instanceof Error ? error.message : 'Search failed.')
+      if (requestId === searchRequestRef.current) {
+        setSearchError(error instanceof Error ? error.message : 'Search failed.')
+      }
       return []
     } finally {
-      setIsSearching(false)
+      if (requestId === searchRequestRef.current) {
+        setIsSearching(false)
+      }
     }
   }
 
@@ -707,19 +744,23 @@ function App() {
     setActiveJob('')
 
     const effectiveBackend = options?.backend ?? backend
-    const effectiveDetectionMode = isTunnelBackend(effectiveBackend) ? 'local' : (options?.detectionMode ?? detectionMode)
+    const effectiveDetectionMode: DetectionMode = 'openai'
 
-    appendLog(`Submitting ${sourceLabel} with backend ${effectiveBackend} and detection ${effectiveDetectionMode}.`)
+    if (workerStatus?.local_bridge && !workerStatus.local_bridge.reachable) {
+      const message = 'Ads cannot be removed right now because the Windows processor is offline. Start WAMP and the Windows tunnel, then try again.'
+      setRunError(message)
+      appendLog(`Error: ${message}`)
+      return
+    }
+
+    appendLog(`Submitting ${sourceLabel} for ad removal.`)
 
     try {
       const form = new FormData()
       form.append('source_url', mediaUrl)
       form.append('backend', effectiveBackend)
       form.append('detection_mode', effectiveDetectionMode)
-      form.append('openai_model', isTunnelBackend(effectiveBackend) ? 'local' : (openAiModel.trim() || 'gpt-4o-mini'))
-      if (!isTunnelBackend(effectiveBackend) && openAiKey.trim()) {
-        form.append('openai_api_key', openAiKey.trim())
-      }
+      form.append('openai_model', OPENAI_MODEL)
       if (currentUserId) {
         form.append('user_id', currentUserId)
       }
@@ -757,11 +798,13 @@ function App() {
   }
 
   useEffect(() => {
-    void fetchLiveJobs()
-    void fetchWorkerStatus()
+    const liveKickoff = deferEffect(fetchLiveJobs)
+    const workerKickoff = deferEffect(fetchWorkerStatus)
     const interval = setInterval(() => void fetchLiveJobs(), 5000)
     const workerInterval = setInterval(() => void fetchWorkerStatus(), 10000)
     return () => {
+      clearTimeout(liveKickoff)
+      clearTimeout(workerKickoff)
       clearInterval(interval)
       clearInterval(workerInterval)
     }
@@ -769,42 +812,57 @@ function App() {
   }, [])
 
   useEffect(() => {
-    void fetchCompletedJobs()
-    void fetchFailedJobs()
+    const kickoff = deferEffect(() => {
+      void fetchCompletedJobs()
+      void fetchFailedJobs()
+    })
     const interval = setInterval(() => { void fetchCompletedJobs(); void fetchFailedJobs() }, 30000)
-    return () => clearInterval(interval)
+    return () => {
+      clearTimeout(kickoff)
+      clearInterval(interval)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    void fetchUsers()
+    const kickoff = deferEffect(fetchUsers)
+    return () => clearTimeout(kickoff)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
     if (!activeJobId) return
 
-    void waitForJob(activeJobId)
+    const kickoff = deferEffect(() => waitForJob(activeJobId))
+    return () => clearTimeout(kickoff)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
     if (currentUserId) {
       window.localStorage.setItem(USER_KEY, currentUserId)
-      void fetchSubscriptions(currentUserId)
-      void fetchLiveJobs()
-      void fetchCompletedJobs()
-      void fetchFailedJobs()
+      const kickoff = deferEffect(() => {
+        void fetchSubscriptions(currentUserId)
+        void fetchLiveJobs()
+        void fetchCompletedJobs()
+        void fetchFailedJobs()
+      })
+      return () => clearTimeout(kickoff)
     }
+    return undefined
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUserId])
 
   useEffect(() => {
     if (jobStatus?.status === 'completed' || jobStatus?.status === 'failed') {
-      void fetchLiveJobs()
-      void fetchCompletedJobs()
-      void fetchFailedJobs()
+      const kickoff = deferEffect(() => {
+        void fetchLiveJobs()
+        void fetchCompletedJobs()
+        void fetchFailedJobs()
+      })
+      return () => clearTimeout(kickoff)
     }
+    return undefined
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobStatus?.status])
 
@@ -857,17 +915,36 @@ function App() {
             </div>
           ) : null}
           <div className="search-row">
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="Search podcasts"
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  void runPodcastSearch()
-                }
-              }}
-            />
+            <div className="search-input-wrap">
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(event) => {
+                  const nextValue = event.target.value
+                  setSearchTerm(nextValue)
+                  if (nextValue === '' && (podcasts.length > 0 || hasSearched || searchError)) {
+                    clearPodcastSearch()
+                  }
+                }}
+                placeholder="Search podcasts"
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    void runPodcastSearch()
+                  }
+                }}
+              />
+              {searchTerm || podcasts.length > 0 || hasSearched ? (
+                <button
+                  type="button"
+                  className="search-clear-btn"
+                  aria-label="Clear podcast search"
+                  title="Clear podcast search"
+                  onClick={clearPodcastSearch}
+                >
+                  x
+                </button>
+              ) : null}
+            </div>
             <button type="button" onClick={() => void runPodcastSearch()} disabled={isSearching}>
               {isSearching ? 'Searching...' : 'Search'}
             </button>
@@ -970,60 +1047,12 @@ function App() {
         </div>
 
         <div className="panel processing-panel">
-          <h2>Server ad remover</h2>
-          <p className="tiny">Configured API base: {API_BASE}</p>
-
-          <div className="processing-field-row">
-            <label>
-              Backend
-              <select value={backend} onChange={(event) => setBackend(event.target.value as Backend)}>
-                <option value="openai-whisper">OpenAI Whisper API</option>
-                <option value="whisper">Linux local Whisper</option>
-                <option value="tunnel-whisper">Windows tunnel Whisper</option>
-                <option value="tunnel-parakeet">Windows tunnel Parakeet</option>
-              </select>
-            </label>
-            <label>
-              Detection
-              <select
-                value={effectiveDetectionMode}
-                disabled={selectedTunnelBackend}
-                onChange={(event) => setDetectionMode(event.target.value as DetectionMode)}
-              >
-                <option value="local">Local</option>
-                <option value="hybrid">Hybrid</option>
-                <option value="openai">OpenAI only</option>
-              </select>
-            </label>
-          </div>
-
-          <div className="processing-field-row">
-            <label>
-              OpenAI model
-              <input
-                type="text"
-                value={openAiModel}
-                disabled={selectedTunnelBackend}
-                onChange={(event) => setOpenAiModel(event.target.value)}
-                placeholder="gpt-4o-mini"
-              />
-            </label>
-            <label>
-              OpenAI key (blank uses server key)
-              <input
-                type="password"
-                placeholder="sk-..."
-                value={openAiKey}
-                disabled={selectedTunnelBackend}
-                onChange={(event) => setOpenAiKey(event.target.value)}
-              />
-            </label>
-          </div>
+          <h2>Remove ads</h2>
 
           <div className="button-row">
             <button
               type="button"
-              disabled={!canSubmit || isPreparingPlayback}
+              disabled={!canSubmit || isPreparingPlayback || windowsBridgeUnavailable}
               onClick={() => {
                 if (!activeEpisode) return
                 void submitEpisodeForProcessing(activeEpisode, activeEpisode.trackName)
@@ -1034,20 +1063,12 @@ function App() {
           </div>
 
           <div className="status-stack">
-            <span className="status on">Selected backend: {backendLabel(backend)}</span>
-            <span className={isOpenAiEnabled ? 'status on' : 'status neutral'}>
-              {selectedTunnelBackend
-                ? 'No OpenAI calls for tunnel backend'
-                : (isOpenAiEnabled ? 'Browser key loaded' : 'Using server key if configured')}
-            </span>
+            {windowsBridgeUnavailable ? (
+              <span className="status off">Ads cannot be removed right now</span>
+            ) : null}
             {workerStatus?.local_bridge ? (
               <span className={workerStatus.local_bridge.reachable ? 'status on' : 'status off'}>
-                Windows tunnel {workerStatus.local_bridge.reachable ? 'reachable' : 'offline'}
-              </span>
-            ) : null}
-            {workerStatus ? (
-              <span className={workerStatus.running ? 'status on' : 'status off'}>
-                Worker {workerStatus.running ? 'running' : 'needs start'}
+                Windows processor {workerStatus.local_bridge.reachable ? 'available' : 'offline'}
               </span>
             ) : null}
             {jobStatus ? (
@@ -1072,13 +1093,12 @@ function App() {
               </p>
               {workerStatus.local_bridge ? (
                 <p className="tiny">
-                  Windows tunnel: {workerStatus.local_bridge.reachable ? 'reachable' : 'offline'}
-                  {workerStatus.local_bridge.url ? ` at ${workerStatus.local_bridge.url}` : ''}
+                  Windows processor: {workerStatus.local_bridge.reachable ? 'available' : 'offline'}
                 </p>
               ) : null}
               {workerStatus.local_bridge && !workerStatus.local_bridge.reachable ? (
                 <p className="tiny">
-                  Start WAMP, then run the Windows scheduled task named AdFree Local Reverse Tunnel.
+                  Ads cannot be removed right now. Start WAMP, then run the Windows scheduled task named AdFree Local Reverse Tunnel.
                 </p>
               ) : null}
               {!workerStatus.running ? (
@@ -1095,8 +1115,6 @@ function App() {
           {jobStatus ? (
             <div className="result-panel">
               <p><strong>Job id:</strong> {jobStatus.job_id}</p>
-              <p><strong>Backend:</strong> {jobStatus.backend}</p>
-              <p><strong>Detection:</strong> {jobStatus.detection_mode}</p>
               <p><strong>Status:</strong> {jobStatus.status}</p>
             </div>
           ) : null}
@@ -1159,17 +1177,17 @@ function App() {
       <section className="history-section">
         <div className="history-section-header">
           <h2 className="section-heading">Ad-free episodes</h2>
-          {completedJobs.length > 0 ? (
+          {visibleCompletedJobs.length > 0 ? (
             <button type="button" className="clear-all-btn" onClick={() => void clearAllJobs('completed')}>
               Clear completed
             </button>
           ) : null}
         </div>
-        {completedJobs.length === 0 ? (
+        {visibleCompletedJobs.length === 0 ? (
           <p className="tiny">No completed conversions yet.</p>
         ) : (
           <div className="history-list">
-            {completedJobs.map((job) => (
+            {visibleCompletedJobs.map((job) => (
               <div key={job.job_id} className="history-item-wrap">
                 <button
                   type="button"
@@ -1177,9 +1195,9 @@ function App() {
                   onClick={() => setSelectedHistoryJob(job)}
                 >
                   <div className="history-item-main">
-                    {job.podcast_name ? <span className="history-podcast-name">{job.podcast_name}</span> : null}
+                    {jobDisplayPodcast(job) ? <span className="history-podcast-name">{jobDisplayPodcast(job)}</span> : null}
                     <strong className="history-episode-title">
-                      {job.episode_title ?? (() => { try { return job.source_url ? new URL(job.source_url).hostname : null } catch { return null } })() ?? 'Unknown episode'}
+                      {jobDisplayTitle(job)}
                     </strong>
                   </div>
                   <div className="history-item-meta">
@@ -1224,9 +1242,9 @@ function App() {
                   onClick={() => setSelectedHistoryJob(job)}
                 >
                   <div className="history-item-main">
-                    {job.podcast_name ? <span className="history-podcast-name">{job.podcast_name}</span> : null}
+                    {jobDisplayPodcast(job) ? <span className="history-podcast-name">{jobDisplayPodcast(job)}</span> : null}
                     <strong className="history-episode-title">
-                      {job.episode_title ?? (() => { try { return job.source_url ? new URL(job.source_url).hostname : null } catch { return null } })() ?? 'Unknown episode'}
+                      {jobDisplayTitle(job) || 'Conversion record'}
                     </strong>
                     {job.error_message ? <span className="history-error-msg">{job.error_message}</span> : null}
                   </div>
@@ -1270,7 +1288,6 @@ function App() {
 
             <div className="result-panel">
               <p><strong>Job ID:</strong> {selectedHistoryJob.job_id}</p>
-              <p><strong>Backend:</strong> {selectedHistoryJob.backend} / {selectedHistoryJob.detection_mode}</p>
               <p><strong>Status:</strong> {selectedHistoryJob.status}</p>
               {selectedHistoryJob.duration_seconds != null ? (
                 <p><strong>Processing time:</strong> {formatSecondsToHMS(selectedHistoryJob.duration_seconds)}</p>
@@ -1348,7 +1365,7 @@ function App() {
       ) : null}
 
       <footer className="footer-note">
-        This web app is wired to the Linux API worker stack, with optional Windows tunnel processing for local Whisper or Parakeet.
+        This web app queues Windows tunnel processing through the PHP API. Completed files are served back from the PHP server.
         {' · '}Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
       </footer>
     </div>

@@ -17,11 +17,11 @@ function resolvePythonPath(settings) {
   const requestedParakeetPython = settings?.parakeetPythonPath || '';
   const bundledParakeetPython = path.join(resolveAdCutForgeRoot(), 'parakeet-runtime', 'Scripts', 'python.exe');
 
-  if (settings?.transcriptionBackend === 'parakeet' && fileExists(requestedParakeetPython)) {
+  if (fileExists(requestedParakeetPython)) {
     return requestedParakeetPython;
   }
 
-  if (settings?.transcriptionBackend === 'parakeet' && fileExists(bundledParakeetPython)) {
+  if (fileExists(bundledParakeetPython)) {
     return bundledParakeetPython;
   }
 
@@ -33,20 +33,13 @@ function resolvePythonPath(settings) {
 }
 
 function resolveBackend(settings) {
-  if (settings?.transcriptionBackend === 'parakeet') {
-    const requestedParakeetPython = settings?.parakeetPythonPath || '';
-    const bundledParakeetPython = path.join(resolveAdCutForgeRoot(), 'parakeet-runtime', 'Scripts', 'python.exe');
-    if (fileExists(requestedParakeetPython) || fileExists(bundledParakeetPython)) {
-      return 'parakeet';
-    }
-    return 'whisper';
+  const requestedParakeetPython = settings?.parakeetPythonPath || '';
+  const bundledParakeetPython = path.join(resolveAdCutForgeRoot(), 'parakeet-runtime', 'Scripts', 'python.exe');
+  if (!fileExists(requestedParakeetPython) && !fileExists(bundledParakeetPython)) {
+    throw new Error('Parakeet runtime was not found on this Windows machine. Ad removal is unavailable until the Windows processor is installed.');
   }
 
-  if (settings?.transcriptionBackend === 'whisper') {
-    return 'whisper';
-  }
-
-  return 'whisper';
+  return 'parakeet';
 }
 
 function buildArgs(filePath, settings) {
@@ -61,13 +54,13 @@ function buildArgs(filePath, settings) {
 
   args.push(scriptPath, '--cli', '--overwrite', '--backend', backend);
 
-  if (settings?.detectionMode) {
-    args.push('--detection-mode', settings.detectionMode);
-  }
+  args.push('--detection-mode', 'openai');
 
-  if (settings?.openAiApiKey) {
-    args.push('--openai-api-key', settings.openAiApiKey);
+  const openAiApiKey = process.env.OPENAI_API_KEY || '';
+  if (!openAiApiKey.trim()) {
+    throw new Error('OPENAI_API_KEY is not set on this Windows machine. Ad removal is unavailable until the Windows processor has the key.');
   }
+  args.push('--openai-api-key', openAiApiKey);
 
   if (settings?.openAiModel) {
     args.push('--openai-model', settings.openAiModel);

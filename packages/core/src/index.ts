@@ -1,5 +1,5 @@
 export type TranscriptionBackend = 'parakeet' | 'whisper' | 'openai-whisper';
-export type AdDetectionMode = 'local' | 'hybrid' | 'openai';
+export type AdDetectionMode = 'openai';
 
 export type AppPlatform = 'web' | 'windows' | 'android';
 
@@ -16,9 +16,9 @@ export interface ProcessingSettings {
 
 export const DEFAULT_SETTINGS: ProcessingSettings = {
   openAiApiKey: '',
-  openAiModel: 'gpt-4o-mini',
-  transcriptionBackend: 'openai-whisper',
-  detectionMode: 'hybrid',
+  openAiModel: 'gpt-5.5',
+  transcriptionBackend: 'parakeet',
+  detectionMode: 'openai',
   parakeetPythonPath: '',
   parakeetModel: 'nvidia/parakeet-tdt-0.6b-v3',
   removeOriginalAfterExport: true,
@@ -30,15 +30,15 @@ export function resolveDefaultSettings(platform: AppPlatform): ProcessingSetting
     return {
       ...DEFAULT_SETTINGS,
       transcriptionBackend: 'parakeet',
-      detectionMode: 'local',
+      detectionMode: 'openai',
     };
   }
 
   if (platform === 'android') {
     return {
       ...DEFAULT_SETTINGS,
-      transcriptionBackend: 'openai-whisper',
-      detectionMode: 'hybrid',
+      transcriptionBackend: 'parakeet',
+      detectionMode: 'openai',
     };
   }
 
@@ -69,7 +69,7 @@ export interface AdRange {
   end: number;
   confidence: number;
   reason: string;
-  source: 'local' | 'openai';
+  source: 'openai';
 }
 
 export interface ProcessingJob {

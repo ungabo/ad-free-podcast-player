@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="100" viewBox="0 0 320 100" fill="none">
+<g transform="translate(10,10)" color="#111">
+  <path d="M3 9.25L10 3.25L17 9.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M5 8.7V17H8.25V12.4H11.75V17H15V8.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="20" y="44" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">home</text>
+<g transform="translate(60,10)" color="#111">
+  <circle cx="8.5" cy="8.5" r="5.25" stroke="currentColor" stroke-width="1.8"/>
+  <path d="M12.4 12.4L17 17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+</g>
+<text x="70" y="44" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">search</text>
+<g transform="translate(110,10)" color="#111">
+  <circle cx="10" cy="10" r="7.25" stroke="currentColor" stroke-width="1.8"/>
+  <path d="M5.2 14.8L14.8 5.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M5.7 12.6L7.4 7.4H8.7L10.4 12.6" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M6.35 10.85H9.7" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
+  <path d="M12 7.4H13.35C14.55 7.4 15.25 8.2 15.25 10C15.25 11.8 14.55 12.6 13.35 12.6H12V7.4Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/>
+</g>
+<text x="120" y="44" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">adfree</text>
+<g transform="translate(160,10)" color="#111">
+  <path d="M7 8.25C7 6.6 8.35 5.25 10 5.25C11.65 5.25 13 6.6 13 8.25V14C13 15.65 11.65 17 10 17C8.35 17 7 15.65 7 14V8.25Z" stroke="currentColor" stroke-width="1.8"/>
+  <path d="M7.9 5.65L6.35 3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M12.1 5.65L13.65 3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M4.2 9H7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M13 9H15.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M4.5 13.2L7 12.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M13 12.4L15.5 13.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M10 5.25V17" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</g>
+<text x="170" y="44" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">debug_bug</text>
+<g transform="translate(210,10)" color="#111">
+  <path d="M8.75 2.75H11.25L11.75 5.05C12.2 5.22 12.62 5.47 13 5.75L15.2 5L16.45 7.15L14.7 8.7C14.75 9.13 14.75 9.57 14.7 10L16.45 11.55L15.2 13.7L13 12.95C12.62 13.23 12.2 13.48 11.75 13.65L11.25 15.95H8.75L8.25 13.65C7.8 13.48 7.38 13.23 7 12.95L4.8 13.7L3.55 11.55L5.3 10C5.25 9.57 5.25 9.13 5.3 8.7L3.55 7.15L4.8 5L7 5.75C7.38 5.47 7.8 5.22 8.25 5.05L8.75 2.75Z" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/>
+  <circle cx="10" cy="9.35" r="2.25" stroke="currentColor" stroke-width="1.6"/>
+</g>
+<text x="220" y="44" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">settings</text>
+<g transform="translate(260,10)" color="#111">
+  <path d="M6.25 4.5L15.5 10L6.25 15.5V4.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+</g>
+<text x="270" y="44" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">play</text>
+<g transform="translate(10,55)" color="#111">
+  <path d="M7 4.5V15.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M13 4.5V15.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+</g>
+<text x="20" y="89" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">pause</text>
+<g transform="translate(60,55)" color="#111">
+  <path d="M4 3.5H14.2L16 5.3V16.5H4V3.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+  <path d="M6.5 3.5V8H13V3.5" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M6.5 16.5V11.5H13.5V16.5" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M11.4 5.2V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+</g>
+<text x="70" y="89" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">save</text>
+<g transform="translate(110,55)" color="#111">
+  <path d="M10 3.5V12.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M6.25 8.8L10 12.55L13.75 8.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M4.5 16.5H15.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+</g>
+<text x="120" y="89" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">download</text>
+<g transform="translate(160,55)" color="#111">
+  <path d="M16.1 7.2C15.1 4.85 12.8 3.25 10.1 3.25C7.45 3.25 5.2 4.8 4.15 7.05" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M15.55 3.95L16.35 7.45L12.85 8.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M3.9 12.8C4.9 15.15 7.2 16.75 9.9 16.75C12.55 16.75 14.8 15.2 15.85 12.95" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M4.45 16.05L3.65 12.55L7.15 11.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="170" y="89" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">refresh</text>
+<g transform="translate(210,55)" color="#111">
+  <path d="M4 6.5V16H13.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M7 4H16V13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M8.25 11.75L16 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+</g>
+<text x="220" y="89" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">open</text>
+<g transform="translate(260,55)" color="#111">
+  <circle cx="5" cy="15" r="1.4" fill="currentColor"/>
+  <path d="M4 9.5C7.6 9.5 10.5 12.4 10.5 16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M4 4.5C10.35 4.5 15.5 9.65 15.5 16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+</g>
+<text x="270" y="89" text-anchor="middle" font-size="5" fill="#111" font-family="Arial">rss_feed</text>
+</svg>

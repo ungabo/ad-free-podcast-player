@@ -10,13 +10,14 @@ const ROOT = resolve(process.cwd(), '../..')
 const DIST = resolve(process.cwd(), 'dist')
 const SCP = String.raw`C:\Windows\System32\OpenSSH\scp.exe`
 const SSH = String.raw`C:\Windows\System32\OpenSSH\ssh.exe`
+const IDENTITY_FILE = String.raw`C:\Users\Gabe\.ssh\adfree_hosting_ed25519`
 const HOST = 'agitated-engelbart_9pw3g4pzt1v@74.208.203.194'
 const REMOTE_HTTPDOCS_ROOT = '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/httpdocs'
 const REMOTE_HTTPDOCS = `${REMOTE_HTTPDOCS_ROOT}/adfree-web`
 const REMOTE_STACK = '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack'
 
 function scp(localPath, remotePath, recursive = false) {
-  const args = ['-o', 'StrictHostKeyChecking=accept-new']
+  const args = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-i', IDENTITY_FILE]
   if (recursive) args.push('-r')
   args.push(localPath, `${HOST}:${remotePath}`)
   console.log(`  scp ${localPath} -> ${remotePath}`)
@@ -24,7 +25,7 @@ function scp(localPath, remotePath, recursive = false) {
 }
 
 function ssh(cmd) {
-  execFileSync(SSH, ['-o', 'StrictHostKeyChecking=accept-new', HOST, cmd], { stdio: 'inherit' })
+  execFileSync(SSH, ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-i', IDENTITY_FILE, HOST, cmd], { stdio: 'inherit' })
 }
 
 if (!existsSync(join(DIST, 'index.php'))) {

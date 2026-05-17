@@ -56,8 +56,8 @@ app.whenReady().then(async () => {
       retentionDays: 30,
     },
     adRemover: {
-      openAiKey: '',
-      detectionMode: 'local',
+      openAiModel: 'gpt-5.5',
+      detectionMode: 'openai',
       backend: 'parakeet',
       removeOriginal: true,
       selectedFile: '',

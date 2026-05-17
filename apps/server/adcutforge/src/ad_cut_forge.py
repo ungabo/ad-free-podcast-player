@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -63,24 +62,14 @@ def detect_duration_seconds(ffprobe_bin: str, input_file: Path) -> float:
     return float(result.stdout.strip())
 
 
-def choose_intro_trim_seconds(duration_seconds: float) -> float:
-    if duration_seconds >= 1800:
-        return 90.0
-    if duration_seconds >= 900:
-        return 60.0
-    if duration_seconds >= 480:
-        return 25.0
-    return 0.0
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Headless AdCutForge-compatible CLI")
     parser.add_argument("--cli", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--backend", default="openai-whisper")
-    parser.add_argument("--detection-mode", default="local")
+    parser.add_argument("--detection-mode", default="openai")
     parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY", ""))
-    parser.add_argument("--openai-model", default="gpt-4o-mini")
+    parser.add_argument("--openai-model", default="gpt-5.5")
     parser.add_argument("--artifacts-dir", default="")
     parser.add_argument("input_file")
     return parser.parse_args()
@@ -91,14 +80,8 @@ def build_output_path(input_file: Path) -> Path:
 
 
 def normalize_detection_mode(value: str | None, openai_key: str = "") -> str:
-    mode = (value or "").strip().lower().replace("_", "-")
-    if mode in ("openai", "openai-only", "ai"):
-        return "openai"
-    if mode in ("hybrid", "both"):
-        return "hybrid"
-    if openai_key.strip() and mode not in ("local", "local-only", "heuristic", "heuristics"):
-        return "hybrid"
-    return "local"
+    # GPT ad detection is the only supported path.
+    return "openai"
 
 
 def seconds_to_srt_time(seconds: float) -> str:
@@ -220,6 +203,10 @@ def transcribe_openai(
         index = 0
         for chunk_index, chunk in enumerate(sorted(Path(temp_dir).glob(f"{prefix}-chunk-*.mp3"))):
             chunk_duration = detect_duration_seconds(ffprobe_bin, chunk)
+            if chunk_duration < 0.25 or chunk.stat().st_size < 1024:
+                print(f"Skipping tiny transcript chunk at {offset:.0f}s")
+                offset += max(0.0, chunk_duration)
+                continue
             chunk_hash = file_sha256(chunk)
             cache_file = transcript_cache_dir / f"{chunk_index:04d}-{chunk_hash[:16]}.json"
             if cache_file.is_file():
@@ -269,36 +256,6 @@ def transcribe_openai(
     return segments
 
 
-HEURISTIC_PATTERNS: list[tuple[str, float]] = [
-    (r"\b(ad|advertisement|sponsor|sponsored|promo code|offer code)\b", 0.3),
-    (r"\b(brought to you by|paid for by|support for this podcast)\b", 0.45),
-    (r"\b(go to|visit|head to|check out)\s+[a-z0-9][a-z0-9.-]+\.(com|net|org|io|co)\b", 0.4),
-    (r"\b(download the app|start your trial|sign up|get started|save \d+%)\b", 0.3),
-    (r"\b(use code|promo code|enter code|at checkout)\b", 0.4),
-]
-
-BREAK_LEADS = [
-    r"\bwe'?ll be right back\b",
-    r"\bafter (the|a) break\b",
-    r"\bbefore we get back\b",
-    r"\band we'?re back\b",
-]
-
-
-def score_segment(text: str) -> tuple[float, list[str]]:
-    lower = text.lower()
-    score = 0.0
-    reasons: list[str] = []
-    for pattern, weight in HEURISTIC_PATTERNS:
-        if re.search(pattern, lower):
-            score += weight
-            reasons.append(pattern)
-    if len(lower) > 60 and re.search(r"\byou\b", lower) and re.search(r"\b(save|get|try|visit|use|download)\b", lower):
-        score += 0.15
-        reasons.append("direct-response language")
-    return min(score, 1.0), reasons
-
-
 def merge_ranges(ranges: list[AdRange], bridge_gap: float = 20.0, min_seconds: float = 8.0) -> list[AdRange]:
     if not ranges:
         return []
@@ -313,44 +270,14 @@ def merge_ranges(ranges: list[AdRange], bridge_gap: float = 20.0, min_seconds: f
             end=max(previous.end, item.end),
             confidence=max(previous.confidence, item.confidence),
             reason=previous.reason + "; " + item.reason,
-            source=previous.source if previous.source == item.source else "mixed",
+            source="openai",
         )
     return [item for item in merged if item.end - item.start >= min_seconds]
 
 
-def detect_ads_local(segments: list[Segment], duration: float) -> list[AdRange]:
-    ranges: list[AdRange] = []
-    active_start: float | None = None
-    active_end: float | None = None
-    active_reasons: list[str] = []
-
-    for segment in segments:
-        score, reasons = score_segment(segment.text)
-        lower = segment.text.lower()
-        has_break_lead = any(re.search(pattern, lower) for pattern in BREAK_LEADS)
-        if score >= 0.35 or has_break_lead:
-            if active_start is None or segment.start > (active_end or 0) + 25.0:
-                active_start = max(0.0, segment.start - 5.0)
-                active_reasons = []
-            active_end = min(duration, segment.end + 8.0)
-            active_reasons.extend(reasons or ["break cue"])
-        elif active_start is not None and active_end is not None and segment.start <= active_end + 18.0:
-            active_end = min(duration, segment.end + 3.0)
-        elif active_start is not None and active_end is not None:
-            ranges.append(AdRange(active_start, active_end, 0.65, ", ".join(sorted(set(active_reasons))), "local"))
-            active_start = None
-            active_end = None
-            active_reasons = []
-
-    if active_start is not None and active_end is not None:
-        ranges.append(AdRange(active_start, active_end, 0.65, ", ".join(sorted(set(active_reasons))), "local"))
-
-    return merge_ranges(ranges)
-
-
 def compact_segments_for_prompt(segments: list[Segment]) -> str:
     rows = [
-        {"i": segment.index, "start": round(segment.start, 2), "end": round(segment.end, 2), "text": segment.text[:280]}
+        {"i": segment.index, "start": round(segment.start, 3), "end": round(segment.end, 3), "text": segment.text[:500]}
         for segment in segments
     ]
     return json.dumps(rows, ensure_ascii=False)
@@ -361,6 +288,7 @@ def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artif
         "type": "json_schema",
         "json_schema": {
             "name": "ad_ranges",
+            "strict": True,
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
@@ -375,8 +303,19 @@ def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artif
                                 "end": {"type": "number"},
                                 "confidence": {"type": "number"},
                                 "reason": {"type": "string"},
+                                "evidence": {"type": "string"},
+                                "real_paid_or_external_promo": {"type": "boolean"},
+                                "parody_or_comedy_bit": {"type": "boolean"},
                             },
-                            "required": ["start", "end", "confidence", "reason"],
+                            "required": [
+                                "start",
+                                "end",
+                                "confidence",
+                                "reason",
+                                "evidence",
+                                "real_paid_or_external_promo",
+                                "parody_or_comedy_bit",
+                            ],
                         },
                     }
                 },
@@ -385,80 +324,140 @@ def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artif
         },
     }
     system = (
-        "You identify inserted ads in timestamped podcast transcripts. "
-        "Return exact ad-copy spans only. Do not mark normal show discussion as an ad. "
-        "Ad spans are usually under 180 seconds. If a transcript segment is too coarse to identify exact ad copy, return no range."
+        "You are an expert podcast ad-break detector. Return every inserted ad, sponsor read, paid promo, "
+        "network promo, cross-promo, shopping/insurance/credit/app/product pitch, and call-to-action block in "
+        "a timestamped podcast transcript. Return all ad/promotional blocks in the provided time window, not "
+        "just the first one. Use exact audio timestamps from the provided segment boundaries: prefer the first "
+        "segment that contains ad copy as start and the first segment after the ad break as end. Include "
+        "host-read ads, pre-rolls, mid-rolls, post-rolls, dynamic ad insertions, network promos, and "
+        "promotional calls to visit/download/listen/buy/sign up/use a code. Treat show/network/event "
+        "promotions as ads when they interrupt or bracket the episode content. Do not include normal episode "
+        "discussion; a host saying 'we will be right back' is a transition cue, not itself an ad unless bundled "
+        "with promo copy. If a broad segment mixes real show discussion and ad copy, choose the narrower "
+        "timestamp boundaries from neighboring segments and explain uncertainty. Multiple ad spots back-to-back "
+        "should usually be one range if no real episode content separates them. Include short setup banter, "
+        "housekeeping lines, bumpers, or show/network jingles when they sit inside the ad/promo pod and exist "
+        "only to introduce or bridge ads/promos. This is not safety margin; do not include unrelated episode "
+        "content outside the ad/promo pod. If there is an untranscribed/silent gap after the final ad-copy "
+        "segment, end at the final ad-copy segment end unless the gap is represented by a transcribed bumper, "
+        "jingle, or promo line. The end timestamp must be the end of the final ad-copy segment or the start "
+        "of the first resumed episode-content segment; never use "
+        "the start timestamp of a segment that still contains ad copy as the range end. Important exclusion: "
+        "do not remove fictional, comedic, parody, mock, "
+        "satirical, April Fools, or in-universe joke advertisements. Treat those as episode content even when "
+        "they use explicit ad language such as ad space, sponsor, paid for by, promo code, or product-pitch "
+        "copy. Exclude absurd products, fake councils/organizations, impossible claims, and host-riff bits "
+        "where the ad format is part of the comedy. Only return a range when it is a real paid/external "
+        "promotional interruption, not a comedy sketch or parody. Do not add any safety margin before or "
+        "after the ad. For every returned range, "
+        "real_paid_or_external_promo must be true and parody_or_comedy_bit must be false. If a segment might be "
+        "parody/comedy, leave it out. Return an empty ad_ranges array only if the whole transcript contains "
+        "no advertising or promotional interruption."
     )
-    model_name = model or "gpt-4o-mini"
-    detection_cache_dir = cache_root(artifacts_dir) / "detection" / "openai-chat" / model_name
+    response_schema = {
+        "type": "json_schema",
+        "name": schema["json_schema"]["name"],
+        "strict": schema["json_schema"]["strict"],
+        "schema": schema["json_schema"]["schema"],
+    }
+    model_name = model or "gpt-5.5"
+    endpoint_kind = "responses" if model_name.startswith("gpt-5") else "chat"
+    detection_cache_dir = cache_root(artifacts_dir) / "detection" / f"openai-{endpoint_kind}" / model_name
     detection_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    ranges: list[AdRange] = []
-    for start in range(0, len(segments), 90):
-        batch = segments[start : start + 90]
-        batch_number = (start // 90) + 1
-        batch_segments = compact_segments_for_prompt(batch)
+    batch_segments = compact_segments_for_prompt(segments)
+    user_content = "Detect every ad/promo block in this timestamped transcript. Return JSON only. Transcript segments:\n" + batch_segments
+    if endpoint_kind == "responses":
+        payload = {
+            "model": model_name,
+            "instructions": system,
+            "input": [{"role": "user", "content": user_content}],
+            "text": {"format": response_schema},
+            "reasoning": {"effort": "high"},
+            "store": False,
+        }
+        endpoint_url = "https://api.openai.com/v1/responses"
+        timeout_seconds = 180
+    else:
         payload = {
             "model": model_name,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": "Find ad breaks in this JSON segment list:\n" + batch_segments},
+                {"role": "user", "content": user_content},
             ],
             "response_format": schema,
             "temperature": 0,
         }
-        cache_key = text_sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        cache_file = detection_cache_dir / f"{cache_key}.json"
+        endpoint_url = "https://api.openai.com/v1/chat/completions"
+        timeout_seconds = 90
+    cache_key = text_sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    cache_file = detection_cache_dir / f"{cache_key}.json"
 
-        if cache_file.is_file():
-            print(f"Using cached ad detection batch {batch_number}")
-            parsed = json.loads(cache_file.read_text(encoding="utf-8"))
+    if cache_file.is_file():
+        print("Using cached ad detection")
+        parsed = json.loads(cache_file.read_text(encoding="utf-8"))
+    else:
+        print("Detecting ads with OpenAI")
+        request = urllib.request.Request(
+            endpoint_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(exc.read().decode("utf-8", errors="replace")) from exc
+        if endpoint_kind == "responses":
+            content = response_data.get("output_text", "")
+            if not content:
+                chunks: list[str] = []
+                for output_item in response_data.get("output", []):
+                    for content_item in output_item.get("content", []):
+                        if content_item.get("type") == "output_text":
+                            chunks.append(str(content_item.get("text", "")))
+                content = "".join(chunks)
         else:
-            print(f"Detecting ads in batch {batch_number}")
-            request = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=90) as response:
-                    response_data = json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                raise RuntimeError(exc.read().decode("utf-8", errors="replace")) from exc
             content = response_data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            cache_file.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+        parsed = json.loads(content)
+        cache_file.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
 
-        for item in parsed.get("ad_ranges", []):
-            ad = AdRange(
-                start=float(item["start"]),
-                end=float(item["end"]),
-                confidence=float(item["confidence"]),
-                reason=str(item["reason"]),
-                source="openai",
-            )
-            if ad.confidence >= 0.65 and 3.0 <= (ad.end - ad.start) <= 240.0:
-                ranges.append(ad)
+    ranges: list[AdRange] = []
+    for item in parsed.get("ad_ranges", []):
+        real_paid_or_external_promo = bool(item.get("real_paid_or_external_promo", False))
+        parody_or_comedy_bit = bool(item.get("parody_or_comedy_bit", False))
+        ad = AdRange(
+            start=float(item["start"]),
+            end=float(item["end"]),
+            confidence=float(item["confidence"]),
+            reason=str(item["reason"]),
+            source="openai",
+        )
+        if (
+            real_paid_or_external_promo
+            and not parody_or_comedy_bit
+            and ad.confidence >= 0.75
+            and 3.0 <= (ad.end - ad.start) <= 240.0
+        ):
+            ranges.append(ad)
     return merge_ranges(ranges, bridge_gap=25.0, min_seconds=8.0)
 
 
 def constrain_ad_ranges(ranges: list[AdRange], duration: float) -> list[AdRange]:
     constrained: list[AdRange] = []
     for item in ranges:
-        start = 0.0 if item.start < 10.0 else item.start
+        start = max(0.0, item.start)
         normalized = AdRange(start, item.end, item.confidence, item.reason, item.source)
         if 3.0 <= (normalized.end - normalized.start) <= 300.0 and normalized.end <= duration + 1.0:
             constrained.append(normalized)
     total = sum(item.end - item.start for item in constrained)
-    if duration > 0 and total > min(duration * 0.25, 900.0):
-        return []
-    if duration > 0 and any((item.end - item.start) > duration * 0.2 for item in constrained):
+    if duration > 0 and total > duration * 0.9:
         return []
     return constrained
 
 
-def apply_margins(ranges: list[AdRange], duration: float, before: float = 0.75, after: float = 0.75) -> list[AdRange]:
+def apply_margins(ranges: list[AdRange], duration: float, before: float = 0.0, after: float = 0.0) -> list[AdRange]:
     return merge_ranges(
         [
             AdRange(
@@ -573,14 +572,14 @@ def main() -> int:
     artifacts_dir = Path(args.artifacts_dir).resolve() if args.artifacts_dir else input_file.with_suffix(".artifacts")
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    print("5% Starting processing")
-    print(f"12% Backend: {args.backend}")
-    print(f"18% Detection mode: {args.detection_mode}")
-
     try:
         duration = detect_duration_seconds(ffprobe_bin, input_file)
         backend = args.backend.strip().lower()
         mode = normalize_detection_mode(args.detection_mode, args.openai_api_key)
+
+        print("5% Starting processing")
+        print(f"12% Backend: {args.backend}")
+        print(f"18% Detection mode: {mode} (GPT only)")
 
         if backend == "openai-whisper":
             if not args.openai_api_key.strip():
@@ -591,14 +590,10 @@ def main() -> int:
         else:
             raise RuntimeError("Local Whisper is not installed on this server. Use OpenAI Whisper API.")
 
-        print("65% Detecting ad ranges")
-        ranges = detect_ads_local(segments, duration) if mode in ("local", "hybrid") else []
-        if mode in ("openai", "hybrid"):
-            if not args.openai_api_key.strip():
-                raise RuntimeError("OpenAI detection selected, but no OpenAI API key was provided.")
-            ranges = merge_ranges(
-                ranges + call_openai_for_ads(segments, args.openai_api_key.strip(), args.openai_model, artifacts_dir)
-            )
+        print("65% Detecting ad ranges with GPT")
+        if not args.openai_api_key.strip():
+            raise RuntimeError("GPT ad detection requires an OpenAI API key.")
+        ranges = call_openai_for_ads(segments, args.openai_api_key.strip(), args.openai_model, artifacts_dir)
         ranges = constrain_ad_ranges(apply_margins(ranges, duration), duration)
         write_ad_artifacts(ranges, artifacts_dir, artifact_method)
         if ranges:

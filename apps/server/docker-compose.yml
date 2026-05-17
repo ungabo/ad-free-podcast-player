@@ -25,7 +25,6 @@ services:
     volumes:
       - ./worker:/app
       - ./storage:/srv/storage
-      - ${ADCUTFORGE_ROOT:-./adcutforge}:/opt/adcutforge
     environment:
       APP_STORAGE: /srv/storage
       DB_PATH: /srv/storage/jobs.sqlite
@@ -34,11 +33,7 @@ services:
       OUTPUT_DIR: /srv/storage/output
       WORK_DIR: /srv/storage/work
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-2}
-      PROCESSOR_MODE: ${PROCESSOR_MODE:-adcutforge}
-      FFMPEG_BIN: ffmpeg
       SOURCE_CACHE_RETENTION_DAYS: ${SOURCE_CACHE_RETENTION_DAYS:-60}
       SOURCE_DOWNLOAD_TIMEOUT_SECONDS: ${SOURCE_DOWNLOAD_TIMEOUT_SECONDS:-900}
-      ADCUTFORGE_ROOT: /opt/adcutforge
-      ADCUTFORGE_PYTHON: ${ADCUTFORGE_PYTHON:-python3}
-      ADCUTFORGE_SCRIPT: ${ADCUTFORGE_SCRIPT:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LOCAL_PROCESSOR_BASE_URL: ${LOCAL_PROCESSOR_BASE_URL:-http://host.docker.internal:8081/adfree-api}
+      LOCAL_PROCESSOR_TIMEOUT_SECONDS: ${LOCAL_PROCESSOR_TIMEOUT_SECONDS:-14400}

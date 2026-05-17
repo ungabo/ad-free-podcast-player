@@ -14,6 +14,32 @@ This folder holds the local Windows setup for the server stack when you want to 
 - `D:\wamp64\www\adfree-api` for the PHP API entrypoint
 - `D:\wamp64\www\adfree-web` for the built web app
 - `D:\wamp64\storage` for SQLite, queue files, uploads, output, and artifacts
+- `D:\wamp64\storage\cacert.pem` for the Mozilla CA bundle used by Windows PHP HTTPS downloads
+
+## HTTPS Source Downloads
+
+Windows PHP often does not ship with a usable CA bundle for cURL/OpenSSL. Source URL jobs keep TLS verification enabled and use `ADFREE_CA_BUNDLE`, `CURL_CA_BUNDLE`, or `SSL_CERT_FILE` when set.
+
+`apps/server/windows/setup-local.ps1` downloads `cacert.pem` from curl.se into `D:\wamp64\storage` by default and writes the needed Apache `SetEnv` values into the local API `.htaccess`.
+
+If you manage Apache by vhost instead, copy the CA bundle `SetEnv` lines from `apps/server/windows/wamp-vhost.example.conf` and restart WAMP.
+
+## OpenAI Key
+
+The OpenAI API key belongs on the Windows processor only. Set it before syncing WAMP:
+
+```powershell
+$env:OPENAI_API_KEY = 'sk-...'
+.\apps\server\windows\setup-local.ps1
+```
+
+Or pass it directly:
+
+```powershell
+.\apps\server\windows\setup-local.ps1 -OpenAiApiKey 'sk-...'
+```
+
+The script writes `SetEnv OPENAI_API_KEY ...` into the local API `.htaccess`. Browser and Android clients do not send the key.
 
 ## UI Disable Toggle
 

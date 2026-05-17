@@ -211,39 +211,12 @@
   <main class="shell">
     <section class="panel">
       <h1>Ad Free Podcast Server</h1>
-      <p>Upload a file, queue a job, and download the processed output when it is finished.</p>
+      <p>Paste an episode audio URL, queue ad removal, and download the processed output when it is finished.</p>
 
       <form id="jobForm" class="grid">
         <label class="full">
-          Audio file
-          <input type="file" id="audio" name="audio" accept="audio/*" required />
-        </label>
-
-        <label>
-          Backend
-          <select id="backend" name="backend">
-            <option value="openai-whisper">OpenAI Whisper API</option>
-            <option value="whisper">Local Whisper (server install required)</option>
-          </select>
-        </label>
-
-        <label>
-          Detection mode
-          <select id="detectionMode" name="detection_mode">
-            <option value="local">Local</option>
-            <option value="hybrid">Hybrid</option>
-            <option value="openai">OpenAI only</option>
-          </select>
-        </label>
-
-        <label>
-          OpenAI model
-          <input type="text" id="openAiModel" name="openai_model" value="gpt-4o-mini" />
-        </label>
-
-        <label>
-          OpenAI API key (optional)
-          <input type="password" id="openAiApiKey" name="openai_api_key" placeholder="sk-..." />
+          Episode audio URL
+          <input type="url" id="sourceUrl" name="source_url" placeholder="https://..." required />
         </label>
 
         <div class="full actions">
@@ -253,7 +226,7 @@
         </div>
       </form>
 
-      <p class="note">Tip: if worker mode is ffmpeg-copy, this validates the full pipeline without ad removal logic.</p>
+      <p class="note">Ad removal requires the Windows processor tunnel. If Windows is offline, new jobs cannot be queued.</p>
     </section>
 
     <section class="panel">
@@ -266,10 +239,6 @@
         <div>
           <strong>Job ID</strong>
           <span id="jobId">-</span>
-        </div>
-        <div>
-          <strong>Backend</strong>
-          <span id="jobBackend">-</span>
         </div>
         <div>
           <strong>State</strong>
@@ -294,7 +263,6 @@
     const statusText = document.getElementById('statusText');
     const progressBar = document.getElementById('progressBar');
     const jobIdText = document.getElementById('jobId');
-    const backendText = document.getElementById('jobBackend');
     const stateText = document.getElementById('jobState');
     const progressText = document.getElementById('jobProgress');
     const logsBox = document.getElementById('jobLogs');
@@ -323,7 +291,6 @@
 
     function updateJobCard(job) {
       jobIdText.textContent = job.job_id || '-';
-      backendText.textContent = job.backend || '-';
       stateText.textContent = job.status || '-';
       setProgress(job.progress || 0);
 
@@ -386,7 +353,6 @@
         updateJobCard({
           job_id: payload.job_id,
           status: 'queued',
-          backend: document.getElementById('backend').value,
           progress: 0,
         });
 

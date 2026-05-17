@@ -1,9 +1,9 @@
 # Web Processing Stack (PHP API + Linux Worker)
 
-This folder adds a server version of ad-removal processing:
+This folder adds the PHP API used by the web and Android apps:
 
-- PHP API for uploads, job creation, status polling, and output download
-- Python worker for background processing
+- PHP API for job creation, status polling, and output download
+- Python worker that sends new ad-removal jobs to the Windows tunnel processor
 - Shared storage and SQLite job tracking
 - Docker Compose setup for Linux deployment
 
@@ -16,14 +16,9 @@ This folder adds a server version of ad-removal processing:
 - Output files: `apps/server/storage/output`
 - Job DB: `apps/server/storage/jobs.sqlite`
 
-## Processing Modes
+## Processing Path
 
-- `PROCESSOR_MODE=adcutforge` (default)
-  - Calls AdCutForge for actual ad-removal processing
-  - Configure `ADCUTFORGE_ROOT` or `ADCUTFORGE_SCRIPT`
-- `PROCESSOR_MODE=ffmpeg-copy`
-  - Safe baseline for end-to-end testing
-  - Produces a normalized AAC output without ad removal logic
+New ad-removal jobs always use the Windows tunnel processor. The PHP API stores completed output and serves downloads, but it does not run a local/server fallback when Windows is unavailable.
 
 ## Run With Docker
 
@@ -59,27 +54,19 @@ Example vhost and sync script notes live in `apps/server/windows/README.md`.
 - `POST /api/jobs`
 - Content-Type: `multipart/form-data`
 - Fields:
-  - `audio` (optional file)
-  - `source_url` (optional URL to a remote audio file)
-  - `backend` (optional): `openai-whisper`, `whisper`
-  - `detection_mode` (optional): `local`, `hybrid`, `openai`
-  - `openai_model` (optional, default `gpt-4o-mini`)
-  - `openai_api_key` (optional)
+  - `source_url` (required URL to a remote audio file)
+  - `backend` (optional, normalized to `tunnel-parakeet`)
+  - `detection_mode` (optional): `openai` (GPT ad detection only)
 
-You must provide either `audio` or `source_url`.
+The OpenAI API key must be configured on the Windows machine, not supplied by browser clients.
 
 Example:
 
 ```bash
 curl -X POST http://localhost:8080/api/jobs \
-  -F "audio=@/path/to/episode.mp3" \
-  -F "backend=openai-whisper" \
-  -F "detection_mode=hybrid"
-
-curl -X POST http://localhost:8080/api/jobs \
   -F "source_url=https://example.com/episode.mp3" \
-  -F "backend=openai-whisper" \
-  -F "detection_mode=hybrid"
+  -F "backend=tunnel-parakeet" \
+  -F "detection_mode=openai"
 ```
 
 ### Get Job Status
@@ -97,8 +84,7 @@ curl -X POST http://localhost:8080/api/jobs \
 ## Notes
 
 - The worker updates job state in SQLite as it runs.
-- If you use AdCutForge mode, install the full processing runtime on Linux and point env vars to it.
-- Keep OpenAI keys in server environment when possible instead of sending per-request keys.
-- For `source_url` jobs, the API queues immediately and the worker downloads the source audio.
+- Keep OpenAI keys on the Windows processor. `apps/server/windows/setup-local.ps1` writes `OPENAI_API_KEY` into the local WAMP API environment when you pass `-OpenAiApiKey` or run it from a shell where `OPENAI_API_KEY` is already set.
+- For `source_url` jobs, the worker asks the Windows tunnel processor to download and process the source audio.
 - Worker source downloads are cached by episode URL and reused for future jobs.
 - Cached source downloads are pruned automatically after 60 days (configurable via `SOURCE_CACHE_RETENTION_DAYS`).

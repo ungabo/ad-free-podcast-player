@@ -9,10 +9,9 @@ declare global {
       runProcessing: (payload: {
         filePath: string
         settings: {
-          openAiApiKey: string
           openAiModel: string
-          transcriptionBackend: 'whisper' | 'openai-whisper'
-          detectionMode: 'local' | 'hybrid' | 'openai'
+          transcriptionBackend: 'parakeet'
+          detectionMode: 'openai'
           removeOriginalAfterExport: boolean
           cacheTtlDays: number
         }

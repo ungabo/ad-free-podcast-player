@@ -3,6 +3,7 @@ const SMARTLESS_FEED = "https://feeds.simplecast.com/hNaFxXpO";
 const BROWSER_STORE_KEY = "adfreepod.windows.v1";
 const DEBUG_PREVIEW_LIMIT = 30000;
 const DESCRIPTION_LIMIT = 2500;
+const EPISODE_PAGE_SIZE = 10;
 
 let state = createDefaultState();
 let route = "home";
@@ -45,9 +46,8 @@ function createDefaultState() {
     progress: {},
     settings: { autoplayNext: false, seekBack: 15, seekForward: 30, retentionDays: 30 },
     adRemover: {
-      openAiKey: "",
-      openAiModel: "gpt-4.1-mini",
-      detectionMode: "local",
+      openAiModel: "gpt-5.5",
+      detectionMode: "openai",
       backend: "parakeet",
       removeOriginal: true,
       selectedFile: "",
@@ -226,10 +226,7 @@ function renderActivityPanel() {
     }
 
     // Engine label
-    const engineLabel = adState.backend === "parakeet" ? "Parakeet (NVIDIA, local GPU)"
-      : adState.backend === "whisper" ? "Whisper (local CPU)"
-      : adState.backend === "openai-whisper" ? "OpenAI Whisper API (cloud)"
-      : escapeHtml(adState.backend || "unknown");
+    const engineLabel = "Windows Parakeet (local)";
 
     // Recent ad-remover log lines (last 8, strip the [type] prefix noise for readability)
     const recentLogs = runtime.adRemover.logs.slice(-8).map((line) =>
@@ -252,7 +249,7 @@ function renderActivityPanel() {
 
         <div class="adRunPanel__meta">
           <span><em>Engine:</em> ${engineLabel}</span>
-          <span><em>Detection:</em> ${escapeHtml(adState.detectionMode || "local")}</span>
+          <span><em>Detection:</em> GPT only</span>
           <span><em>Elapsed:</em> ${elapsedText}</span>
           <span><em>ETA:</em> ${etaText}</span>
         </div>
@@ -334,9 +331,8 @@ function setTitle(title, eyebrow = "Windows desktop build") {
 function adRemoverState() {
   if (!state.adRemover) {
     state.adRemover = {
-      openAiKey: "",
-      openAiModel: "gpt-4.1-mini",
-      detectionMode: "local",
+      openAiModel: "gpt-5.5",
+      detectionMode: "openai",
       backend: "parakeet",
       removeOriginal: true,
       selectedFile: "",
@@ -344,7 +340,8 @@ function adRemoverState() {
       lastResult: null,
     };
   }
-  if (!state.adRemover.openAiModel) state.adRemover.openAiModel = "gpt-4.1-mini";
+  if (!state.adRemover.openAiModel) state.adRemover.openAiModel = "gpt-5.5";
+  state.adRemover.detectionMode = "openai";
   return state.adRemover;
 }
 
@@ -615,7 +612,7 @@ async function parseFeed(feedUrl, raw) {
 }
 
 function podcastEpisodes(podcastId, filter = "All") {
-  return Object.values(state.episodes)
+  return sortEpisodesNewestFirst(Object.values(state.episodes)
     .filter((episode) => episode.podcastId === podcastId)
     .filter((episode) => {
       const progress = state.progress[episode.id]?.positionSeconds || 0;
@@ -627,8 +624,16 @@ function podcastEpisodes(podcastId, filter = "All") {
       if (filter === "Listened") return episode.isListened;
       if (filter === "Unlistened") return !episode.isListened;
       return true;
-    })
-    .sort((a, b) => Date.parse(b.pubDate || 0) - Date.parse(a.pubDate || 0));
+    }));
+}
+
+function sortEpisodesNewestFirst(episodes) {
+  return [...episodes].sort((a, b) => {
+    const dateA = Date.parse(a.pubDate || "") || 0;
+    const dateB = Date.parse(b.pubDate || "") || 0;
+    if (dateA !== dateB) return dateB - dateA;
+    return String(b.firstSeenAt || "").localeCompare(String(a.firstSeenAt || ""));
+  });
 }
 
 function episodeIndicators(episode) {
@@ -795,9 +800,9 @@ function renderHome() {
         </div>
       </div>`}
     <h2>In Progress</h2>
-    <div class="episodeList">${Object.values(state.episodes).filter(e => (state.progress[e.id]?.positionSeconds || 0) > 0 && (state.progress[e.id]?.percentComplete || 0) < 95).slice(0, 8).map(episodeCard).join("") || `<div class="card muted">Nothing in progress yet.</div>`}</div>
+    <div class="episodeList">${sortEpisodesNewestFirst(Object.values(state.episodes).filter(e => (state.progress[e.id]?.positionSeconds || 0) > 0 && (state.progress[e.id]?.percentComplete || 0) < 95)).slice(0, 8).map(episodeCard).join("") || `<div class="card muted">Nothing in progress yet.</div>`}</div>
     <h2>Downloads</h2>
-    <div class="episodeList">${Object.values(state.episodes).filter(e => e.downloadStatus === "downloaded").slice(0, 8).map(episodeCard).join("") || `<div class="card muted">Downloaded episodes will appear here after you use Download MP3.</div>`}</div>
+    <div class="episodeList">${sortEpisodesNewestFirst(Object.values(state.episodes).filter(e => e.downloadStatus === "downloaded")).slice(0, 8).map(episodeCard).join("") || `<div class="card muted">Downloaded episodes will appear here after you use Download MP3.</div>`}</div>
   `;
   wireCommonActions();
 }
@@ -867,6 +872,10 @@ function renderPodcast() {
   setStatus(`Last refreshed: ${podcast.lastFeedRefreshAt || "Never"}`);
   const filter = sessionStorage.getItem("episodeFilter") || "All";
   const episodes = podcastEpisodes(podcast.id, filter);
+  const page = Math.max(0, Number(sessionStorage.getItem("episodePage") || "0") || 0);
+  const pageCount = Math.max(1, Math.ceil(episodes.length / EPISODE_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const visibleEpisodes = episodes.slice(safePage * EPISODE_PAGE_SIZE, safePage * EPISODE_PAGE_SIZE + EPISODE_PAGE_SIZE);
   els.screen.innerHTML = `
     <section class="card">
       <h2>${escapeHtml(podcast.title)}</h2>
@@ -880,7 +889,14 @@ function renderPodcast() {
     </section>
     <h2>Episodes</h2>
     <div class="buttonRow">${["All", "New", "In progress", "Downloaded", "Not downloaded", "Listened", "Unlistened"].map(f => `<button class="${f === filter ? "" : "ghost"}" data-filter="${f}">${f}</button>`).join("")}</div>
-    <div class="episodeList">${episodes.slice(0, 60).map(episodeCard).join("") || `<div class="card muted">No episodes match this filter.</div>`}</div>
+    <div class="episodeList">${visibleEpisodes.map(episodeCard).join("") || `<div class="card muted">No episodes match this filter.</div>`}</div>
+    ${episodes.length > EPISODE_PAGE_SIZE ? `
+      <div class="buttonRow">
+        <button class="ghost" data-page="${safePage - 1}" ${safePage === 0 ? "disabled" : ""}>Prev page</button>
+        <span class="muted">Page ${safePage + 1} / ${pageCount}</span>
+        <button class="ghost" data-page="${safePage + 1}" ${safePage + 1 >= pageCount ? "disabled" : ""}>Next page</button>
+      </div>
+    ` : ""}
   `;
   wireCommonActions();
 }
@@ -1208,7 +1224,7 @@ async function runAdRemoval(options = {}) {
   startAdProgressTimer();
   adState.lastResult = null;
   saveState();
-  pushActivityLine(`Ad removal started for ${sourceLabel}. Engine: ${adState.backend}, detection: ${adState.detectionMode}`);
+  pushActivityLine(`Ad removal started for ${sourceLabel}. Engine: ${adState.backend}, detection: openai`);
   if (!preserveRoute || route === "adremover") {
     renderAdRemover();
   }
@@ -1218,10 +1234,9 @@ async function runAdRemoval(options = {}) {
     const result = await window.desktopApi.runProcessing({
       filePath: adState.selectedFile,
       settings: {
-        openAiApiKey: adState.openAiKey,
-        openAiModel: adState.openAiModel || "gpt-4.1-mini",
-        transcriptionBackend: adState.backend,
-        detectionMode: adState.detectionMode,
+        openAiModel: adState.openAiModel || "gpt-5.5",
+        transcriptionBackend: "parakeet",
+        detectionMode: "openai",
         parakeetPythonPath: "",
         parakeetModel: "nvidia/parakeet-tdt-0.6b-v3",
         removeOriginalAfterExport,
@@ -1309,26 +1324,16 @@ function renderAdRemover() {
           <button id="adPickFile">Choose file</button>
           <button id="adRunButton" ${!runtime.desktop.connected || runtime.adRemover.isRunning ? "disabled" : ""}>${runtime.adRemover.isRunning ? "Processing..." : "Remove ads"}</button>
         </div>
-        <label>Transcription backend
-          <select id="adBackend">
-            <option value="parakeet" ${adState.backend === "parakeet" ? "selected" : ""}>Parakeet</option>
-            <option value="whisper" ${adState.backend === "whisper" ? "selected" : ""}>Whisper local</option>
-            <option value="openai-whisper" ${adState.backend === "openai-whisper" ? "selected" : ""}>OpenAI Whisper API</option>
-          </select>
+        <label>Processor
+          <input id="adBackend" value="Windows Parakeet" readonly>
         </label>
-        <label>Detection mode
-          <select id="adDetectionMode">
-            <option value="local" ${adState.detectionMode === "local" ? "selected" : ""}>Local</option>
-            <option value="hybrid" ${adState.detectionMode === "hybrid" ? "selected" : ""}>Hybrid</option>
-            <option value="openai" ${adState.detectionMode === "openai" ? "selected" : ""}>OpenAI only</option>
-          </select>
+        <label>Detection
+          <input id="adDetectionMode" value="GPT only" readonly>
         </label>
-        <label>OpenAI model — type the model ID directly (e.g. gpt-4.1-mini, gpt-4.5, o3, o4-mini)
-          <input id="adOpenAiModel" value="${escapeHtml(adState.openAiModel || "gpt-4.1-mini")}" placeholder="gpt-4.1-mini">
+        <label>OpenAI model — type the model ID directly (e.g. gpt-5.5, gpt-5.4, gpt-4.1)
+          <input id="adOpenAiModel" value="${escapeHtml(adState.openAiModel || "gpt-5.5")}" placeholder="gpt-5.5">
         </label>
-        <label>OpenAI API key (optional)
-          <input id="adOpenAiKey" type="password" value="${escapeHtml(adState.openAiKey || "")}" placeholder="sk-...">
-        </label>
+        <p class="muted">The OpenAI API key is read from OPENAI_API_KEY on this Windows machine.</p>
         <label><input id="adRemoveOriginal" type="checkbox" ${adState.removeOriginal ? "checked" : ""}> Remove original file after export</label>
         <p class="muted">${runtime.desktop.adCutForgeRoot ? `Engine path: ${escapeHtml(runtime.desktop.adCutForgeRoot)}` : "Engine path will appear when the desktop bridge is ready."}</p>
       </div>
@@ -1369,10 +1374,9 @@ function renderAdRemover() {
   });
 
   document.querySelector("#adRunButton")?.addEventListener("click", () => {
-    adState.backend = document.querySelector("#adBackend").value;
-    adState.detectionMode = document.querySelector("#adDetectionMode").value;
+    adState.backend = "parakeet";
+    adState.detectionMode = "openai";
     adState.openAiModel = document.querySelector("#adOpenAiModel").value;
-    adState.openAiKey = document.querySelector("#adOpenAiKey").value.trim();
     adState.removeOriginal = document.querySelector("#adRemoveOriginal").checked;
     saveState();
     runAdRemoval().catch((error) => setStatus(`Ad removal failed: ${error.message}`));
@@ -1525,6 +1529,11 @@ function wireCommonActions() {
   }));
   document.querySelectorAll("[data-filter]").forEach((el) => el.addEventListener("click", () => {
     sessionStorage.setItem("episodeFilter", el.dataset.filter);
+    sessionStorage.setItem("episodePage", "0");
+    renderPodcast();
+  }));
+  document.querySelectorAll("[data-page]").forEach((el) => el.addEventListener("click", () => {
+    sessionStorage.setItem("episodePage", el.dataset.page);
     renderPodcast();
   }));
   document.querySelectorAll("[data-download]").forEach((el) => el.addEventListener("click", () => {

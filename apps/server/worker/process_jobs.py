@@ -4,13 +4,12 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import sqlite3
-import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -29,20 +28,8 @@ SOURCE_CACHE_DIR = Path(
 HEARTBEAT_PATH = Path(
     os.getenv("WORKER_HEARTBEAT", str(APP_STORAGE / "worker-heartbeat.json"))
 ).resolve()
-BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
-BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
-BUNDLED_ADCUTFORGE_ROOT = BASE_DIR / "adcutforge"
-
 POLL_SECONDS = max(1, int(os.getenv("WORKER_POLL_SECONDS", "2")))
-PROCESSOR_MODE = os.getenv("PROCESSOR_MODE", "ffmpeg-copy").strip().lower()
-FFMPEG_BIN = os.getenv(
-    "FFMPEG_BIN",
-    str(BUNDLED_FFMPEG_BIN) if BUNDLED_FFMPEG_BIN.exists() else "ffmpeg",
-).strip()
-FFPROBE_BIN = os.getenv(
-    "FFPROBE_BIN",
-    str(BUNDLED_FFPROBE_BIN) if BUNDLED_FFPROBE_BIN.exists() else "ffprobe",
-).strip()
+PROCESSOR_LABEL = "windows-tunnel"
 SOURCE_CACHE_RETENTION_DAYS = max(
     1, int(os.getenv("SOURCE_CACHE_RETENTION_DAYS", "60"))
 )
@@ -53,13 +40,6 @@ SOURCE_DOWNLOAD_TIMEOUT_SECONDS = max(
     30, int(os.getenv("SOURCE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
 )
 
-ADCUTFORGE_ROOT = os.getenv(
-    "ADCUTFORGE_ROOT",
-    str(BUNDLED_ADCUTFORGE_ROOT) if BUNDLED_ADCUTFORGE_ROOT.exists() else "",
-).strip()
-ADCUTFORGE_PYTHON = os.getenv("ADCUTFORGE_PYTHON", "python3").strip()
-ADCUTFORGE_SCRIPT = os.getenv("ADCUTFORGE_SCRIPT", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 LOCAL_PROCESSOR_BASE_URL = os.getenv(
     "LOCAL_PROCESSOR_BASE_URL", "http://127.0.0.1:8081/adfree-api"
 ).rstrip("/")
@@ -69,7 +49,6 @@ LOCAL_PROCESSOR_TIMEOUT_SECONDS = max(
 )
 
 MAX_LOG_CHARS = 60000
-PROGRESS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)%")
 
 
 def utc_now() -> str:
@@ -98,7 +77,7 @@ def write_heartbeat(state: str = "running") -> None:
     payload = {
         "state": state,
         "time": utc_now(),
-        "mode": PROCESSOR_MODE,
+        "mode": PROCESSOR_LABEL,
         "queue_dir": str(QUEUE_DIR),
         "output_dir": str(OUTPUT_DIR),
     }
@@ -106,6 +85,28 @@ def write_heartbeat(state: str = "running") -> None:
         HEARTBEAT_PATH.write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
         pass
+
+
+class HeartbeatPinger:
+    def __init__(self, state: str = "running", interval_seconds: int = 10) -> None:
+        self.state = state
+        self.interval_seconds = interval_seconds
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> "HeartbeatPinger":
+        write_heartbeat(self.state)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=1)
+        write_heartbeat(self.state)
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval_seconds):
+            write_heartbeat(self.state)
 
 
 def open_db() -> sqlite3.Connection:
@@ -164,7 +165,7 @@ def mark_failed(job_id: str, error_message: str, logs: str) -> None:
             (
                 "failed",
                 100.0,
-                error_message[:1000],
+                summarize_error_message(error_message),
                 truncate_logs(logs),
                 now,
                 now,
@@ -354,149 +355,12 @@ def download_source_to_cache(
     tmp_path.replace(cache_path)
 
 
-def prepare_input_audio(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Path:
-    input_path = Path(str(payload["input_path"])).resolve()
-    input_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if input_path.exists() and input_path.stat().st_size > 0:
-        emit_runtime_update(job_id, logs_list, 20.0, "20% Using uploaded input audio")
-        return input_path
-
-    source_url = str(payload.get("source_url", "") or "").strip()
-    if not source_url:
-        raise RuntimeError("Input audio is missing and no source_url was provided")
-
-    validate_source_url(source_url)
-
-    cache_key = source_cache_key(source_url)
-    cached_file = find_cached_source_file(cache_key)
-    if cached_file is not None and cached_file.exists():
-        emit_runtime_update(
-            job_id,
-            logs_list,
-            18.0,
-            f"18% Source cache hit ({cached_file.name})",
-        )
-        shutil.copy2(cached_file, input_path)
-        emit_runtime_update(job_id, logs_list, 35.0, "35% Prepared input audio from cache")
-        return input_path
-
-    extension = input_path.suffix if input_path.suffix else ".m4a"
-    cache_target = SOURCE_CACHE_DIR / f"{cache_key}{extension}"
-
-    emit_runtime_update(job_id, logs_list, 10.0, "10% Downloading source audio on server")
-    download_source_to_cache(source_url, cache_target, job_id, logs_list)
-    emit_runtime_update(job_id, logs_list, 30.0, "30% Cached source audio for future jobs")
-
-    shutil.copy2(cache_target, input_path)
-    emit_runtime_update(job_id, logs_list, 35.0, "35% Prepared input audio")
-    return input_path
-
-
-def run_command(
-    command: list[str],
-    cwd: Optional[Path],
-    on_line: Optional[Callable[[str], None]] = None,
-) -> Tuple[int, str, str]:
-    logs: list[str] = []
-    edited_audio = ""
-    process = subprocess.Popen(
-        command,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
-
-    assert process.stdout is not None
-    for raw_line in process.stdout:
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        logs.append(line)
-        if line.startswith("Edited audio:"):
-            edited_audio = line.split(":", 1)[1].strip()
-
-        if on_line is not None:
-            on_line(line)
-
-    exit_code = process.wait()
-    return exit_code, "\n".join(logs), edited_audio
-
-
-def run_ffmpeg_copy(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str]:
-    input_path = Path(str(payload["input_path"])).resolve()
-    output_path = Path(str(payload["output_path"])).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    command = [
-        FFMPEG_BIN,
-        "-y",
-        "-i",
-        str(input_path),
-        "-vn",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "64k",
-        "-ac",
-        "1",
-        str(output_path),
-    ]
-
-    emit_runtime_update(job_id, logs_list, 45.0, "45% Rendering output with ffmpeg")
-    exit_code, logs, _ = run_command(
-        command,
-        cwd=None,
-        on_line=lambda line: emit_runtime_update(job_id, logs_list, 70.0, line),
-    )
-    if exit_code != 0:
-        raise RuntimeError(f"ffmpeg failed with exit code {exit_code}")
-    if not output_path.exists():
-        raise RuntimeError("ffmpeg did not produce an output file")
-
-    emit_runtime_update(job_id, logs_list, 92.0, "92% ffmpeg render complete")
-    return str(output_path), logs
-
-
-def resolve_adcutforge_script() -> Optional[Path]:
-    if ADCUTFORGE_SCRIPT:
-        candidate = Path(ADCUTFORGE_SCRIPT)
-        if candidate.exists():
-            return candidate.resolve()
-    if ADCUTFORGE_ROOT:
-        candidate = Path(ADCUTFORGE_ROOT) / "src" / "ad_cut_forge.py"
-        if candidate.exists():
-            return candidate.resolve()
-    return None
-
-
-def find_rendered_audio(input_path: Path, explicit_path: str) -> Optional[Path]:
-    if explicit_path:
-        candidate = Path(explicit_path)
-        if candidate.exists():
-            return candidate.resolve()
-
-    parent = input_path.parent
-    stem = input_path.stem
-    ordered = sorted(parent.glob(f"{stem}*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for item in ordered:
-        name = item.name.lower()
-        if item.is_file() and (".noads" in name or ".adfree" in name):
-            return item.resolve()
-    return None
-
-
 def is_tunnel_backend(backend: str) -> bool:
-    return backend.strip().lower() in {"tunnel-whisper", "tunnel-parakeet"}
+    return backend.strip().lower() in {"tunnel-parakeet", "tunnel-openai-whisper", "tunnel-whisper"}
 
 
 def tunnel_local_backend(backend: str) -> str:
-    return "parakeet" if backend.strip().lower() == "tunnel-parakeet" else "whisper"
+    return "openai-whisper"
 
 
 def bridge_headers(content_type: Optional[str] = None) -> dict[str, str]:
@@ -523,16 +387,39 @@ def post_bridge_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         method="POST",
     )
     try:
-        with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
+        with HeartbeatPinger("running"):
+            with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Windows bridge returned HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"Windows bridge returned HTTP {exc.code}: {summarize_bridge_error(detail)}") from exc
     except URLError as exc:
         raise RuntimeError(f"Windows bridge is not reachable at {LOCAL_PROCESSOR_BASE_URL}: {exc}") from exc
     if not isinstance(decoded, dict):
         raise RuntimeError("Windows bridge returned a non-object JSON response")
     return decoded
+
+
+def summarize_bridge_error(detail: str) -> str:
+    text = detail.strip()
+    if not text:
+        return "No bridge error body was returned."
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, dict) and isinstance(decoded.get("error"), str):
+            text = decoded["error"].strip()
+    except json.JSONDecodeError:
+        pass
+    if len(text) <= 1000:
+        return text
+    return f"{text[:450]} ... {text[-500:]}"
+
+
+def summarize_error_message(message: str) -> str:
+    text = message.strip()
+    if len(text) <= 1000:
+        return text
+    return f"{text[:450]} ... {text[-500:]}"
 
 
 def download_bridge_file(path_or_url: str, destination: Path) -> None:
@@ -541,9 +428,10 @@ def download_bridge_file(path_or_url: str, destination: Path) -> None:
     tmp_path = destination.with_suffix(destination.suffix + ".part")
     tmp_path.unlink(missing_ok=True)
     try:
-        with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
-            with tmp_path.open("wb") as output:
-                shutil.copyfileobj(response, output)
+        with HeartbeatPinger("running"):
+            with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
+                with tmp_path.open("wb") as output:
+                    shutil.copyfileobj(response, output)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         tmp_path.unlink(missing_ok=True)
@@ -558,28 +446,29 @@ def download_bridge_file(path_or_url: str, destination: Path) -> None:
 
 
 def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
-    backend = str(payload.get("backend", "tunnel-whisper")).strip().lower()
+    backend = str(payload.get("backend", "tunnel-parakeet")).strip().lower()
     source_url = str(payload.get("source_url", "") or "").strip()
     if not source_url:
         raise RuntimeError("Windows tunnel processing requires source_url jobs.")
+    detection_mode = "openai"
+    openai_model = str(payload.get("openai_model", "") or "").strip() or "gpt-5.5"
 
     emit_runtime_update(
         job_id,
         logs_list,
         38.0,
-        f"38% Sending job to Windows tunnel ({tunnel_local_backend(backend)})",
+        f"38% Sending job to Windows tunnel ({tunnel_local_backend(backend)}, GPT detection)",
     )
-    response = post_bridge_json(
-        "/api/local/process",
-        {
-            "job_id": job_id,
-            "source_url": source_url,
-            "backend": tunnel_local_backend(backend),
-            "detection_mode": "local",
-            "episode_title": payload.get("episode_title") or "",
-            "podcast_name": payload.get("podcast_name") or "",
-        },
-    )
+    bridge_payload = {
+        "job_id": job_id,
+        "source_url": source_url,
+        "backend": tunnel_local_backend(backend),
+        "detection_mode": detection_mode,
+        "episode_title": payload.get("episode_title") or "",
+        "podcast_name": payload.get("podcast_name") or "",
+    }
+    bridge_payload["openai_model"] = openai_model
+    response = post_bridge_json("/api/local/process", bridge_payload)
     if not response.get("ok"):
         raise RuntimeError(str(response.get("error") or "Windows bridge processing failed"))
 
@@ -624,110 +513,6 @@ def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[s
     return str(output_path), bridge_logs, timestamps_path, transcript_path
 
 
-def run_adcutforge(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
-    script = resolve_adcutforge_script()
-    if script is None:
-        raise RuntimeError(
-            "AdCutForge script not found. Set ADCUTFORGE_ROOT or ADCUTFORGE_SCRIPT, "
-            "or switch PROCESSOR_MODE=ffmpeg-copy."
-        )
-
-    input_path = Path(str(payload["input_path"])).resolve()
-    output_path = Path(str(payload["output_path"])).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    job_artifacts_dir = ARTIFACTS_DIR / job_id
-    job_artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    backend = str(payload.get("backend", "openai-whisper")).strip().lower()
-    if backend not in ("whisper", "openai-whisper"):
-        backend = "openai-whisper"
-
-    command = [
-        ADCUTFORGE_PYTHON,
-        "-u",
-        str(script),
-        "--cli",
-        "--overwrite",
-        "--backend",
-        backend,
-        "--artifacts-dir",
-        str(job_artifacts_dir),
-    ]
-
-    detection_mode = str(payload.get("detection_mode", "")).strip().lower()
-    if detection_mode in ("local", "hybrid", "openai"):
-        command.extend(["--detection-mode", detection_mode])
-
-    openai_key = str(payload.get("openai_api_key", "")).strip() or OPENAI_API_KEY
-    if openai_key:
-        command.extend(["--openai-api-key", openai_key])
-
-    openai_model = str(payload.get("openai_model", "")).strip()
-    if openai_model:
-        command.extend(["--openai-model", openai_model])
-
-    command.append(str(input_path))
-    command_cwd = Path(ADCUTFORGE_ROOT).resolve() if ADCUTFORGE_ROOT else script.parent
-
-    current_progress = 40.0
-
-    def on_line(line: str) -> None:
-        nonlocal current_progress
-        mapped = current_progress
-        match = PROGRESS_RE.search(line)
-        if match:
-            try:
-                raw = max(0.0, min(100.0, float(match.group(1))))
-                mapped = 35.0 + (raw / 100.0) * 60.0
-            except ValueError:
-                mapped = current_progress
-        current_progress = max(current_progress, mapped)
-        emit_runtime_update(job_id, logs_list, current_progress, line)
-
-    emit_runtime_update(job_id, logs_list, 40.0, "40% Running AdCutForge")
-    exit_code, logs, edited_audio = run_command(command, cwd=command_cwd, on_line=on_line)
-    if exit_code != 0:
-        lines = [line.strip() for line in logs.strip().splitlines() if line.strip()]
-        detail = next(
-            (
-                line
-                for line in lines
-                if "selected, but" in line.lower()
-                or "not available" in line.lower()
-                or "not installed" in line.lower()
-                or "no openai api key" in line.lower()
-                or "failed" in line.lower()
-            ),
-            lines[-1] if lines else "",
-        )
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"AdCutForge failed with exit code {exit_code}{suffix}")
-
-    rendered = find_rendered_audio(input_path, edited_audio)
-    if rendered is None:
-        raise RuntimeError("AdCutForge did not report a rendered audio output")
-
-    emit_runtime_update(job_id, logs_list, 95.0, "95% Finalizing processed output")
-    shutil.copy2(rendered, output_path)
-
-    transcript_path: Optional[str] = None
-    timestamps_path: Optional[str] = None
-    transcript_candidate = job_artifacts_dir / "transcript.txt"
-    if transcript_candidate.exists():
-        transcript_path = str(transcript_candidate)
-    else:
-        transcript_candidate = job_artifacts_dir / "transcript_timestamped.txt"
-        if transcript_candidate.exists():
-            transcript_path = str(transcript_candidate)
-
-    timestamps_candidate = job_artifacts_dir / "timestamps.json"
-    if timestamps_candidate.exists():
-        timestamps_path = str(timestamps_candidate)
-
-    return str(output_path), logs, timestamps_path, transcript_path
-
-
 def process_job_file(queue_file: Path) -> None:
     try:
         payload = json.loads(queue_file.read_text(encoding="utf-8"))
@@ -761,20 +546,11 @@ def process_job_file(queue_file: Path) -> None:
     try:
         prune_expired_source_cache()
         if not is_tunnel_backend(backend):
-            emit_runtime_update(job_id, logs_list, 8.0, "8% Preparing source audio")
-            prepare_input_audio(job_id, payload, logs_list)
+            raise RuntimeError("Ad removal requires the Windows tunnel processor. No server-side fallback is available.")
 
         transcript_path: Optional[str] = None
         timestamps_path: Optional[str] = None
-        if PROCESSOR_MODE == "adcutforge":
-            if is_tunnel_backend(backend):
-                output_path, _, timestamps_path, transcript_path = run_tunnel_processor(job_id, payload, logs_list)
-            else:
-                output_path, _, timestamps_path, transcript_path = run_adcutforge(job_id, payload, logs_list)
-        elif PROCESSOR_MODE == "ffmpeg-copy":
-            output_path, _ = run_ffmpeg_copy(job_id, payload, logs_list)
-        else:
-            raise RuntimeError("Unsupported PROCESSOR_MODE. Use adcutforge or ffmpeg-copy.")
+        output_path, _, timestamps_path, transcript_path = run_tunnel_processor(job_id, payload, logs_list)
 
         finished_at = time.time()
         duration_seconds = save_job_stats(job_id, payload, started_at, finished_at)
@@ -826,7 +602,7 @@ def main() -> None:
     prune_old_outputs()
     print(
         "[worker] Starting with "
-        f"mode={PROCESSOR_MODE}, queue={QUEUE_DIR}, output={OUTPUT_DIR}, cache={SOURCE_CACHE_DIR}"
+        f"mode={PROCESSOR_LABEL}, queue={QUEUE_DIR}, output={OUTPUT_DIR}, cache={SOURCE_CACHE_DIR}"
     )
     write_heartbeat("started")
 

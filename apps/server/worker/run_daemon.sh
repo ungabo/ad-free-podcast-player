@@ -19,11 +19,6 @@ if [ -f "$STACK_ROOT/.env" ]; then
   . "$STACK_ROOT/.env"
   set +a
 fi
-export FFMPEG_BIN="${FFMPEG_BIN:-$STACK_ROOT/runtime/bin/ffmpeg}"
-export FFPROBE_BIN="${FFPROBE_BIN:-$STACK_ROOT/runtime/bin/ffprobe}"
-export PROCESSOR_MODE="${PROCESSOR_MODE:-adcutforge}"
-export ADCUTFORGE_ROOT="${ADCUTFORGE_ROOT:-$STACK_ROOT/adcutforge}"
-export ADCUTFORGE_PYTHON="${ADCUTFORGE_PYTHON:-/usr/bin/python3}"
 export ADCUTFORGE_CACHE_DIR="${ADCUTFORGE_CACHE_DIR:-$STORAGE_ROOT/adcutforge-cache}"
 export LOCAL_PROCESSOR_BASE_URL="${LOCAL_PROCESSOR_BASE_URL:-http://127.0.0.1:8081/adfree-api}"
 export LOCAL_PROCESSOR_TIMEOUT_SECONDS="${LOCAL_PROCESSOR_TIMEOUT_SECONDS:-14400}"
