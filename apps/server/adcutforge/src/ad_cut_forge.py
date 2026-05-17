@@ -16,8 +16,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -188,13 +190,15 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
                 os.remove(chunk_path)
             except OSError:
                 pass
+            print(f"Parakeet completed chunk {chunk_index + 1}/{chunk_count}", flush=True)
             continue
         try:
             outputs = model.transcribe([chunk_path], timestamps=True)
-            if not outputs:
-                continue
-            item = outputs[0]
-            chunk_segments, chunk_text = segments_from_item(item, start_seconds, end_seconds)
+            if outputs:
+                item = outputs[0]
+                chunk_segments, chunk_text = segments_from_item(item, start_seconds, end_seconds)
+            else:
+                chunk_segments, chunk_text = [], ""
         except torch.OutOfMemoryError as exc:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -212,6 +216,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        print(f"Parakeet completed chunk {chunk_index + 1}/{chunk_count}", flush=True)
 
 for index, segment in enumerate(segments):
     segment["index"] = index
@@ -363,6 +368,38 @@ def load_parakeet_segments(json_path: Path) -> list[Segment]:
     return segments
 
 
+def format_compact_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def parakeet_wav_plan(wav_path: Path, chunk_seconds: float) -> tuple[float, int]:
+    with wave.open(str(wav_path), "rb") as wav:
+        frame_rate = wav.getframerate()
+        frame_count = wav.getnframes()
+    duration = frame_count / frame_rate if frame_rate else 0.0
+    chunk_frames = max(1, int(frame_rate * chunk_seconds)) if frame_rate else 1
+    chunk_ranges = []
+    cursor = 0
+    while cursor < frame_count:
+        end = min(cursor + chunk_frames, frame_count)
+        chunk_ranges.append((cursor, end))
+        cursor = end
+    min_tail_frames = int(frame_rate * 15)
+    if len(chunk_ranges) > 1 and (chunk_ranges[-1][1] - chunk_ranges[-1][0]) < min_tail_frames:
+        previous_start, _previous_end = chunk_ranges[-2]
+        chunk_ranges[-2] = (previous_start, frame_count)
+        chunk_ranges.pop()
+    return duration, max(1, len(chunk_ranges))
+
+
 def transcribe_parakeet(
     ffmpeg_bin: str,
     input_file: Path,
@@ -417,8 +454,17 @@ def transcribe_parakeet(
         env.setdefault("PARAKEET_CHUNK_SECONDS", "30")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUNBUFFERED", "1")
+        try:
+            chunk_seconds = max(15.0, float(env.get("PARAKEET_CHUNK_SECONDS", "30")))
+        except ValueError:
+            chunk_seconds = 30.0
+        audio_duration, planned_chunks = parakeet_wav_plan(wav_path, chunk_seconds)
 
-        print("25% Transcribing with Parakeet", flush=True)
+        print(
+            f"25% Transcribing with Parakeet: loading model for "
+            f"{planned_chunks} chunk(s), {format_compact_duration(audio_duration)} audio",
+            flush=True,
+        )
         process = subprocess.Popen(
             [str(python_path), str(runner_path), str(wav_path), str(output_json), model],
             stdout=subprocess.PIPE,
@@ -430,17 +476,34 @@ def transcribe_parakeet(
             bufsize=1,
         )
         assert process.stdout is not None
+        chunk_progress_started_at: float | None = None
         for raw_line in process.stdout:
             line = raw_line.strip()
             if not line:
                 continue
             print(line, flush=True)
-            match = re.search(r"Parakeet chunk\s+(\d+)/(\d+)", line)
-            if match:
-                current = int(match.group(1))
-                total = max(1, int(match.group(2)))
+            completed_match = re.search(r"Parakeet completed chunk\s+(\d+)/(\d+)", line)
+            if completed_match:
+                current = int(completed_match.group(1))
+                total = max(1, int(completed_match.group(2)))
+                if chunk_progress_started_at is None:
+                    chunk_progress_started_at = time.monotonic()
+                progress = min(60.0, 25.0 + (current / total * 35.0))
+                eta = ""
+                if current > 0 and current < total:
+                    elapsed = max(0.1, time.monotonic() - chunk_progress_started_at)
+                    remaining = (elapsed / current) * (total - current)
+                    eta = f"; about {format_compact_duration(remaining)} left"
+                print(f"{progress:.0f}% Parakeet transcribed {current}/{total} chunks{eta}", flush=True)
+                continue
+            started_match = re.search(r"Parakeet chunk\s+(\d+)/(\d+)", line)
+            if started_match:
+                current = int(started_match.group(1))
+                total = max(1, int(started_match.group(2)))
+                if chunk_progress_started_at is None:
+                    chunk_progress_started_at = time.monotonic()
                 progress = min(60.0, 25.0 + ((current - 1) / total * 35.0))
-                print(f"{progress:.0f}% Parakeet chunk {current}/{total}", flush=True)
+                print(f"{progress:.0f}% Parakeet transcribing chunk {current}/{total}", flush=True)
         exit_code = process.wait()
         if exit_code != 0:
             raise RuntimeError(f"Parakeet transcription failed with exit code {exit_code}.")
