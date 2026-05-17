@@ -16,6 +16,7 @@ const GPT_ONLY_CACHE_EPOCH = '2026-05-16T23:50:00+00:00';
 const WORKER_HEARTBEAT_FRESH_SECONDS = 20;
 const STALE_JOB_GRACE_SECONDS = 300;
 const RUNNING_JOB_HARD_TIMEOUT_SECONDS = 21600;
+const PODCAST_EPISODE_LOOKUP_LIMIT = 200;
 
 $config = loadConfig();
 ensureDirectory($config['storage_root']);
@@ -279,7 +280,7 @@ function getPodcastEpisodes(): void
         throw new RuntimeException('collection_id must be numeric.');
     }
 
-    $url = 'https://itunes.apple.com/lookup?id=' . rawurlencode($collectionId) . '&entity=podcastEpisode&limit=30';
+    $url = 'https://itunes.apple.com/lookup?id=' . rawurlencode($collectionId) . '&entity=podcastEpisode&limit=' . PODCAST_EPISODE_LOOKUP_LIMIT;
     $payload = fetchRemoteJson($url, ['itunes.apple.com']);
     $results = $payload['results'] ?? [];
     if (is_array($results)) {

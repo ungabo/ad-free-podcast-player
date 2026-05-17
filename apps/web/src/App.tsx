@@ -20,6 +20,7 @@ const JOB_STATUS_TRANSIENT_RETRIES = 12
 
 const SEARCH_CACHE_TTL = 12 * 60 * 60 * 1000
 const EPISODE_CACHE_TTL = 12 * 60 * 60 * 1000
+const EPISODE_CACHE_VERSION = 2
 const EPISODE_PAGE_SIZE = 40
 
 function getSearchCache(term: string): PodcastResult[] | null {
@@ -45,7 +46,8 @@ function getEpisodeCache(collectionId: number): EpisodeResult[] | null {
   try {
     const raw = window.localStorage.getItem(`adfree-episodes:${collectionId}`)
     if (!raw) return null
-    const { ts, data } = JSON.parse(raw) as { ts: number; data: EpisodeResult[] }
+    const { ts, data, version } = JSON.parse(raw) as { ts: number; data: EpisodeResult[]; version?: number }
+    if (version !== EPISODE_CACHE_VERSION) return null
     if (Date.now() - ts > EPISODE_CACHE_TTL) return null
     return data
   } catch { return null }
@@ -55,7 +57,7 @@ function setEpisodeCache(collectionId: number, data: EpisodeResult[]): void {
   try {
     window.localStorage.setItem(
       `adfree-episodes:${collectionId}`,
-      JSON.stringify({ ts: Date.now(), data })
+      JSON.stringify({ ts: Date.now(), version: EPISODE_CACHE_VERSION, data })
     )
   } catch { /* ignore quota errors */ }
 }
@@ -1391,7 +1393,7 @@ function App() {
               )
             })}
           </div>
-          {episodes.length > EPISODE_PAGE_SIZE ? (
+          {episodes.length > 0 ? (
             <>
               <div className="episode-pagination">
                 <button
