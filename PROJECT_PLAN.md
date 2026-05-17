@@ -32,7 +32,7 @@ The long-term target is:
 
 ### Ad Removal Engine
 - Python-based AdCutForge remains the processing engine
-- Parakeet / Whisper / OpenAI Whisper support stays behind one local job contract
+- Parakeet transcription plus OpenAI GPT detection is the only supported job contract
 
 ## What Is Already Done
 

@@ -2065,10 +2065,6 @@ public class MainActivity extends Activity {
         queueAdRemoval(e, isRefresh);
     }
 
-    private String engineLabel(String engine) {
-        return "Windows tunnel OpenAI Whisper";
-    }
-
     private void runAndroidAdRemoval(String episodeId) {
         adCancelled.set(false);
         Db localDb = db;

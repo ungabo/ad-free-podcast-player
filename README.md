@@ -51,8 +51,8 @@ ad-free-podcast-player/
 - **Language**: Java
 - **UI Framework**: Android native (Material Design)
 - **Audio**: Media3 Transformer for export
-- **Transcription**: OpenAI Whisper API
-- **Ad Detection**: Python-based processing via local service
+- **Transcription**: Parakeet on the Windows processor
+- **Ad Detection**: OpenAI GPT via the server/Windows processor
 - **State**: SQLite database
 
 ### Web Server
@@ -63,7 +63,8 @@ ad-free-podcast-player/
 
 ### Shared
 - **Ad Removal Engine**: Python (`ad_cut_forge.py`)
-- **Transcription**: OpenAI Whisper API
+- **Transcription**: Parakeet only
+- **Ad Detection**: OpenAI GPT only
 - **RSS Parsing**: Standard feed format support
 
 ## Development Setup
@@ -179,7 +180,7 @@ The ad removal feature is designed for personal use on podcasts you own or have 
 **Use responsibly and legally.**
 
 ### Python Ad Removal Engine
-Based on `ad_cut_forge.py` from the separate podcast ad remover project. Uses OpenAI Whisper API for transcription and ad detection.
+Based on `ad_cut_forge.py` from the separate podcast ad remover project. Uses Parakeet for transcription and OpenAI GPT for ad detection.
 
 ## Contributing
 

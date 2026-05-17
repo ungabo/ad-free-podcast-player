@@ -45,17 +45,6 @@ export function resolveDefaultSettings(platform: AppPlatform): ProcessingSetting
   return DEFAULT_SETTINGS;
 }
 
-export function resolveBackendWithFallback(
-  requested: TranscriptionBackend,
-  capabilities: { parakeetAvailable: boolean },
-): TranscriptionBackend {
-  if (requested === 'parakeet' && capabilities.parakeetAvailable) {
-    return 'parakeet';
-  }
-
-  throw new Error('Parakeet transcription is required. No alternate transcription backend is available.');
-}
-
 export interface AdRange {
   start: number;
   end: number;
