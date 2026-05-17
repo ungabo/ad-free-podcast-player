@@ -92,9 +92,9 @@ public class MainActivity extends Activity {
     private static final int SOFT_BLUE = 0xffeaf3ff;
     private static final int SOFT_GREEN = 0xffeaf8f2;
     private static final int SOFT_RED = 0xffffedf1;
-    private static final String ENGINE_TUNNEL_OPENAI_WHISPER = "tunnel_openai_whisper";
-    private static final String DEFAULT_TRANSCRIPTION_ENGINE = ENGINE_TUNNEL_OPENAI_WHISPER;
-    private static final String BACKEND_DEFAULT_VERSION = "3";
+    private static final String ENGINE_TUNNEL_PARAKEET = "tunnel_parakeet";
+    private static final String DEFAULT_TRANSCRIPTION_ENGINE = ENGINE_TUNNEL_PARAKEET;
+    private static final String BACKEND_DEFAULT_VERSION = "4";
     private static final String DEFAULT_OPENAI_MODEL = "gpt-5.5";
     private static final String CURRENT_AD_API_HOST = "adsbegone.sitesindevelopment.com";
     private static final String LEGACY_AD_API_HOST = "agitated-engelbart.74-208-203-194.plesk.page";
@@ -581,14 +581,14 @@ public class MainActivity extends Activity {
             db.setSetting("backend_default_version", BACKEND_DEFAULT_VERSION);
         }
         String engine = db.setting("transcription_engine", "");
-        if (!ENGINE_TUNNEL_OPENAI_WHISPER.equals(engine)) {
+        if (!ENGINE_TUNNEL_PARAKEET.equals(engine)) {
             db.setSetting("transcription_engine", DEFAULT_TRANSCRIPTION_ENGINE);
         }
         if (TextUtils.isEmpty(db.setting("display_timezone", "").trim())) {
             db.setSetting("display_timezone", "America/New_York");
         }
         String openAiModel = db.setting("openai_model", "").trim();
-        if (TextUtils.isEmpty(openAiModel) || "whisper-1".equalsIgnoreCase(openAiModel)) {
+        if (TextUtils.isEmpty(openAiModel) || !openAiModel.toLowerCase(Locale.US).startsWith("gpt-")) {
             db.setSetting("openai_model", DEFAULT_OPENAI_MODEL);
         }
     }
@@ -649,6 +649,11 @@ public class MainActivity extends Activity {
         ArrayList<Episode> progress = db.episodesByStatus("in_progress", 8);
         if (progress.isEmpty()) root.addView(emptyState("Nothing in progress yet."));
         for (Episode e : progress) root.addView(episodeRow(e, true, false, true));
+        section("Queued & Processing");
+        LinearLayout serverQueueContainer = new LinearLayout(this);
+        serverQueueContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(serverQueueContainer);
+        loadRemoteQueueForHome(serverQueueContainer);
         section("Saved Episodes");
         ArrayList<Episode> saved = db.savedEpisodes(20);
         if (saved.isEmpty()) root.addView(emptyState("Save episodes to build a metadata-only playlist."));
@@ -752,6 +757,113 @@ public class MainActivity extends Activity {
         if (shown == 0) {
             root.addView(emptyState("The server did not return any completed episodes with downloadable audio."));
         }
+    }
+
+    private void loadRemoteQueueForHome(LinearLayout container) {
+        if (container == null) return;
+        container.removeAllViews();
+        container.addView(text("Loading current conversion queue...", 13, MUTED, false));
+        String apiBase = apiBaseUrlSetting(db);
+        io.execute(() -> {
+            try {
+                JSONObject parsed = fetchApiJsonWithFallback(apiBase, "/api/jobs?status=queued,running&limit=20", "Server queue failed", "server conversion queue");
+                JSONArray jobs = parsed.optJSONArray("jobs");
+                ArrayList<JSONObject> sorted = sortJobsByQueueTime(jobs == null ? new JSONArray() : jobs);
+                postUi(() -> {
+                    if (container.getParent() == null) return;
+                    container.removeAllViews();
+                    if (sorted.isEmpty()) {
+                        container.addView(emptyState("No queued or processing conversions right now."));
+                        return;
+                    }
+                    for (JSONObject job : sorted) {
+                        if (job == null) continue;
+                        String jobId = job.optString("job_id", "");
+                        if (TextUtils.isEmpty(jobId)) continue;
+                        String status = job.optString("status", "").trim().toLowerCase(Locale.US);
+                        if (TextUtils.isEmpty(status)) status = "queued";
+                        String progress = String.format(Locale.US, "%d", Math.max(0, (int) Math.round(job.optDouble("progress", 0.0))));
+                        String episodeTitle = cleanRemoteEpisodeTitle(job.optString("episode_title", ""));
+                        if (TextUtils.isEmpty(episodeTitle)) episodeTitle = readableJobTitle(job);
+                        String podcastName = cleanRemotePodcastName(job.optString("podcast_name", ""));
+                        String backend = TextUtils.isEmpty(job.optString("backend", "")) ? "server" : job.optString("backend", "");
+                        String when = displayDateTimeForJob(job);
+
+                        LinearLayout item = compactRow();
+                        item.setPadding(0, dp(8), 0, dp(8));
+                        item.setClickable(true);
+                        final String statusForClick = status;
+                        item.setOnClickListener(v -> {
+                            String id = cleanJobId(jobId);
+                            if (!TextUtils.isEmpty(id)) setStatus("Job " + id + " is in " + statusForClick + ".");
+                        });
+                        TextView statusLine = text(capitalizeFirst(status) + "  |  " + progress + "%", 11, statusColor(status), true);
+                        statusLine.setEllipsize(TextUtils.TruncateAt.END);
+                        item.addView(statusLine);
+                        if (!TextUtils.isEmpty(podcastName)) item.addView(text(podcastName, 11, MUTED, true));
+                        item.addView(text(TextUtils.isEmpty(episodeTitle) ? "Episode in queue" : episodeTitle, 14, INK, true));
+                        String meta = "Job " + cleanJobId(jobId) + "  |  " + backend;
+                        if (!TextUtils.isEmpty(when)) meta = meta + "  |  " + when;
+                        item.addView(text(meta, 11, MUTED, false));
+                        container.addView(item);
+                    }
+                });
+            } catch (Exception ex) {
+                final String message = TextUtils.isEmpty(ex.getMessage()) ? "Could not load queued conversions." : ex.getMessage();
+                postUi(() -> {
+                    if (container.getParent() == null) return;
+                    container.removeAllViews();
+                    container.addView(emptyState(message));
+                });
+            }
+        });
+    }
+
+    private ArrayList<JSONObject> sortJobsByQueueTime(JSONArray jobs) {
+        ArrayList<JSONObject> out = new ArrayList<>();
+        for (int i = 0; i < jobs.length(); i++) {
+            JSONObject job = jobs.optJSONObject(i);
+            if (job != null) out.add(job);
+        }
+        Collections.sort(out, (a, b) -> Long.compare(jobQueueMillis(b), jobQueueMillis(a)));
+        return out;
+    }
+
+    private long jobQueueMillis(JSONObject job) {
+        Date parsed = parseFeedOrIsoDate(jobQueueTime(job));
+        return parsed == null ? 0L : parsed.getTime();
+    }
+
+    private String jobQueueTime(JSONObject job) {
+        if (job == null) return "";
+        String raw = job.optString("started_at", "");
+        if (TextUtils.isEmpty(raw)) raw = job.optString("updated_at", "");
+        if (TextUtils.isEmpty(raw)) raw = job.optString("created_at", "");
+        return raw;
+    }
+
+    private String displayDateTimeForJob(JSONObject job) {
+        String raw = jobQueueTime(job);
+        if (TextUtils.isEmpty(raw)) return "";
+        Date parsed = parseFeedOrIsoDate(raw);
+        return parsed == null ? "" : displayDateTime(parsed);
+    }
+
+    private String cleanJobId(String jobId) {
+        if (TextUtils.isEmpty(jobId)) return "";
+        return jobId.substring(0, Math.min(8, jobId.length()));
+    }
+
+    private int statusColor(String status) {
+        if ("running".equalsIgnoreCase(status)) return TEAL;
+        if ("queued".equalsIgnoreCase(status)) return CORAL;
+        return TEAL;
+    }
+
+    private String capitalizeFirst(String value) {
+        if (TextUtils.isEmpty(value)) return "";
+        if (value.length() == 1) return value.toUpperCase(Locale.US);
+        return value.substring(0, 1).toUpperCase(Locale.US) + value.substring(1);
     }
 
     private ArrayList<JSONObject> sortedRemoteJobs(JSONArray jobs) {
@@ -2054,7 +2166,7 @@ public class MainActivity extends Activity {
     }
 
     private String apiBackendForEngine() {
-        return "tunnel-openai-whisper";
+        return "tunnel-parakeet";
     }
 
     private String apiDetectionModeForEngine() {

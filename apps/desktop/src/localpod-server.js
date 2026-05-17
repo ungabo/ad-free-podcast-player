@@ -8,7 +8,16 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.woff2': 'font/woff2',
 };
+
+const REMOTE_API_BASE = 'https://adsbegone.sitesindevelopment.com/adfree-api';
 
 function safeFilename(value) {
   const base = String(value || 'podcast-episode')
@@ -206,6 +215,55 @@ async function streamRemote(req, res, target, disposition) {
   }
 }
 
+async function proxyRemoteApi(req, res, requestUrl) {
+  const apiPath = requestUrl.pathname.replace(/^\/adfree-api/, '') || '/';
+  const targetUrl = `${REMOTE_API_BASE}${apiPath}${requestUrl.search}`;
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (!value) continue;
+    const lower = key.toLowerCase();
+    if (['host', 'connection', 'content-length'].includes(lower)) continue;
+    headers[key] = Array.isArray(value) ? value.join(', ') : value;
+  }
+
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const method = req.method || 'GET';
+  const response = await fetch(targetUrl, {
+    method,
+    redirect: 'manual',
+    headers,
+    body: ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : Buffer.concat(chunks),
+  });
+
+  const outgoing = {
+    'access-control-allow-origin': '*',
+    'cache-control': response.headers.get('cache-control') || 'no-store',
+    'content-type': response.headers.get('content-type') || 'application/octet-stream',
+  };
+  for (const key of ['location', 'content-disposition']) {
+    const value = response.headers.get(key);
+    if (value) outgoing[key] = value;
+  }
+
+  res.writeHead(response.status, outgoing);
+  if (!response.body) {
+    res.end();
+    return;
+  }
+
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+  } finally {
+    res.end();
+  }
+}
+
 function streamLocalFile(req, res, filePath) {
   const stat = fs.statSync(filePath);
   const total = stat.size;
@@ -330,6 +388,11 @@ function startLocalPodServer({ publicDir, offlineDir, port = 0, host = '127.0.0.
     const server = http.createServer(async (req, res) => {
       const requestUrl = new URL(req.url, `http://${req.headers.host}`);
       try {
+        if (requestUrl.pathname === '/adfree-api' || requestUrl.pathname.startsWith('/adfree-api/')) {
+          await proxyRemoteApi(req, res, requestUrl);
+          return;
+        }
+
         if (requestUrl.pathname === '/api/search') {
           const term = requestUrl.searchParams.get('term') || '';
           const limit = requestUrl.searchParams.get('limit') || '25';

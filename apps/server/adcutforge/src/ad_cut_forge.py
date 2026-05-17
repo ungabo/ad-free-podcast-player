@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,212 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[2]
 BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
 BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
+
+PARAKEET_SCRIPT = r"""
+import audioop
+import json
+import os
+import sys
+import tempfile
+import wave
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+audio_path, output_path, model_name = sys.argv[1], sys.argv[2], sys.argv[3]
+chunk_seconds = max(15.0, float(os.environ.get("PARAKEET_CHUNK_SECONDS", "30")))
+
+try:
+    import torch
+    import nemo.collections.asr as nemo_asr
+except Exception as exc:
+    raise SystemExit(
+        "Parakeet backend needs PyTorch and NVIDIA NeMo in this Python environment. "
+        "Install with: pip install -U torch torchaudio nemo_toolkit[asr]\n"
+        f"Import error: {exc}"
+    )
+
+
+def pick(mapping, *names):
+    for name in names:
+        if isinstance(mapping, dict) and name in mapping:
+            return mapping[name]
+        if hasattr(mapping, name):
+            return getattr(mapping, name)
+    return None
+
+
+def format_seconds(seconds):
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def item_text(item):
+    text = getattr(item, "text", None)
+    if text is None and isinstance(item, dict):
+        text = item.get("text")
+    return "" if text is None else str(text)
+
+
+def item_timestamps(item):
+    timestamps = getattr(item, "timestamp", None)
+    if timestamps is None and isinstance(item, dict):
+        timestamps = item.get("timestamp")
+    if timestamps is None:
+        timestep = getattr(item, "timestep", None)
+        if timestep is not None:
+            timestamps = timestep
+    return timestamps or {}
+
+
+def segments_from_item(item, offset, fallback_end):
+    text = item_text(item).strip()
+    timestamps = item_timestamps(item)
+    raw_segments = timestamps.get("segment") or timestamps.get("segments") or []
+    raw_words = timestamps.get("word") or timestamps.get("words") or []
+
+    out = []
+    for seg in raw_segments:
+        start = pick(seg, "start", "start_time", "start_offset")
+        end = pick(seg, "end", "end_time", "end_offset")
+        seg_text = pick(seg, "segment", "text", "word")
+        if start is None or end is None:
+            continue
+        out.append(
+            {
+                "start": offset + float(start),
+                "end": offset + float(end),
+                "text": str(seg_text or "").strip(),
+            }
+        )
+
+    if not out and raw_words:
+        current = []
+        start = None
+        end = None
+        for word in raw_words:
+            word_start = pick(word, "start", "start_time", "start_offset")
+            word_end = pick(word, "end", "end_time", "end_offset")
+            word_text = pick(word, "word", "text")
+            if word_start is None or word_end is None:
+                continue
+            if start is None:
+                start = offset + float(word_start)
+            end = offset + float(word_end)
+            current.append(str(word_text or "").strip())
+            joined = " ".join(part for part in current if part)
+            if len(joined) >= 220 or joined.endswith((".", "?", "!")):
+                out.append({"start": start, "end": end, "text": joined})
+                current = []
+                start = None
+                end = None
+        if current and start is not None and end is not None:
+            out.append({"start": start, "end": end, "text": " ".join(current)})
+
+    if not out and text:
+        out.append({"start": offset, "end": fallback_end, "text": text})
+    return out, text
+
+
+def write_chunk(source, target, start_frame, frame_count):
+    with wave.open(source, "rb") as reader:
+        params = reader.getparams()
+        reader.setpos(start_frame)
+        frames = reader.readframes(frame_count)
+    with wave.open(target, "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(frames)
+    return audioop.rms(frames, params.sampwidth) if frames else 0
+
+
+model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
+if torch.cuda.is_available():
+    model = model.to("cuda")
+model.eval()
+
+with wave.open(audio_path, "rb") as wav:
+    frame_rate = wav.getframerate()
+    frame_count = wav.getnframes()
+duration = frame_count / frame_rate if frame_rate else 0.0
+chunk_frames = max(1, int(frame_rate * chunk_seconds))
+chunk_ranges = []
+cursor = 0
+while cursor < frame_count:
+    end = min(cursor + chunk_frames, frame_count)
+    chunk_ranges.append((cursor, end))
+    cursor = end
+min_tail_frames = int(frame_rate * 15)
+if len(chunk_ranges) > 1 and (chunk_ranges[-1][1] - chunk_ranges[-1][0]) < min_tail_frames:
+    previous_start, _previous_end = chunk_ranges[-2]
+    chunk_ranges[-2] = (previous_start, frame_count)
+    chunk_ranges.pop()
+chunk_count = max(1, len(chunk_ranges))
+
+segments = []
+texts = []
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+    for chunk_index, (start_frame, end_frame) in enumerate(chunk_ranges):
+        frames_this_chunk = end_frame - start_frame
+        start_seconds = start_frame / frame_rate
+        end_seconds = (start_frame + frames_this_chunk) / frame_rate
+        chunk_path = os.path.join(temp_dir, f"chunk-{chunk_index:04d}.wav")
+        rms = write_chunk(audio_path, chunk_path, start_frame, frames_this_chunk)
+        print(
+            f"Parakeet chunk {chunk_index + 1}/{chunk_count}: "
+            f"{format_seconds(start_seconds)}-{format_seconds(end_seconds)}",
+            flush=True,
+        )
+        if rms < 20:
+            print(f"Skipping near-silent chunk {chunk_index + 1}/{chunk_count}", flush=True)
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
+            continue
+        try:
+            outputs = model.transcribe([chunk_path], timestamps=True)
+            if not outputs:
+                continue
+            item = outputs[0]
+            chunk_segments, chunk_text = segments_from_item(item, start_seconds, end_seconds)
+        except torch.OutOfMemoryError as exc:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise SystemExit(
+                "Parakeet ran out of GPU memory while processing a chunk. "
+                "Close other GPU-heavy apps or lower PARAKEET_CHUNK_SECONDS. "
+                f"Original error: {exc}"
+            )
+        segments.extend(chunk_segments)
+        if chunk_text.strip():
+            texts.append(chunk_text.strip())
+        try:
+            os.remove(chunk_path)
+        except OSError:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+for index, segment in enumerate(segments):
+    segment["index"] = index
+
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "backend": "parakeet",
+            "model": model_name,
+            "chunk_seconds": chunk_seconds,
+            "duration": duration,
+            "text": " ".join(texts),
+            "segments": segments,
+        },
+        handle,
+        indent=2,
+    )
+"""
 
 
 @dataclass(frozen=True)
@@ -66,10 +273,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Headless AdCutForge-compatible CLI")
     parser.add_argument("--cli", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--backend", default="openai-whisper")
+    parser.add_argument("--backend", default="parakeet")
     parser.add_argument("--detection-mode", default="openai")
     parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY", ""))
     parser.add_argument("--openai-model", default="gpt-5.5")
+    parser.add_argument("--parakeet-python", default="")
+    parser.add_argument("--parakeet-model", default="nvidia/parakeet-tdt-0.6b-v3")
     parser.add_argument("--artifacts-dir", default="")
     parser.add_argument("input_file")
     return parser.parse_args()
@@ -129,50 +338,52 @@ def serialize_segments(segments: list[Segment]) -> list[dict[str, float | int | 
     return [segment.__dict__ for segment in segments]
 
 
-def parse_openai_segments(transcript: object, chunk_duration: float) -> list[dict[str, float | str]]:
-    raw_segments = getattr(transcript, "segments", None)
-    if raw_segments is None and isinstance(transcript, dict):
-        raw_segments = transcript.get("segments")
-
-    parsed: list[dict[str, float | str]] = []
-    for raw in raw_segments or []:
-        text = str(getattr(raw, "text", raw.get("text", "") if isinstance(raw, dict) else "")).strip()
-        start = float(getattr(raw, "start", raw.get("start", 0.0) if isinstance(raw, dict) else 0.0))
-        end = float(getattr(raw, "end", raw.get("end", start) if isinstance(raw, dict) else start))
-        if text:
-            parsed.append({"start": start, "end": end, "text": text})
-
-    if not parsed:
-        text = str(getattr(transcript, "text", "") if not isinstance(transcript, dict) else transcript.get("text", "")).strip()
-        if text:
-            parsed.append({"start": 0.0, "end": chunk_duration, "text": text})
-
-    return parsed
+def clean_segment_text(text: str) -> str:
+    text = text.replace("\ufeff", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\[(?:BLANK_AUDIO|MUSIC|SILENCE|NOISE|APPLAUSE)\]", "", text, flags=re.I)
+    text = re.sub(r"\((?:music|silence|noise|applause)\)", "", text, flags=re.I)
+    return text.strip()
 
 
-def transcribe_openai(
-    ffmpeg_bin: str,
-    ffprobe_bin: str,
-    input_file: Path,
-    api_key: str,
-    artifacts_dir: Path,
-    prefix: str = "source",
-) -> list[Segment]:
-    try:
-        from openai import OpenAI
-    except Exception as exc:
-        raise RuntimeError("OpenAI Python package is not available on the server.") from exc
-
-    client = OpenAI(api_key=api_key)
+def load_parakeet_segments(json_path: Path) -> list[Segment]:
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    raw_segments = data.get("segments") if isinstance(data, dict) else []
+    if not isinstance(raw_segments, list):
+        raw_segments = []
     segments: list[Segment] = []
-    input_hash = file_sha256(input_file)
-    chunk_seconds = os.getenv("OPENAI_TRANSCRIBE_CHUNK_SECONDS", "120")
-    transcript_cache_dir = cache_root(artifacts_dir) / "transcripts" / "openai-whisper" / input_hash / f"chunk-{chunk_seconds}s"
-    transcript_cache_dir.mkdir(parents=True, exist_ok=True)
+    for fallback_index, raw in enumerate(raw_segments):
+        if not isinstance(raw, dict):
+            continue
+        text = clean_segment_text(str(raw.get("text", "")))
+        start = raw.get("start")
+        end = raw.get("end")
+        if text and isinstance(start, (int, float)) and isinstance(end, (int, float)) and end >= start:
+            segments.append(Segment(int(raw.get("index", fallback_index)), float(start), float(end), text))
+    return segments
 
-    with tempfile.TemporaryDirectory(prefix="adfree-openai-") as temp_dir:
-        chunk_pattern = str(Path(temp_dir) / f"{prefix}-chunk-%03d.mp3")
-        command = [
+
+def transcribe_parakeet(
+    ffmpeg_bin: str,
+    input_file: Path,
+    parakeet_python: str,
+    parakeet_model: str,
+    artifacts_dir: Path,
+) -> list[Segment]:
+    python_path = Path(parakeet_python).expanduser()
+    if not parakeet_python.strip() or not python_path.is_file():
+        raise RuntimeError("Parakeet backend is required, but the Parakeet Python executable was not found.")
+
+    model = parakeet_model.strip() or "nvidia/parakeet-tdt-0.6b-v3"
+    output_json = artifacts_dir / "parakeet.json"
+    with tempfile.TemporaryDirectory(prefix="adfree-parakeet-") as temp_dir:
+        temp_root = Path(temp_dir)
+        wav_path = temp_root / "source.wav"
+        runner_path = temp_root / "parakeet_runner.py"
+        runner_path.write_text(PARAKEET_SCRIPT, encoding="utf-8")
+
+        print("22% Preparing audio for Parakeet", flush=True)
+        result = run_command([
             ffmpeg_bin,
             "-y",
             "-hide_banner",
@@ -185,74 +396,67 @@ def transcribe_openai(
             "1",
             "-ar",
             "16000",
-            "-b:a",
-            "32k",
-            "-f",
-            "segment",
-            "-segment_time",
-            chunk_seconds,
-            "-reset_timestamps",
-            "1",
-            chunk_pattern,
-        ]
-        result = run_command(command)
+            "-c:a",
+            "pcm_s16le",
+            str(wav_path),
+        ])
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ffmpeg chunking failed")
+            raise RuntimeError(result.stderr.strip() or "ffmpeg audio preparation failed")
 
-        offset = 0.0
-        index = 0
-        for chunk_index, chunk in enumerate(sorted(Path(temp_dir).glob(f"{prefix}-chunk-*.mp3"))):
-            chunk_duration = detect_duration_seconds(ffprobe_bin, chunk)
-            if chunk_duration < 0.25 or chunk.stat().st_size < 1024:
-                print(f"Skipping tiny transcript chunk at {offset:.0f}s")
-                offset += max(0.0, chunk_duration)
+        env = os.environ.copy()
+        try:
+            cache_root_path = python_path.parents[1] / "model-cache"
+            cache_root_path.mkdir(parents=True, exist_ok=True)
+            env.setdefault("HF_HOME", str(cache_root_path / "huggingface"))
+            env.setdefault("NEMO_HOME", str(cache_root_path / "nemo"))
+            if (cache_root_path / "huggingface").exists():
+                env.setdefault("HF_HUB_OFFLINE", "1")
+        except IndexError:
+            pass
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        env.setdefault("PARAKEET_CHUNK_SECONDS", "30")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+        print("25% Transcribing with Parakeet", flush=True)
+        process = subprocess.Popen(
+            [str(python_path), str(runner_path), str(wav_path), str(output_json), model],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
                 continue
-            chunk_hash = file_sha256(chunk)
-            cache_file = transcript_cache_dir / f"{chunk_index:04d}-{chunk_hash[:16]}.json"
-            if cache_file.is_file():
-                print(f"Using cached transcript chunk at {offset:.0f}s")
-                cached = json.loads(cache_file.read_text(encoding="utf-8"))
-                parsed_segments = cached.get("segments", []) if isinstance(cached, dict) else []
-            else:
-                print(f"Transcribing chunk at {offset:.0f}s")
-                with chunk.open("rb") as handle:
-                    transcript = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=handle,
-                        response_format="verbose_json",
-                        timestamp_granularities=["segment"],
-                    )
-                parsed_segments = parse_openai_segments(transcript, chunk_duration)
-                cache_file.write_text(
-                    json.dumps(
-                        {
-                            "backend": "openai-whisper",
-                            "chunk_index": chunk_index,
-                            "chunk_hash": chunk_hash,
-                            "duration": chunk_duration,
-                            "segments": parsed_segments,
-                        },
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
+            print(line, flush=True)
+            match = re.search(r"Parakeet chunk\s+(\d+)/(\d+)", line)
+            if match:
+                current = int(match.group(1))
+                total = max(1, int(match.group(2)))
+                progress = min(60.0, 25.0 + ((current - 1) / total * 35.0))
+                print(f"{progress:.0f}% Parakeet chunk {current}/{total}", flush=True)
+        exit_code = process.wait()
+        if exit_code != 0:
+            raise RuntimeError(f"Parakeet transcription failed with exit code {exit_code}.")
 
-            for raw in parsed_segments:
-                text = str(raw.get("text", "")).strip() if isinstance(raw, dict) else ""
-                start = float(raw.get("start", 0.0)) if isinstance(raw, dict) else 0.0
-                end = float(raw.get("end", start)) if isinstance(raw, dict) else start
-                if text:
-                    segments.append(Segment(index=index, start=offset + start, end=offset + end, text=text))
-                    index += 1
-            offset += chunk_duration
+    if not output_json.is_file():
+        raise RuntimeError("Parakeet completed but did not create timestamped JSON.")
 
+    segments = load_parakeet_segments(output_json)
     if not segments:
-        raise RuntimeError("OpenAI transcription returned no timestamped segments.")
-    (artifacts_dir / f"{prefix}.segments.json").write_text(
+        raise RuntimeError("Parakeet returned no timestamped segments.")
+
+    print("60% Finished Parakeet transcription", flush=True)
+    (artifacts_dir / "source.segments.json").write_text(
         json.dumps(serialize_segments(segments), indent=2), encoding="utf-8"
     )
-    if prefix == "source":
-        write_transcripts(segments, artifacts_dir)
+    write_transcripts(segments, artifacts_dir)
     return segments
 
 
@@ -581,14 +785,17 @@ def main() -> int:
         print(f"12% Backend: {args.backend}")
         print(f"18% Detection mode: {mode} (GPT only)")
 
-        if backend == "openai-whisper":
-            if not args.openai_api_key.strip():
-                raise RuntimeError("OpenAI Whisper backend selected, but no OpenAI API key was provided.")
-            print("25% Transcribing with OpenAI Whisper API")
-            segments = transcribe_openai(ffmpeg_bin, ffprobe_bin, input_file, args.openai_api_key.strip(), artifacts_dir)
-            artifact_method = f"openai_whisper_{mode}"
+        if backend == "parakeet":
+            segments = transcribe_parakeet(
+                ffmpeg_bin,
+                input_file,
+                args.parakeet_python.strip(),
+                args.parakeet_model.strip(),
+                artifacts_dir,
+            )
+            artifact_method = f"parakeet_{mode}"
         else:
-            raise RuntimeError("Local Whisper is not installed on this server. Use OpenAI Whisper API.")
+            raise RuntimeError("Parakeet transcription is required. No alternate transcription backend is available.")
 
         print("65% Detecting ad ranges with GPT")
         if not args.openai_api_key.strip():

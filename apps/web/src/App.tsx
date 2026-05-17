@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
 
 const STORAGE_KEY = 'adfree-web-settings'
 const USER_KEY = 'adfree-user-id'
@@ -9,15 +9,17 @@ const isLocalDevHost =
 const API_BASE = (
   import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV && isLocalDevHost ? DEFAULT_REMOTE_API_BASE : '/adfree-api')
 ).replace(/\/$/, '')
-const DEFAULT_BACKEND: Backend = 'tunnel-openai-whisper'
+const DEFAULT_BACKEND: Backend = 'tunnel-parakeet'
 const SETTINGS_VERSION = 2
 const OPENAI_MODEL = 'gpt-5.5'
+const APP_ICON_URL = './app-icon.svg'
 const JOB_POLL_INTERVAL_MS = 5000
 const JOB_SLOW_NOTICE_MS = 10 * 60 * 1000
 const JOB_STATUS_TRANSIENT_RETRIES = 12
 
-const SEARCH_CACHE_TTL = 24 * 60 * 60 * 1000
-const EPISODE_CACHE_TTL = 6 * 60 * 60 * 1000
+const SEARCH_CACHE_TTL = 12 * 60 * 60 * 1000
+const EPISODE_CACHE_TTL = 12 * 60 * 60 * 1000
+const EPISODE_PAGE_SIZE = 40
 
 function getSearchCache(term: string): PodcastResult[] | null {
   try {
@@ -64,7 +66,8 @@ function deferEffect(callback: () => void | Promise<void>): number {
 }
 
 type DetectionMode = 'openai'
-type Backend = 'tunnel-openai-whisper'
+type AppView = 'home' | 'search' | 'jobs' | 'adfree' | 'about'
+type Backend = 'tunnel-parakeet'
 
 type SavedSettings = {
   settingsVersion?: number
@@ -104,7 +107,11 @@ type JobStatusResponse = {
   backend: string
   detection_mode: string
   openai_model: string
+  source_url: string | null
+  episode_title: string | null
+  podcast_name: string | null
   progress: number
+  duration_seconds: number | null
   error_message: string | null
   logs: string | null
   created_at: string
@@ -112,19 +119,14 @@ type JobStatusResponse = {
   started_at: string | null
   finished_at: string | null
   download_url: string | null
-}
-
-type JobRecord = JobStatusResponse & {
-  source_url: string | null
-  episode_title: string | null
-  podcast_name: string | null
-  duration_seconds: number | null
   transcript_url: string | null
   timestamped_transcript_url: string | null
   timestamps_url: string | null
   stats_url: string | null
   user_id: string | null
 }
+
+type JobRecord = JobStatusResponse
 
 type User = {
   id: string
@@ -231,11 +233,11 @@ function isHostOnlyTitle(value: string): boolean {
   return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(text)
 }
 
-function jobDisplayTitle(job: JobRecord): string {
+function jobDisplayTitle(job: Pick<JobStatusResponse, 'episode_title'>): string {
   return cleanJobText(job.episode_title)
 }
 
-function jobDisplayPodcast(job: JobRecord): string {
+function jobDisplayPodcast(job: Pick<JobStatusResponse, 'podcast_name'>): string {
   return cleanJobText(job.podcast_name)
 }
 
@@ -257,6 +259,7 @@ function cleanCompletedJobs(jobs: JobRecord[]): JobRecord[] {
       seen.add(key)
       return true
     })
+    .slice(0, 40)
 }
 
 function sleep(ms: number): Promise<void> {
@@ -268,6 +271,7 @@ function sleep(ms: number): Promise<void> {
 function App() {
   const [detectionMode] = useState<DetectionMode>('openai')
   const [backend] = useState<Backend>(DEFAULT_BACKEND)
+  const [activeView, setActiveView] = useState<AppView>('home')
 
   const [searchTerm, setSearchTerm] = useState('')
   const [isSearching, setIsSearching] = useState(false)
@@ -291,6 +295,8 @@ function App() {
   const [processedAudioUrl, setProcessedAudioUrl] = useState('')
   const [directDownloadUrl, setDirectDownloadUrl] = useState('')
   const [activeJobId, setActiveJobId] = useState<string>(() => window.localStorage.getItem(ACTIVE_JOB_KEY) ?? '')
+  const [episodeJumpValue, setEpisodeJumpValue] = useState('1')
+  const [startNoticeVisible, setStartNoticeVisible] = useState(false)
 
   const [liveJobs, setLiveJobs] = useState<JobRecord[]>([])
   const [completedJobs, setCompletedJobs] = useState<JobRecord[]>([])
@@ -315,6 +321,37 @@ function App() {
 
   const canSubmit = Boolean(activeEpisode && episodePlayableUrl(activeEpisode) && !isSubmitting)
   const windowsBridgeUnavailable = workerStatus?.local_bridge ? !workerStatus.local_bridge.reachable : false
+  const totalEpisodePages = Math.max(1, Math.ceil(episodes.length / EPISODE_PAGE_SIZE))
+  const currentEpisodePage = Math.min(episodePage, totalEpisodePages - 1)
+  const visibleEpisodes = episodes.slice(
+    currentEpisodePage * EPISODE_PAGE_SIZE,
+    currentEpisodePage * EPISODE_PAGE_SIZE + EPISODE_PAGE_SIZE
+  )
+  const isBlockingLoading = isSearching || isLoadingEpisodes || isPreparingPlayback || startNoticeVisible
+  const loadingTitle = startNoticeVisible ? 'Processing started' : isPreparingPlayback ? 'Downloading' : 'Loading'
+  const loadingBody = startNoticeVisible
+    ? "Ad removal can take a while. You'll get a notification when the ad-free version is ready."
+    : isPreparingPlayback
+      ? 'Preparing the ad-free episode for playback.'
+      : 'Loading'
+  const activeJobTitle = jobStatus ? jobDisplayTitle(jobStatus) : ''
+  const activeJobPodcast = jobStatus ? jobDisplayPodcast(jobStatus) : ''
+  const processingTitle = activeJobTitle || activeEpisode?.trackName || ''
+  const processingPodcast = activeJobPodcast || activePodcast?.collectionName || ''
+  const hasProcessingCard = Boolean(jobStatus || isSubmitting || logLines.length > 0)
+
+  function setEpisodePageClamped(page: number): void {
+    setEpisodePage(Math.max(0, Math.min(page, totalEpisodePages - 1)))
+  }
+
+  function jumpToEpisodePage(): void {
+    const cleaned = episodeJumpValue.replace(/\D/g, '')
+    setEpisodeJumpValue(cleaned)
+    if (!cleaned) return
+    const requested = Number.parseInt(cleaned, 10)
+    if (!Number.isFinite(requested)) return
+    setEpisodePageClamped(requested - 1)
+  }
 
   useEffect(() => {
     const payload: SavedSettings = {
@@ -324,6 +361,14 @@ function App() {
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
   }, [detectionMode, backend])
+
+  useEffect(() => {
+    if (episodePage !== currentEpisodePage) {
+      setEpisodePage(currentEpisodePage)
+      return
+    }
+    setEpisodeJumpValue(String(currentEpisodePage + 1))
+  }, [currentEpisodePage, episodePage])
 
   useEffect(() => {
     return () => {
@@ -568,8 +613,7 @@ function App() {
 
   async function fetchCompletedJobs(): Promise<void> {
     try {
-      const userParam = currentUserId ? `&user_id=${encodeURIComponent(currentUserId)}` : ''
-      const response = await fetch(apiUrl(`/api/jobs?status=completed&limit=100${userParam}`))
+      const response = await fetch(apiUrl('/api/jobs?status=completed&limit=100'))
       if (!response.ok) return
       const data = (await response.json()) as { jobs: JobRecord[] }
       setCompletedJobs(data.jobs ?? [])
@@ -785,6 +829,7 @@ function App() {
       const message = 'Ads cannot be removed right now because the Windows processor is offline. Start WAMP and the Windows tunnel, then try again.'
       setRunError(message)
       appendLog(`Error: ${message}`)
+      setIsSubmitting(false)
       return
     }
 
@@ -822,6 +867,8 @@ function App() {
 
       appendLog(`Job queued: ${createResult.job_id}`)
       setActiveJob(createResult.job_id)
+      setStartNoticeVisible(true)
+      window.setTimeout(() => setStartNoticeVisible(false), 3000)
       await waitForJob(createResult.job_id)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Processing failed.'
@@ -903,15 +950,16 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <p className="kicker">Linux Web Interface</p>
-        <h1>Ad Free Podcast Player</h1>
-        <p className="lede">
-          Search for podcasts, pick an episode, and run server-side ad removal with transcripts and ad timestamps.
-        </p>
+      <header id="home" className="topbar">
+        <div className="brand-block">
+          <h1>Ad Free Podcast Player</h1>
+          <p className="topbar-subtitle">
+            Windows processor {workerStatus?.local_bridge?.reachable ? 'available' : 'offline'}
+          </p>
+        </div>
         {users.length > 0 ? (
           <div className="user-selector-row">
-            <label htmlFor="user-select">Account:</label>
+            <label htmlFor="user-select">Account</label>
             <select
               id="user-select"
               value={currentUserId}
@@ -925,9 +973,122 @@ function App() {
         ) : null}
       </header>
 
+      <nav className="app-menu" aria-label="App menu">
+        {([
+          ['home', 'Home'],
+          ['search', 'Search'],
+          ['jobs', 'Jobs'],
+          ['adfree', 'Ad-free'],
+          ['about', 'About'],
+        ] as const).map(([view, label]) => (
+          <button
+            key={view}
+            type="button"
+            className={activeView === view ? 'active' : ''}
+            onClick={() => setActiveView(view)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {isBlockingLoading ? (
+        <div className="loading-overlay" role="status" aria-live="polite">
+          <div className="loading-card">
+            <strong>{loadingTitle}</strong>
+            <span>{loadingBody}</span>
+          </div>
+        </div>
+      ) : null}
+
+      {activeView === 'home' ? (
+        <section className="home-dashboard">
+          <div className="panel home-brand-panel">
+            <img src={APP_ICON_URL} alt="" className="app-brand-image" />
+            <div>
+              <h2>Ad Free Podcast Player</h2>
+              <p className="tiny">Search, queue, and play ad-free podcast episodes.</p>
+              <button type="button" onClick={() => setActiveView('search')}>Search podcasts</button>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="history-section-header">
+              <h2 className="section-heading">Queued & Processing</h2>
+              <button type="button" className="clear-all-btn" onClick={() => setActiveView('jobs')}>View all</button>
+            </div>
+            {liveJobs.length === 0 ? (
+              <p className="tiny">No queued or processing conversions right now.</p>
+            ) : (
+              <div className="live-jobs-list">
+                {liveJobs.slice(0, 4).map((job) => (
+                  <div key={job.job_id} className="live-job-card">
+                    <div className="live-job-main">
+                      {jobDisplayPodcast(job) ? <span className="history-podcast-name">{jobDisplayPodcast(job)}</span> : null}
+                      <strong>{jobDisplayTitle(job) || 'Conversion job'}</strong>
+                    </div>
+                    <div className="active-job-meta">
+                      <span className={`status ${job.status === 'running' ? 'on' : 'neutral'}`}>{job.status}</span>
+                      <span className="tiny">{Math.round(job.progress)}%</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="history-section-header">
+              <h2 className="section-heading">Recent Ad-free</h2>
+              <button type="button" className="clear-all-btn" onClick={() => setActiveView('adfree')}>View all</button>
+            </div>
+            {visibleCompletedJobs.length === 0 ? (
+              <p className="tiny">No completed conversions yet.</p>
+            ) : (
+              <div className="history-list">
+                {visibleCompletedJobs.slice(0, 5).map((job) => (
+                  <button key={job.job_id} type="button" className="history-item" onClick={() => setSelectedHistoryJob(job)}>
+                    <div className="history-item-main">
+                      {jobDisplayPodcast(job) ? <span className="history-podcast-name">{jobDisplayPodcast(job)}</span> : null}
+                      <strong className="history-episode-title">{jobDisplayTitle(job)}</strong>
+                    </div>
+                    <span className="status on">Ready</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="panel">
+            <h2 className="section-heading">Favorites</h2>
+            {subscriptions.length === 0 ? (
+              <p className="tiny">Search for podcasts and favorite them here.</p>
+            ) : (
+              <div className="sub-list">
+                {subscriptions.slice(0, 6).map((sub) => (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    className="sub-item"
+                    onClick={() => {
+                      setActiveView('search')
+                      void selectSubscription(sub)
+                    }}
+                  >
+                    {sub.artwork_url ? <img src={sub.artwork_url} alt="" className="sub-art" /> : null}
+                    <span>{sub.podcast_title}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      ) : null}
+
+      {activeView === 'search' ? (
       <section className="player-layout">
-        <div className="panel search-panel">
-          <h2>Find podcasts</h2>
+        <div id="search" className="panel search-panel">
+          <h2>Search</h2>
 
           {subscriptions.length > 0 ? (
             <div className="subscriptions-panel">
@@ -961,7 +1122,7 @@ function App() {
                     clearPodcastSearch()
                   }
                 }}
-                placeholder="Search podcasts"
+                placeholder="podcast name"
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
                     void runPodcastSearch()
@@ -1038,7 +1199,7 @@ function App() {
           {isLoadingEpisodes ? <p className="tiny">Loading episodes...</p> : null}
 
           <div className="episode-list">
-            {episodes.slice(episodePage * 10, episodePage * 10 + 10).map((episode) => (
+            {visibleEpisodes.map((episode) => (
               <button
                 key={episode.trackId}
                 type="button"
@@ -1054,22 +1215,38 @@ function App() {
               </button>
             ))}
           </div>
-          {episodes.length > 10 ? (
-            <div className="episode-pagination">
-              <button
-                type="button"
-                className="page-btn"
-                disabled={episodePage === 0}
-                onClick={() => setEpisodePage((p) => p - 1)}
-              >&lt; Prev</button>
-              <span className="page-info">{episodePage + 1} / {Math.ceil(episodes.length / 10)}</span>
-              <button
-                type="button"
-                className="page-btn"
-                disabled={(episodePage + 1) * 10 >= episodes.length}
-                onClick={() => setEpisodePage((p) => p + 1)}
-              >Next &gt;</button>
-            </div>
+          {episodes.length > EPISODE_PAGE_SIZE ? (
+            <>
+              <div className="episode-pagination">
+                <button
+                  type="button"
+                  className="page-btn"
+                  disabled={currentEpisodePage === 0}
+                  onClick={() => setEpisodePageClamped(currentEpisodePage - 1)}
+                >Previous</button>
+                <span className="page-info">{currentEpisodePage + 1}</span>
+                <button
+                  type="button"
+                  className="page-btn"
+                  disabled={currentEpisodePage >= totalEpisodePages - 1}
+                  onClick={() => setEpisodePageClamped(currentEpisodePage + 1)}
+                >Next</button>
+              </div>
+              <div className="jump-row">
+                <label htmlFor="episode-jump">Jump to page</label>
+                <input
+                  id="episode-jump"
+                  inputMode="numeric"
+                  value={episodeJumpValue}
+                  onBlur={jumpToEpisodePage}
+                  onChange={(event) => setEpisodeJumpValue(event.target.value.replace(/\D/g, ''))}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') jumpToEpisodePage()
+                  }}
+                />
+                <span className="tiny">of {totalEpisodePages}</span>
+              </div>
+            </>
           ) : null}
 
           <div className="player-bar">
@@ -1152,10 +1329,37 @@ function App() {
 
           {runError ? <p className="error-text">{runError}</p> : null}
 
-          {jobStatus ? (
-            <div className="result-panel">
-              <p><strong>Job id:</strong> {jobStatus.job_id}</p>
-              <p><strong>Status:</strong> {jobStatus.status}</p>
+          {hasProcessingCard ? (
+            <div className="result-panel active-job-card">
+              <div className="active-job-heading">
+                {processingPodcast ? <span className="history-podcast-name">{processingPodcast}</span> : null}
+                <strong className="active-job-title">{processingTitle || 'Ad removal job'}</strong>
+              </div>
+              <div className="active-job-meta">
+                {jobStatus ? (
+                  <span className={jobStatus.status === 'completed' ? 'status on' : 'status neutral'}>
+                    {jobStatus.status}
+                  </span>
+                ) : (
+                  <span className="status neutral">starting</span>
+                )}
+                {jobStatus ? <span className="tiny">{Math.round(jobStatus.progress)}%</span> : null}
+                {jobStatus?.backend ? <span className="tiny">{jobStatus.backend}</span> : null}
+                {jobStatus?.created_at ? <span className="tiny">Queued {formatTimestamp(jobStatus.created_at)}</span> : null}
+              </div>
+              <div className="progress-bar-track">
+                <div
+                  className="progress-bar-fill"
+                  style={{ width: `${Math.max(2, Math.round(jobStatus?.progress ?? 2))}%` }}
+                />
+              </div>
+              {jobStatus?.job_id ? <p><strong>Job id:</strong> {jobStatus.job_id}</p> : null}
+              {jobStatus?.started_at ? <p><strong>Started:</strong> {formatTimestamp(jobStatus.started_at)}</p> : null}
+              {jobStatus?.error_message ? <p className="error-text">{jobStatus.error_message}</p> : null}
+              <h3>Live process log</h3>
+              <div className="log-panel">
+                {logLines.length === 0 ? 'No process output yet.' : [...logLines].reverse().join('\n')}
+              </div>
             </div>
           ) : null}
 
@@ -1168,16 +1372,16 @@ function App() {
             </p>
           ) : null}
 
-          <h3>Live process log</h3>
-          <div className="log-panel">
-            {logLines.length === 0 ? 'No process output yet.' : [...logLines].reverse().join('\n')}
-          </div>
         </div>
       </section>
+      ) : null}
 
-      {liveJobs.length > 0 ? (
-        <section className="live-section">
-          <h2 className="section-heading">Active conversions</h2>
+      {activeView === 'jobs' ? (
+      <section id="jobs" className="live-section">
+        <h2 className="section-heading">Queued & Processing</h2>
+        {liveJobs.length === 0 ? (
+          <p className="tiny">No queued or processing conversions right now.</p>
+        ) : (
           <div className="live-jobs-list">
             {liveJobs.map((job) => (
               <div key={job.job_id} className="live-job-card">
@@ -1197,6 +1401,12 @@ function App() {
                     Kill
                   </button>
                 </div>
+                {jobDisplayTitle(job) || jobDisplayPodcast(job) ? (
+                  <div className="live-job-main">
+                    {jobDisplayPodcast(job) ? <span className="history-podcast-name">{jobDisplayPodcast(job)}</span> : null}
+                    {jobDisplayTitle(job) ? <strong>{jobDisplayTitle(job)}</strong> : null}
+                  </div>
+                ) : null}
                 {job.started_at ? (
                   <div className="live-job-started tiny">Started: {formatTimestamp(job.started_at)}</div>
                 ) : job.created_at ? (
@@ -1211,10 +1421,12 @@ function App() {
               </div>
             ))}
           </div>
-        </section>
+        )}
+      </section>
       ) : null}
 
-      <section className="history-section">
+      {activeView === 'adfree' ? (
+      <section id="ad-free" className="history-section">
         <div className="history-section-header">
           <h2 className="section-heading">Ad-free episodes</h2>
           {visibleCompletedJobs.length > 0 ? (
@@ -1264,8 +1476,9 @@ function App() {
           </div>
         )}
       </section>
+      ) : null}
 
-      {failedJobs.length > 0 ? (
+      {activeView === 'jobs' && failedJobs.length > 0 ? (
         <section className="history-section log-section">
           <div className="history-section-header">
             <h2 className="section-heading">Conversion log</h2>
@@ -1404,9 +1617,24 @@ function App() {
         </div>
       ) : null}
 
+      {activeView === 'about' ? (
+        <section id="about" className="history-section about-panel">
+          <img src={APP_ICON_URL} alt="" className="about-app-image" />
+          <h2 className="section-heading">About</h2>
+          <p className="tiny">
+            This app queues Windows tunnel processing through the PHP API. Completed files are served back from the PHP server.
+          </p>
+          <p className="tiny">
+            Only remove ads from podcasts you have the rights to edit or listen to in this format.
+          </p>
+          <p className="tiny">
+            Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
+          </p>
+        </section>
+      ) : null}
+
       <footer className="footer-note">
-        This web app queues Windows tunnel processing through the PHP API. Completed files are served back from the PHP server.
-        {' · '}Built {new Date(__BUILD_TIME__).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' })} ET
+        <a href="./downloads/ad-free-podcast-player-latest.apk" download>Download Android APK</a>
       </footer>
     </div>
   )

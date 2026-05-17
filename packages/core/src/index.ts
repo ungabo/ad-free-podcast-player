@@ -1,4 +1,4 @@
-export type TranscriptionBackend = 'parakeet' | 'whisper' | 'openai-whisper';
+export type TranscriptionBackend = 'parakeet';
 export type AdDetectionMode = 'openai';
 
 export type AppPlatform = 'web' | 'windows' | 'android';
@@ -47,21 +47,13 @@ export function resolveDefaultSettings(platform: AppPlatform): ProcessingSetting
 
 export function resolveBackendWithFallback(
   requested: TranscriptionBackend,
-  capabilities: { parakeetAvailable: boolean; whisperAvailable: boolean },
+  capabilities: { parakeetAvailable: boolean },
 ): TranscriptionBackend {
   if (requested === 'parakeet' && capabilities.parakeetAvailable) {
     return 'parakeet';
   }
 
-  if (requested === 'parakeet' && capabilities.whisperAvailable) {
-    return 'whisper';
-  }
-
-  if (requested === 'whisper' && capabilities.whisperAvailable) {
-    return 'whisper';
-  }
-
-  return 'openai-whisper';
+  throw new Error('Parakeet transcription is required. No alternate transcription backend is available.');
 }
 
 export interface AdRange {

@@ -8,6 +8,7 @@ import { join, resolve } from 'node:path'
 
 const ROOT = resolve(process.cwd(), '../..')
 const DIST = resolve(process.cwd(), 'dist')
+const ANDROID_APK = join(ROOT, 'apps/android/app/build/outputs/apk/debug/app-debug.apk')
 const SCP = String.raw`C:\Windows\System32\OpenSSH\scp.exe`
 const SSH = String.raw`C:\Windows\System32\OpenSSH\ssh.exe`
 const IDENTITY_FILE = String.raw`C:\Users\Gabe\.ssh\adfree_hosting_ed25519`
@@ -32,14 +33,21 @@ if (!existsSync(join(DIST, 'index.php'))) {
   throw new Error('dist/index.php missing; run npm run build first')
 }
 
+if (!existsSync(ANDROID_APK)) {
+  throw new Error(`Android APK missing at ${ANDROID_APK}; run .\\gradlew.bat assembleDebug in apps/android first`)
+}
+
 console.log('\n-- Deploying web app --')
 scp(join(DIST, 'index.php'), `${REMOTE_HTTPDOCS}/index.php`)
 scp(join(DIST, 'index.html'), `${REMOTE_HTTPDOCS}/index.html`)
 scp(join(DIST, '.htaccess'), `${REMOTE_HTTPDOCS}/.htaccess`)
+scp(join(DIST, 'app-icon.svg'), `${REMOTE_HTTPDOCS}/app-icon.svg`)
 scp(join(DIST, 'favicon.svg'), `${REMOTE_HTTPDOCS}/favicon.svg`)
 scp(join(DIST, 'icons.svg'), `${REMOTE_HTTPDOCS}/icons.svg`)
 ssh(`rm -rf ${REMOTE_HTTPDOCS}/assets`)
 scp(join(DIST, 'assets'), `${REMOTE_HTTPDOCS}/`, true)
+ssh(`mkdir -p ${REMOTE_HTTPDOCS}/downloads`)
+scp(ANDROID_APK, `${REMOTE_HTTPDOCS}/downloads/ad-free-podcast-player-latest.apk`)
 ssh(`find ${REMOTE_HTTPDOCS} -type d -exec chmod 755 {} + && find ${REMOTE_HTTPDOCS} -type f -exec chmod 644 {} +`)
 
 console.log('\n-- Deploying root redirect --')

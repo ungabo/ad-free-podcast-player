@@ -1,3 +1,4 @@
+<?php /* Generated from dist/index.html */ ?>
 <!doctype html>
 <html lang="en">
   <head>

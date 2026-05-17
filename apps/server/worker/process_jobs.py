@@ -356,11 +356,11 @@ def download_source_to_cache(
 
 
 def is_tunnel_backend(backend: str) -> bool:
-    return backend.strip().lower() in {"tunnel-parakeet", "tunnel-openai-whisper", "tunnel-whisper"}
+    return backend.strip().lower() == "tunnel-parakeet"
 
 
 def tunnel_local_backend(backend: str) -> str:
-    return "openai-whisper"
+    return "parakeet"
 
 
 def bridge_headers(content_type: Optional[str] = None) -> dict[str, str]:
@@ -398,6 +398,20 @@ def post_bridge_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise RuntimeError("Windows bridge returned a non-object JSON response")
     return decoded
+
+
+def get_bridge_json(path: str, timeout: int = 10) -> Optional[dict[str, Any]]:
+    request = Request(bridge_url(path), headers=bridge_headers(), method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RuntimeError(f"Windows bridge status returned HTTP {exc.code}") from exc
+    except (URLError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def summarize_bridge_error(detail: str) -> str:
@@ -446,7 +460,8 @@ def download_bridge_file(path_or_url: str, destination: Path) -> None:
 
 
 def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
-    backend = str(payload.get("backend", "tunnel-parakeet")).strip().lower()
+    backend = "tunnel-parakeet"
+    payload["backend"] = backend
     source_url = str(payload.get("source_url", "") or "").strip()
     if not source_url:
         raise RuntimeError("Windows tunnel processing requires source_url jobs.")
@@ -468,7 +483,44 @@ def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[s
         "podcast_name": payload.get("podcast_name") or "",
     }
     bridge_payload["openai_model"] = openai_model
-    response = post_bridge_json("/api/local/process", bridge_payload)
+    response_holder: dict[str, Any] = {}
+    error_holder: dict[str, BaseException] = {}
+
+    def run_bridge_call() -> None:
+        try:
+            response_holder["response"] = post_bridge_json("/api/local/process", bridge_payload)
+        except BaseException as exc:
+            error_holder["error"] = exc
+
+    bridge_thread = threading.Thread(target=run_bridge_call, daemon=True)
+    bridge_thread.start()
+    last_status_line = ""
+    while bridge_thread.is_alive():
+        status = get_bridge_json(f"/api/local/jobs/{job_id}/status")
+        if status:
+            local_progress = max(0.0, min(100.0, float(status.get("progress") or 0.0)))
+            overall_progress = 38.0 + (local_progress * 0.50)
+            phase = str(status.get("phase") or "Windows processing").strip()
+            message = str(status.get("message") or "").strip()
+            line = f"{round(overall_progress)}% {phase}"
+            if message:
+                line = f"{line}: {message}"
+            if line != last_status_line:
+                emit_runtime_update(job_id, logs_list, overall_progress, line)
+                bridge_logs = str(status.get("logs") or "").strip()
+                if bridge_logs:
+                    for bridge_line in bridge_logs.splitlines()[-4:]:
+                        if bridge_line.strip() and bridge_line.strip() not in logs_list[-12:]:
+                            logs_list.append(f"Windows: {bridge_line.strip()}")
+                    mark_runtime(job_id, overall_progress, "\n".join(logs_list))
+                last_status_line = line
+        bridge_thread.join(timeout=2.0)
+
+    if "error" in error_holder:
+        raise error_holder["error"]
+    response = response_holder.get("response")
+    if not isinstance(response, dict):
+        raise RuntimeError("Windows bridge did not return a response")
     if not response.get("ok"):
         raise RuntimeError(str(response.get("error") or "Windows bridge processing failed"))
 

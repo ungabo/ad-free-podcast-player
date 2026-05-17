@@ -297,6 +297,7 @@ async function createWindow() {
     minWidth: 960,
     minHeight: 680,
     autoHideMenuBar: true,
+    icon: path.join(PLAYER_UI_DIR, 'app-icon.svg'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "electron .",
     "start": "electron .",
-    "package:win": "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '.\\Ad Free Podcast Player-win32-x64' -ErrorAction SilentlyContinue; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue; npx @electron/packager . 'Ad Free Podcast Player' --platform=win32 --arch=x64 --out .\\dist --overwrite --asar --ignore=renderer --ignore=dist --ignore='Ad Free Podcast Player-win32-x64'; Move-Item '.\\dist\\Ad Free Podcast Player-win32-x64' '.\\Ad Free Podcast Player-win32-x64'; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue\""
+    "sync:web": "node scripts/sync-web-ui.mjs",
+    "package:win": "node scripts/sync-web-ui.mjs && powershell -NoProfile -Command \"Remove-Item -Recurse -Force '.\\Ad Free Podcast Player-win32-x64' -ErrorAction SilentlyContinue; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue; npx @electron/packager . 'Ad Free Podcast Player' --platform=win32 --arch=x64 --out .\\dist --overwrite --asar --ignore=renderer --ignore=dist --ignore='Ad Free Podcast Player-win32-x64'; Move-Item '.\\dist\\Ad Free Podcast Player-win32-x64' '.\\Ad Free Podcast Player-win32-x64'; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue\""
   },
   "devDependencies": {
     "@electron/get": "^2.0.3",

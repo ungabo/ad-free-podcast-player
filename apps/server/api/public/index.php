@@ -67,6 +67,10 @@ try {
         processLocalBridgeJob($config);
     }
 
+    if ($method === 'GET' && preg_match('#^/api/local/jobs/([a-f0-9]{32})/status$#', $uri, $matches) === 1) {
+        serveLocalBridgeStatus($config, $matches[1]);
+    }
+
     if ($method === 'GET' && preg_match('#^/api/local/jobs/([a-f0-9]{32})/download$#', $uri, $matches) === 1) {
         serveLocalBridgeFile($config, $matches[1], 'download');
     }
@@ -387,7 +391,7 @@ function createJob(PDO $pdo, array $config): void
     }
     validateSourceUrl($sourceUrl);
 
-    $backend = validateBackend((string)($_POST['backend'] ?? 'tunnel-openai-whisper'));
+    $backend = validateBackend((string)($_POST['backend'] ?? 'tunnel-parakeet'));
     $detectionMode = validateDetectionMode((string)($_POST['detection_mode'] ?? 'openai'));
     $openAiModel = trim(envOrDefault('OPENAI_MODEL', 'gpt-5.5'));
     if ($openAiModel === '') {
@@ -1055,7 +1059,7 @@ function probeLocalBridge(array $config): array
         'configured' => true,
         'reachable' => is_array($decoded) && (bool)($decoded['ok'] ?? false),
         'url' => $baseUrl,
-        'backend_options' => ['openai-whisper'],
+        'backend_options' => ['parakeet'],
         'message' => is_array($decoded) ? (string)($decoded['message'] ?? '') : 'Bridge health check did not return JSON.',
     ];
 }
@@ -1147,6 +1151,8 @@ function getLocalBridgeHealth(array $config): void
     $script = joinPath($root, 'src/ad_cut_forge.py');
     $adCutForgeAvailable = is_file($script);
     $pythonAvailable = localCommandExecutableAvailable(localPythonCommandParts());
+    $parakeetPython = resolveLocalParakeetPython($root);
+    $parakeetAvailable = $parakeetPython !== '' && is_file($parakeetPython);
     $ffmpegAvailable = localCommandExecutableAvailable(splitCommandPrefix(envOrDefault('FFMPEG_BIN', 'ffmpeg')));
     $ffprobeAvailable = localCommandExecutableAvailable(splitCommandPrefix(envOrDefault('FFPROBE_BIN', 'ffprobe')));
     $openAiKeyConfigured = trim(envOrDefault('OPENAI_API_KEY', '')) !== '';
@@ -1156,6 +1162,9 @@ function getLocalBridgeHealth(array $config): void
     }
     if (!$pythonAvailable) {
         $missing[] = 'Python runtime';
+    }
+    if (!$parakeetAvailable) {
+        $missing[] = 'Parakeet runtime';
     }
     if (!$ffmpegAvailable) {
         $missing[] = 'ffmpeg';
@@ -1174,11 +1183,13 @@ function getLocalBridgeHealth(array $config): void
         'message' => $ready
             ? 'Windows local processor bridge is ready.'
             : 'Ads cannot be removed right now. Missing: ' . implode(', ', $missing) . '.',
-        'backends' => ['openai-whisper'],
-        'transcription_backend' => 'openai-whisper',
+        'backends' => ['parakeet'],
+        'transcription_backend' => 'parakeet',
         'adcutforge_root' => $root,
+        'parakeet_python' => $parakeetPython,
         'adcutforge_available' => $adCutForgeAvailable,
         'python_available' => $pythonAvailable,
+        'parakeet_available' => $parakeetAvailable,
         'ffmpeg_available' => $ffmpegAvailable,
         'ffprobe_available' => $ffprobeAvailable,
         'openai_key_configured' => $openAiKeyConfigured,
@@ -1200,7 +1211,7 @@ function processLocalBridgeJob(array $config): void
     }
     validateSourceUrl($sourceUrl);
 
-    $backend = 'openai-whisper';
+    $backend = 'parakeet';
     $detectionMode = validateDetectionMode((string)($body['detection_mode'] ?? 'openai'));
     $openAiModel = trim((string)($body['openai_model'] ?? 'gpt-5.5'));
     if ($openAiModel === '') {
@@ -1215,6 +1226,7 @@ function processLocalBridgeJob(array $config): void
     $jobDir = localBridgeJobDir($config, $jobId);
     $cachedResult = readLocalBridgeResult($jobDir);
     if ($cachedResult !== null) {
+        writeLocalBridgeStatus($jobDir, $jobId, 'completed', 100.0, 'Complete', 'Reusing completed Windows bridge result.', (string)($cachedResult['logs'] ?? ''));
         jsonResponse(200, [
             'ok' => true,
             'job_id' => $jobId,
@@ -1231,40 +1243,58 @@ function processLocalBridgeJob(array $config): void
 
     $inputDir = joinPath($jobDir, 'input');
     ensureDirectory($inputDir);
+    writeLocalBridgeStatus($jobDir, $jobId, 'running', 5.0, 'Starting', 'Preparing Windows processor job.');
 
     pruneLocalBridgeJobs($config);
 
     $extension = detectUrlExtension($sourceUrl);
     $inputPath = joinPath($inputDir, 'source.' . $extension);
     $started = microtime(true);
-    downloadRemoteAudio($sourceUrl, $inputPath);
+    try {
+        writeLocalBridgeStatus($jobDir, $jobId, 'running', 10.0, 'Downloading source audio', 'Windows is downloading the source episode.');
+        downloadRemoteAudio($sourceUrl, $inputPath);
+        writeLocalBridgeStatus($jobDir, $jobId, 'running', 20.0, 'Source ready', 'Source audio is ready for transcription.');
 
-    $result = runLocalAdCutForge($config, $jobId, $inputPath, $backend, $detectionMode, $openAiApiKey, $openAiModel);
-    $finished = microtime(true);
-    $statsPath = joinPath($jobDir, 'stats.json');
-    file_put_contents($statsPath, json_encode([
-        'job_id' => $jobId,
-        'status' => 'completed',
-        'backend' => 'tunnel-' . $backend,
-        'detection_mode' => $detectionMode,
-        'source_url' => $sourceUrl,
-        'started_at' => gmdate(DATE_ATOM, (int)$started),
-        'finished_at' => gmdate(DATE_ATOM, (int)$finished),
-        'duration_seconds' => round($finished - $started, 1),
-        'adcutforge_root' => resolveLocalAdCutForgeRoot(),
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $statusUpdater = function (float $cliProgress, string $message, string $logs) use ($jobDir, $jobId): void {
+            $localProgress = 20.0 + (max(0.0, min(100.0, $cliProgress)) * 0.70);
+            $phase = localBridgePhaseFromMessage($message);
+            writeLocalBridgeStatus($jobDir, $jobId, 'running', min(90.0, $localProgress), $phase, $message, $logs);
+        };
 
-    $resultPayload = [
-        'job_id' => $jobId,
-        'output_path' => $result['output_path'],
-        'transcript_path' => $result['transcript_path'],
-        'timestamped_transcript_path' => $result['timestamped_transcript_path'],
-        'timestamps_path' => $result['timestamps_path'],
-        'stats_path' => $statsPath,
-        'detection_mode' => $detectionMode,
-        'logs' => $result['logs'],
-    ];
-    file_put_contents(joinPath($jobDir, 'result.json'), json_encode($resultPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $result = runLocalAdCutForge($config, $jobId, $inputPath, $backend, $detectionMode, $openAiApiKey, $openAiModel, $statusUpdater);
+        $finished = microtime(true);
+        writeLocalBridgeStatus($jobDir, $jobId, 'running', 95.0, 'Returning result', 'Windows finished processing and is preparing files for the server.', (string)$result['logs']);
+
+        $statsPath = joinPath($jobDir, 'stats.json');
+        file_put_contents($statsPath, json_encode([
+            'job_id' => $jobId,
+            'status' => 'completed',
+            'backend' => 'tunnel-' . $backend,
+            'detection_mode' => $detectionMode,
+            'source_url' => $sourceUrl,
+            'started_at' => gmdate(DATE_ATOM, (int)$started),
+            'finished_at' => gmdate(DATE_ATOM, (int)$finished),
+            'duration_seconds' => round($finished - $started, 1),
+            'adcutforge_root' => resolveLocalAdCutForgeRoot(),
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+        $resultPayload = [
+            'job_id' => $jobId,
+            'backend' => 'tunnel-' . $backend,
+            'output_path' => $result['output_path'],
+            'transcript_path' => $result['transcript_path'],
+            'timestamped_transcript_path' => $result['timestamped_transcript_path'],
+            'timestamps_path' => $result['timestamps_path'],
+            'stats_path' => $statsPath,
+            'detection_mode' => $detectionMode,
+            'logs' => $result['logs'],
+        ];
+        file_put_contents(joinPath($jobDir, 'result.json'), json_encode($resultPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        writeLocalBridgeStatus($jobDir, $jobId, 'completed', 100.0, 'Complete', 'Windows processing complete.', (string)$result['logs']);
+    } catch (Throwable $exception) {
+        writeLocalBridgeStatus($jobDir, $jobId, 'failed', 100.0, 'Failed', $exception->getMessage());
+        throw $exception;
+    }
 
     jsonResponse(200, [
         'ok' => true,
@@ -1294,6 +1324,9 @@ function readLocalBridgeResult(string $jobDir): ?array
     if (!is_array($decoded)) {
         return null;
     }
+    if ((string)($decoded['backend'] ?? '') !== 'tunnel-parakeet') {
+        return null;
+    }
 
     $outputPath = (string)($decoded['output_path'] ?? '');
     if ($outputPath === '' || !is_file($outputPath)) {
@@ -1304,6 +1337,93 @@ function readLocalBridgeResult(string $jobDir): ?array
     }
 
     return $decoded;
+}
+
+function localBridgeStatusPath(string $jobDir): string
+{
+    return joinPath($jobDir, 'status.json');
+}
+
+function writeLocalBridgeStatus(
+    string $jobDir,
+    string $jobId,
+    string $status,
+    float $progress,
+    string $phase,
+    string $message,
+    string $logs = ''
+): void {
+    ensureDirectory($jobDir);
+    $path = localBridgeStatusPath($jobDir);
+    $existing = [];
+    if (is_file($path)) {
+        $decoded = json_decode((string)file_get_contents($path), true);
+        if (is_array($decoded)) {
+            $existing = $decoded;
+        }
+    }
+    $now = gmdate(DATE_ATOM);
+    $payload = [
+        'ok' => true,
+        'job_id' => $jobId,
+        'status' => $status,
+        'phase' => $phase,
+        'message' => $message,
+        'progress' => max(0.0, min(100.0, $progress)),
+        'logs' => tailText($logs, 24000),
+        'started_at' => (string)($existing['started_at'] ?? $now),
+        'updated_at' => $now,
+        'finished_at' => in_array($status, ['completed', 'failed', 'cancelled'], true) ? $now : null,
+    ];
+    file_put_contents($path, json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+}
+
+function serveLocalBridgeStatus(array $config, string $jobId): void
+{
+    assertLocalBridgeAccess($config);
+    $jobId = normalizeBridgeJobId($jobId);
+    $jobDir = localBridgeJobDir($config, $jobId);
+    $path = localBridgeStatusPath($jobDir);
+    if (is_file($path)) {
+        $decoded = json_decode((string)file_get_contents($path), true);
+        if (is_array($decoded)) {
+            jsonResponse(200, $decoded);
+        }
+    }
+    $result = readLocalBridgeResult($jobDir);
+    if ($result !== null) {
+        jsonResponse(200, [
+            'ok' => true,
+            'job_id' => $jobId,
+            'status' => 'completed',
+            'phase' => 'Complete',
+            'message' => 'Windows processing complete.',
+            'progress' => 100.0,
+            'logs' => tailText((string)($result['logs'] ?? ''), 24000),
+            'started_at' => null,
+            'updated_at' => gmdate(DATE_ATOM),
+            'finished_at' => gmdate(DATE_ATOM),
+        ]);
+    }
+    jsonResponse(404, [
+        'ok' => false,
+        'job_id' => $jobId,
+        'status' => 'missing',
+        'phase' => 'Waiting',
+        'message' => 'Windows bridge status is not available yet.',
+        'progress' => 0.0,
+    ]);
+}
+
+function localBridgePhaseFromMessage(string $message): string
+{
+    $lower = strtolower($message);
+    if (str_contains($lower, 'transcrib')) return 'Transcribing audio';
+    if (str_contains($lower, 'detect')) return 'Detecting ads with GPT';
+    if (str_contains($lower, 'render') || str_contains($lower, 'cut')) return 'Cutting ad-free audio';
+    if (str_contains($lower, 'final')) return 'Finalizing output';
+    if (str_contains($lower, 'complete')) return 'Complete';
+    return 'Processing audio';
 }
 
 function jobHasHeuristicArtifact(PDO $pdo, array $config, string $jobId): bool
@@ -1516,6 +1636,7 @@ function resolveLocalAdCutForgeRoot(): string
     $candidates = [
         envOrDefault('LOCAL_ADCUTFORGE_ROOT', ''),
         envOrDefault('ADCUTFORGE_ROOT', ''),
+        'D:/__MY APPS/ad free podcast player/apps/server/adcutforge',
         'D:/__MY APPS/ad free podcast player/apps/server/windows/adcutforge',
         'C:/Users/Gabe/Documents/Codex/2026-05-08/podcast ad remover',
     ];
@@ -1528,6 +1649,23 @@ function resolveLocalAdCutForgeRoot(): string
     throw new RuntimeException('Local AdCutForge root was not found. Set LOCAL_ADCUTFORGE_ROOT in WAMP/Apache.');
 }
 
+function resolveLocalParakeetPython(string $adCutForgeRoot): string
+{
+    $candidates = [
+        envOrDefault('LOCAL_PARAKEET_PYTHON', ''),
+        joinPath($adCutForgeRoot, 'parakeet-runtime/Scripts/python.exe'),
+        'C:/Users/Gabe/Documents/Codex/2026-05-08/podcast ad remover/parakeet-runtime/Scripts/python.exe',
+        'D:/__MY APPS/ad free podcast player/apps/server/adcutforge/parakeet-runtime/Scripts/python.exe',
+    ];
+    foreach ($candidates as $candidate) {
+        $trimmed = str_replace('\\', '/', trim((string)$candidate));
+        if ($trimmed !== '' && is_file($trimmed)) {
+            return $trimmed;
+        }
+    }
+    return '';
+}
+
 function runLocalAdCutForge(
     array $config,
     string $jobId,
@@ -1535,7 +1673,8 @@ function runLocalAdCutForge(
     string $backend,
     string $detectionMode,
     string $openAiApiKey,
-    string $openAiModel
+    string $openAiModel,
+    ?callable $statusUpdater = null
 ): array
 {
     $root = resolveLocalAdCutForgeRoot();
@@ -1568,8 +1707,8 @@ function runLocalAdCutForge(
     $parts[] = $artifactDir;
 
     if ($backend === 'parakeet') {
-        $parakeetPython = envOrDefault('LOCAL_PARAKEET_PYTHON', joinPath($root, 'parakeet-runtime/Scripts/python.exe'));
-        if (!is_file($parakeetPython)) {
+        $parakeetPython = resolveLocalParakeetPython($root);
+        if ($parakeetPython === '' || !is_file($parakeetPython)) {
             throw new RuntimeException('Parakeet Python was not found. Set LOCAL_PARAKEET_PYTHON or install the bundled parakeet runtime.');
         }
         $parts[] = '--parakeet-python';
@@ -1586,6 +1725,7 @@ function runLocalAdCutForge(
     $processEnv = [
         'PYTHONIOENCODING' => 'utf-8',
         'PYTHONUTF8' => '1',
+        'PYTHONUNBUFFERED' => '1',
     ];
     foreach (['FFMPEG_BIN', 'FFPROBE_BIN', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE'] as $name) {
         $value = trim(envOrDefault($name, ''));
@@ -1623,12 +1763,47 @@ function runLocalAdCutForge(
         throw new RuntimeException('Failed to start local AdCutForge process.');
     }
     fclose($pipes[0]);
-    $stdout = stream_get_contents($pipes[1]);
-    $stderr = stream_get_contents($pipes[2]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $logs = '';
+    $stdoutBuffer = '';
+    $stderrBuffer = '';
+    $lastProgress = -1.0;
+    $lastStatusAt = 0.0;
+    while (true) {
+        $stdoutChunk = stream_get_contents($pipes[1]);
+        if (is_string($stdoutChunk) && $stdoutChunk !== '') {
+            consumeLocalProcessChunk($stdoutChunk, $stdoutBuffer, $logs, $statusUpdater, $lastProgress, $lastStatusAt);
+        }
+        $stderrChunk = stream_get_contents($pipes[2]);
+        if (is_string($stderrChunk) && $stderrChunk !== '') {
+            consumeLocalProcessChunk($stderrChunk, $stderrBuffer, $logs, $statusUpdater, $lastProgress, $lastStatusAt);
+        }
+
+        $status = proc_get_status($process);
+        if (!is_array($status) || !($status['running'] ?? false)) {
+            break;
+        }
+        usleep(250000);
+    }
+    $stdoutTail = stream_get_contents($pipes[1]);
+    if (is_string($stdoutTail) && $stdoutTail !== '') {
+        consumeLocalProcessChunk($stdoutTail, $stdoutBuffer, $logs, $statusUpdater, $lastProgress, $lastStatusAt);
+    }
+    $stderrTail = stream_get_contents($pipes[2]);
+    if (is_string($stderrTail) && $stderrTail !== '') {
+        consumeLocalProcessChunk($stderrTail, $stderrBuffer, $logs, $statusUpdater, $lastProgress, $lastStatusAt);
+    }
+    if ($stdoutBuffer !== '') {
+        consumeLocalProcessChunk("\n", $stdoutBuffer, $logs, $statusUpdater, $lastProgress, $lastStatusAt);
+    }
+    if ($stderrBuffer !== '') {
+        consumeLocalProcessChunk("\n", $stderrBuffer, $logs, $statusUpdater, $lastProgress, $lastStatusAt);
+    }
     fclose($pipes[1]);
     fclose($pipes[2]);
     $exitCode = proc_close($process);
-    $logs = trim((string)$stdout . "\n" . (string)$stderr);
+    $logs = trim($logs);
     if ($exitCode !== 0) {
         throw new RuntimeException('Local AdCutForge failed with exit code ' . $exitCode . ': ' . summarizeLocalAdCutForgeFailure($logs, $detectionMode));
     }
@@ -1670,6 +1845,45 @@ function runLocalAdCutForge(
         'timestamps_path' => $timestampsPath,
         'logs' => $logs,
     ];
+}
+
+function consumeLocalProcessChunk(
+    string $chunk,
+    string &$buffer,
+    string &$logs,
+    ?callable $statusUpdater,
+    float &$lastProgress,
+    float &$lastStatusAt
+): void {
+    $buffer .= str_replace("\r\n", "\n", str_replace("\r", "\n", $chunk));
+    while (($pos = strpos($buffer, "\n")) !== false) {
+        $line = substr($buffer, 0, $pos);
+        $buffer = substr($buffer, $pos + 1);
+        $trimmed = trim($line);
+        if ($trimmed === '') {
+            continue;
+        }
+        $logs .= $trimmed . "\n";
+        if ($statusUpdater === null) {
+            continue;
+        }
+        $progress = null;
+        if (preg_match('/\b(\d{1,3}(?:\.\d+)?)%\b/', $trimmed, $matches) === 1) {
+            $progress = max(0.0, min(100.0, (float)$matches[1]));
+        } elseif (stripos($trimmed, 'transcribing chunk') !== false) {
+            $progress = max($lastProgress, 30.0);
+        } elseif (stripos($trimmed, 'detecting ads') !== false) {
+            $progress = max($lastProgress, 65.0);
+        } elseif (stripos($trimmed, 'rendering') !== false) {
+            $progress = max($lastProgress, 75.0);
+        }
+        $now = microtime(true);
+        if ($progress !== null && ($progress !== $lastProgress || ($now - $lastStatusAt) >= 2.0)) {
+            $lastProgress = $progress;
+            $lastStatusAt = $now;
+            $statusUpdater($progress, $trimmed, $logs);
+        }
+    }
 }
 
 function localPythonCommandParts(): array
@@ -1841,7 +2055,7 @@ function withBasePath(string $basePath, string $path): string
 
 function validateBackend(string $backend): string
 {
-    return 'tunnel-openai-whisper';
+    return 'tunnel-parakeet';
 }
 
 function validateDetectionMode(string $mode): string
