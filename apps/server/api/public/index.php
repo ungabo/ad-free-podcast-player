@@ -13,6 +13,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
 // Completed-output reuse is only safe after the current GPT detection policy.
 // This cutoff excludes older runs that could remove comedic/parody ad bits.
 const GPT_ONLY_CACHE_EPOCH = '2026-05-16T23:50:00+00:00';
+const WORKER_HEARTBEAT_FRESH_SECONDS = 20;
+const STALE_JOB_GRACE_SECONDS = 300;
+const RUNNING_JOB_HARD_TIMEOUT_SECONDS = 21600;
 
 $config = loadConfig();
 ensureDirectory($config['storage_root']);
@@ -53,7 +56,7 @@ try {
     }
 
     if ($method === 'GET' && $uri === '/api/worker/status') {
-        getWorkerStatus($config);
+        getWorkerStatus($pdo, $config);
     }
 
     if ($method === 'GET' && $uri === '/api/local/health') {
@@ -384,7 +387,7 @@ function createJob(PDO $pdo, array $config): void
     }
     validateSourceUrl($sourceUrl);
 
-    $backend = validateBackend((string)($_POST['backend'] ?? 'tunnel-parakeet'));
+    $backend = validateBackend((string)($_POST['backend'] ?? 'tunnel-openai-whisper'));
     $detectionMode = validateDetectionMode((string)($_POST['detection_mode'] ?? 'openai'));
     $openAiModel = trim(envOrDefault('OPENAI_MODEL', 'gpt-5.5'));
     if ($openAiModel === '') {
@@ -720,6 +723,8 @@ function normalizeLocalPath(string $path): string
 
 function getJob(PDO $pdo, array $config, string $id): void
 {
+    reconcileStaleJobs($pdo, $config);
+
     $job = fetchJob($pdo, $id);
     if ($job === null) {
         jsonResponse(404, ['error' => 'Job not found']);
@@ -814,6 +819,8 @@ function cancelJob(PDO $pdo, array $config, string $id): void
 
 function listJobs(PDO $pdo, array $config): void
 {
+    reconcileStaleJobs($pdo, $config);
+
     $statusFilter = trim((string)($_GET['status'] ?? ''));
     $userIdFilter = trim((string)($_GET['user_id'] ?? ''));
     $limit = max(1, min(200, (int)($_GET['limit'] ?? 50)));
@@ -867,7 +874,25 @@ function listJobs(PDO $pdo, array $config): void
     ]);
 }
 
-function getWorkerStatus(array $config): void
+function getWorkerStatus(PDO $pdo, array $config): void
+{
+    $runtime = workerRuntimeStatus($config);
+    $staleJobsMarked = reconcileStaleJobs($pdo, $config, $runtime);
+
+    jsonResponse(200, [
+        'running' => (bool)$runtime['running'],
+        'lock_present' => (bool)$runtime['lock_present'],
+        'heartbeat_age_seconds' => $runtime['heartbeat_age_seconds'],
+        'heartbeat' => $runtime['heartbeat'],
+        'queue_count' => (int)$runtime['queue_count'],
+        'stale_jobs_marked' => $staleJobsMarked,
+        'local_bridge' => probeLocalBridge($config),
+        'start_command' => 'ssh agitated-engelbart_9pw3g4pzt1v@74.208.203.194 "nohup /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1 &"',
+        'watchdog_command' => '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1',
+    ]);
+}
+
+function workerRuntimeStatus(array $config): array
 {
     $heartbeatPath = (string)($config['worker_heartbeat'] ?? '');
     $lockDir = (string)($config['worker_lock_dir'] ?? '');
@@ -892,18 +917,113 @@ function getWorkerStatus(array $config): void
     }
 
     $lockPresent = $lockDir !== '' && is_dir($lockDir);
-    $running = $lockPresent && $heartbeatAgeSeconds !== null && $heartbeatAgeSeconds <= 20;
+    $running = $lockPresent && $heartbeatAgeSeconds !== null && $heartbeatAgeSeconds <= WORKER_HEARTBEAT_FRESH_SECONDS;
 
-    jsonResponse(200, [
+    return [
         'running' => $running,
         'lock_present' => $lockPresent,
         'heartbeat_age_seconds' => $heartbeatAgeSeconds,
         'heartbeat' => $heartbeat,
         'queue_count' => $queueCount,
-        'local_bridge' => probeLocalBridge($config),
-        'start_command' => 'ssh agitated-engelbart_9pw3g4pzt1v@74.208.203.194 "nohup /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1 &"',
-        'watchdog_command' => '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1',
+    ];
+}
+
+function reconcileStaleJobs(PDO $pdo, array $config, ?array $runtime = null): int
+{
+    $runtime = $runtime ?? workerRuntimeStatus($config);
+    $workerRunning = (bool)($runtime['running'] ?? false);
+    $queueDir = (string)($config['queue_dir'] ?? '');
+    $nowTs = time();
+    $marked = 0;
+
+    $query = $pdo->prepare(
+        "SELECT id, status, created_at, updated_at, started_at, logs
+         FROM jobs
+         WHERE status IN ('queued', 'running')"
+    );
+    $query->execute();
+
+    foreach ($query->fetchAll() as $job) {
+        $jobId = (string)($job['id'] ?? '');
+        if ($jobId === '') {
+            continue;
+        }
+
+        $status = (string)($job['status'] ?? '');
+        $createdAt = parseTimestampSeconds((string)($job['created_at'] ?? ''));
+        $updatedAt = parseTimestampSeconds((string)($job['updated_at'] ?? ''));
+        $startedAt = parseTimestampSeconds((string)($job['started_at'] ?? ''));
+        $lastTouched = $updatedAt ?? $startedAt ?? $createdAt ?? $nowTs;
+        $ageSeconds = max(0, $nowTs - $lastTouched);
+
+        $queuePath = $queueDir === '' ? '' : joinPath($queueDir, $jobId . '.json');
+        $workingPath = $queueDir === '' ? '' : joinPath($queueDir, $jobId . '.working');
+        $hasQueueFile = $queuePath !== '' && is_file($queuePath);
+        $hasWorkingFile = $workingPath !== '' && is_file($workingPath);
+        $reason = null;
+
+        if (!$workerRunning && $ageSeconds >= STALE_JOB_GRACE_SECONDS) {
+            $reason = $status === 'queued'
+                ? 'The ad-removal worker is not running, so this queued conversion cannot continue. Try ad removal again after the worker is online.'
+                : 'The ad-removal worker stopped before this conversion finished. Try ad removal again after the worker is online.';
+        } elseif (!$hasQueueFile && !$hasWorkingFile && $ageSeconds >= STALE_JOB_GRACE_SECONDS) {
+            $reason = 'The conversion queue record is missing, so this job cannot continue. Try ad removal again.';
+        } elseif ($status === 'running' && $startedAt !== null && ($nowTs - $startedAt) >= RUNNING_JOB_HARD_TIMEOUT_SECONDS) {
+            $reason = 'The conversion exceeded the maximum allowed runtime and was marked failed. Try ad removal again.';
+        }
+
+        if ($reason !== null) {
+            markJobFailedFromApi($pdo, $config, $job, $reason);
+            $marked++;
+        }
+    }
+
+    return $marked;
+}
+
+function parseTimestampSeconds(string $value): ?int
+{
+    $value = trim($value);
+    if ($value === '') {
+        return null;
+    }
+
+    $timestamp = strtotime($value);
+    return $timestamp === false ? null : $timestamp;
+}
+
+function markJobFailedFromApi(PDO $pdo, array $config, array $job, string $message): void
+{
+    $jobId = (string)($job['id'] ?? '');
+    if ($jobId === '') {
+        return;
+    }
+
+    $now = gmdate(DATE_ATOM);
+    $existingLogs = trim((string)($job['logs'] ?? ''));
+    $logLine = 'Marked failed by API health check: ' . $message;
+    $logs = $existingLogs === '' ? $logLine : $existingLogs . "\n" . $logLine;
+
+    $update = $pdo->prepare(
+        "UPDATE jobs
+         SET status = 'failed',
+             progress = 100,
+             error_message = :error_message,
+             logs = :logs,
+             updated_at = :updated_at,
+             finished_at = :finished_at
+         WHERE id = :id AND status IN ('queued', 'running')"
+    );
+    $update->execute([
+        ':error_message' => $message,
+        ':logs' => $logs,
+        ':updated_at' => $now,
+        ':finished_at' => $now,
+        ':id' => $jobId,
     ]);
+
+    @unlink(joinPath((string)$config['queue_dir'], $jobId . '.json'));
+    @unlink(joinPath((string)$config['queue_dir'], $jobId . '.working'));
 }
 
 function probeLocalBridge(array $config): array

@@ -9,9 +9,12 @@ const isLocalDevHost =
 const API_BASE = (
   import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV && isLocalDevHost ? DEFAULT_REMOTE_API_BASE : '/adfree-api')
 ).replace(/\/$/, '')
-const DEFAULT_BACKEND: Backend = 'tunnel-parakeet'
+const DEFAULT_BACKEND: Backend = 'tunnel-openai-whisper'
 const SETTINGS_VERSION = 2
 const OPENAI_MODEL = 'gpt-5.5'
+const JOB_POLL_INTERVAL_MS = 5000
+const JOB_SLOW_NOTICE_MS = 10 * 60 * 1000
+const JOB_STATUS_TRANSIENT_RETRIES = 12
 
 const SEARCH_CACHE_TTL = 24 * 60 * 60 * 1000
 const EPISODE_CACHE_TTL = 6 * 60 * 60 * 1000
@@ -61,7 +64,7 @@ function deferEffect(callback: () => void | Promise<void>): number {
 }
 
 type DetectionMode = 'openai'
-type Backend = 'tunnel-parakeet'
+type Backend = 'tunnel-openai-whisper'
 
 type SavedSettings = {
   settingsVersion?: number
@@ -146,6 +149,7 @@ type WorkerStatus = {
   lock_present: boolean
   heartbeat_age_seconds: number | null
   queue_count: number
+  stale_jobs_marked?: number
   start_command: string
   watchdog_command: string
   local_bridge?: {
@@ -676,19 +680,47 @@ function App() {
   }
 
   async function waitForJob(jobId: string): Promise<void> {
-    for (let attempt = 0; attempt < 240; attempt += 1) {
-      const response = await fetch(apiUrl(`/api/jobs/${jobId}`))
-      const status = (await response.json()) as Partial<JobStatusResponse> & { error?: string }
+    let transientErrors = 0
+    let slowNoticeShown = false
+    const waitStartedAt = Date.now()
+
+    while (true) {
+      let response: Response | null = null
+      let status: (Partial<JobStatusResponse> & { error?: string }) | null = null
+
+      try {
+        response = await fetch(apiUrl(`/api/jobs/${jobId}`))
+        status = (await response.json()) as Partial<JobStatusResponse> & { error?: string }
+      } catch (error) {
+        if (transientErrors < JOB_STATUS_TRANSIENT_RETRIES) {
+          transientErrors += 1
+          const detail = error instanceof Error ? error.message : 'Network status check failed.'
+          appendLog(`Status check temporarily failed: ${detail}. Retrying...`)
+          await sleep(JOB_POLL_INTERVAL_MS)
+          continue
+        }
+        throw error
+      }
+
+      if (!response || !status) {
+        throw new Error('Status check failed before the server returned a response.')
+      }
 
       if (!response.ok) {
         const detail = status.error || `Status check failed (${response.status})`
+        if (response.status >= 500 && transientErrors < JOB_STATUS_TRANSIENT_RETRIES) {
+          transientErrors += 1
+          appendLog(`Status check temporarily failed: ${detail}. Retrying...`)
+          await sleep(JOB_POLL_INTERVAL_MS)
+          continue
+        }
         throw new Error(detail)
       }
 
+      transientErrors = 0
       if (!status.job_id || !status.status) {
         throw new Error('Status response was missing job details.')
       }
-
       const typedStatus = status as JobStatusResponse
       const nextLogs = typedStatus.logs ? typedStatus.logs.split('\n').filter((line) => line.trim().length > 0) : []
       setJobStatus(typedStatus)
@@ -718,10 +750,13 @@ function App() {
         throw new Error(typedStatus.error_message || `Job ${typedStatus.status}.`)
       }
 
-      await sleep(2500)
-    }
+      if (!slowNoticeShown && Date.now() - waitStartedAt >= JOB_SLOW_NOTICE_MS) {
+        slowNoticeShown = true
+        appendLog('Still processing on the server. You can leave this page open or come back later; the Ad-free list will update when it finishes.')
+      }
 
-    throw new Error('Timed out waiting for the processing job to finish.')
+      await sleep(JOB_POLL_INTERVAL_MS)
+    }
   }
 
   async function submitEpisodeForProcessing(
@@ -1099,6 +1134,11 @@ function App() {
               {workerStatus.local_bridge && !workerStatus.local_bridge.reachable ? (
                 <p className="tiny">
                   Ads cannot be removed right now. Start WAMP, then run the Windows scheduled task named AdFree Local Reverse Tunnel.
+                </p>
+              ) : null}
+              {workerStatus.stale_jobs_marked ? (
+                <p className="tiny">
+                  Recovered {workerStatus.stale_jobs_marked} stalled conversion{workerStatus.stale_jobs_marked === 1 ? '' : 's'} as failed.
                 </p>
               ) : null}
               {!workerStatus.running ? (

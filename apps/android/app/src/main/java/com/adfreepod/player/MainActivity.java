@@ -107,7 +107,8 @@ public class MainActivity extends Activity {
     private static final int EPISODE_PAGE_SIZE = 40;
     private static final long PODCAST_CACHE_TTL_MS = 12L * 3600L * 1000L;
     private static final int REMOTE_JOB_POLL_INTERVAL_MS = 10000;
-    private static final int REMOTE_JOB_MAX_POLLS = 360;
+    private static final int REMOTE_JOB_STATUS_MAX_ERRORS = 12;
+    private static final int REMOTE_JOB_LONG_NOTICE_POLLS = 60;
     private static final String[] FILTERS = {"All", "New", "In progress", "Downloaded", "Not downloaded", "Listened", "Unlistened"};
 
     private static final String NOTIF_CH_REMOVAL = "ad_removal";
@@ -2411,10 +2412,32 @@ public class MainActivity extends Activity {
     }
 
     private JSONObject waitForRemoteJobCompletion(String apiBase, String jobId) throws Exception {
-        for (int poll = 0; poll < REMOTE_JOB_MAX_POLLS; poll++) {
+        int poll = 0;
+        int transientErrors = 0;
+
+        while (true) {
             if (adCancelled.get()) throw new AdRemovalCancelledException();
 
-            JSONObject status = fetchRemoteJobStatus(apiBase, jobId);
+            JSONObject status;
+            try {
+                status = fetchRemoteJobStatus(apiBase, jobId);
+                transientErrors = 0;
+            } catch (Exception ex) {
+                transientErrors++;
+                if (transientErrors > REMOTE_JOB_STATUS_MAX_ERRORS) throw ex;
+
+                String detail = TextUtils.isEmpty(ex.getMessage()) ? "temporary network error" : ex.getMessage();
+                adCurrentStatus = "Waiting for server status... retrying (" + transientErrors + "/" + REMOTE_JOB_STATUS_MAX_ERRORS + ")";
+                final String uiStatus = adCurrentStatus + "\n" + detail;
+                postUi(() -> {
+                    refreshAdBusyPanel();
+                    setStatus(uiStatus);
+                });
+                updateAdNotification();
+                Thread.sleep(REMOTE_JOB_POLL_INTERVAL_MS);
+                continue;
+            }
+
             String state = status.optString("status", "");
             double progress = status.optDouble("progress", 0);
             String step = lastLogLine(status.optString("logs", ""));
@@ -2434,9 +2457,18 @@ public class MainActivity extends Activity {
                 return status;
             }
 
+            poll++;
+            if (poll == REMOTE_JOB_LONG_NOTICE_POLLS) {
+                adCurrentStatus = text + "\nStill processing on the server. You can keep using the app; a notification will appear when it is ready.";
+                postUi(() -> {
+                    refreshAdBusyPanel();
+                    setStatus(adCurrentStatus);
+                });
+                updateAdNotification();
+            }
+
             Thread.sleep(REMOTE_JOB_POLL_INTERVAL_MS);
         }
-        throw new RuntimeException("Timed out waiting for server processing to finish.");
     }
 
     private void cancelRemoteJobQuietly(String apiBase, String jobId) {
