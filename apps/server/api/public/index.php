@@ -401,7 +401,7 @@ function createJob(PDO $pdo, array $config): void
     $id = bin2hex(random_bytes(16));
     $extension = detectUrlExtension($sourceUrl);
     $inputPath = joinPath($config['input_dir'], $id . '.' . $extension);
-    $outputPath = joinPath($config['output_dir'], $id . '.noads.mp3');
+    $outputPath = joinPath($config['output_dir'], $id . '.noads.m4a');
 
     $now = gmdate(DATE_ATOM);
 
@@ -770,12 +770,28 @@ function downloadJobOutput(PDO $pdo, array $config, string $id): void
 
 function audioContentType(string $path): string
 {
+    if (looksLikeMp4Container($path)) {
+        return 'audio/mp4';
+    }
+
     return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
         'mp3' => 'audio/mpeg',
         'wav' => 'audio/wav',
+        'aac' => 'audio/aac',
         'm4a', 'mp4' => 'audio/mp4',
         default => 'application/octet-stream',
     };
+}
+
+function looksLikeMp4Container(string $path): bool
+{
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) {
+        return false;
+    }
+    $header = fread($handle, 12);
+    fclose($handle);
+    return is_string($header) && strlen($header) >= 8 && substr($header, 4, 4) === 'ftyp';
 }
 
 function cancelJob(PDO $pdo, array $config, string $id): void
