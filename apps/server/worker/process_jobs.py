@@ -48,7 +48,7 @@ TEMP_AUDIO_RETENTION_SECONDS = max(
         )
     ),
 )
-OUTPUT_RETENTION_DAYS = max(0, int(os.getenv("OUTPUT_RETENTION_DAYS", "0")))
+OUTPUT_RETENTION_DAYS = max(0, int(os.getenv("OUTPUT_RETENTION_DAYS", "30")))
 SOURCE_DOWNLOAD_TIMEOUT_SECONDS = max(
     30, int(os.getenv("SOURCE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
 )
@@ -63,7 +63,7 @@ LOCAL_PROCESSOR_TIMEOUT_SECONDS = max(
 
 MAX_LOG_CHARS = 60000
 AUDIO_TEMP_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".part"}
-CLEANUP_INTERVAL_SECONDS = max(60, int(os.getenv("CLEANUP_INTERVAL_SECONDS", "60")))
+CLEANUP_INTERVAL_SECONDS = max(60, int(os.getenv("CLEANUP_INTERVAL_SECONDS", str(20 * 60))))
 
 
 def utc_now() -> str:
@@ -354,19 +354,29 @@ def prune_expired_temp_audio() -> None:
             f"input={deleted_inputs}, source-cache={deleted_cache}"
         )
 
+
 def prune_old_outputs() -> None:
     if OUTPUT_RETENTION_DAYS <= 0:
         return
     retention_seconds = OUTPUT_RETENTION_DAYS * 24 * 3600
     cutoff = time.time() - retention_seconds
+    deleted = 0
     for candidate in OUTPUT_DIR.glob("*"):
         if not candidate.is_file():
             continue
         try:
             if candidate.stat().st_mtime < cutoff:
                 candidate.unlink(missing_ok=True)
+                deleted += 1
         except OSError:
             continue
+    if deleted:
+        print(f"[worker] Pruned old ad-free outputs: output={deleted}")
+
+
+def run_storage_cleanup() -> None:
+    prune_expired_temp_audio()
+    prune_old_outputs()
 
 
 def download_source_to_cache(
@@ -684,7 +694,6 @@ def process_job_file(queue_file: Path) -> None:
     started_at = time.time()
 
     try:
-        prune_expired_temp_audio()
         if not is_tunnel_backend(backend):
             raise RuntimeError("Ad removal requires the Windows tunnel processor. No server-side fallback is available.")
 
@@ -738,8 +747,7 @@ def main() -> None:
     args = parser.parse_args()
 
     ensure_directories()
-    prune_expired_temp_audio()
-    prune_old_outputs()
+    run_storage_cleanup()
     print(
         "[worker] Starting with "
         f"mode={PROCESSOR_LABEL}, queue={QUEUE_DIR}, output={OUTPUT_DIR}, cache={SOURCE_CACHE_DIR}"
@@ -756,7 +764,7 @@ def main() -> None:
         did_work = process_queue_once()
         now = time.monotonic()
         if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
-            prune_expired_temp_audio()
+            run_storage_cleanup()
             last_cleanup_at = now
         if not did_work:
             write_heartbeat("idle")
