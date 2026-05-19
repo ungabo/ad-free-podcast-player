@@ -26,6 +26,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[2]
 BUNDLED_FFMPEG_BIN = BASE_DIR / "runtime" / "bin" / "ffmpeg"
 BUNDLED_FFPROBE_BIN = BASE_DIR / "runtime" / "bin" / "ffprobe"
+OUTPUT_AUDIO_BITRATE = os.getenv("ADCUTFORGE_AUDIO_BITRATE", "48k").strip() or "48k"
 
 PARAKEET_SCRIPT = r"""
 import audioop
@@ -791,7 +792,7 @@ def render_with_cuts(ffmpeg_bin: str, input_file: Path, output_file: Path, range
                 "-c:a",
                 "aac",
                 "-b:a",
-                "64k",
+                OUTPUT_AUDIO_BITRATE,
                 "-ac",
                 "1",
                 str(part),
@@ -824,7 +825,18 @@ def render_intro_trim(ffmpeg_bin: str, input_file: Path, output_file: Path, trim
     command = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error"]
     if trim_start > 0:
         command.extend(["-ss", f"{trim_start:.2f}"])
-    command.extend(["-i", str(input_file), "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", str(output_file)])
+    command.extend([
+        "-i",
+        str(input_file),
+        "-vn",
+        "-c:a",
+        "aac",
+        "-b:a",
+        OUTPUT_AUDIO_BITRATE,
+        "-ac",
+        "1",
+        str(output_file),
+    ])
     result = run_command(command)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffmpeg render failed")
