@@ -88,7 +88,12 @@ if ($BatchMode) {
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($argList -join ' ')
 $trigger = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'Starts WAMP and maintains reverse SSH tunnel for local adfree API bridge' -Force | Out-Null
 Write-Host "Registered scheduled task: $TaskName"
