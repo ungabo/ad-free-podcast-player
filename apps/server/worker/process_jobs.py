@@ -30,12 +30,25 @@ HEARTBEAT_PATH = Path(
 ).resolve()
 POLL_SECONDS = max(1, int(os.getenv("WORKER_POLL_SECONDS", "2")))
 PROCESSOR_LABEL = "windows-tunnel"
-SOURCE_CACHE_RETENTION_DAYS = max(
-    1, int(os.getenv("SOURCE_CACHE_RETENTION_DAYS", "60"))
+SOURCE_CACHE_RETENTION_SECONDS = max(
+    60,
+    int(
+        os.getenv(
+            "SOURCE_CACHE_RETENTION_SECONDS",
+            str(int(os.getenv("SOURCE_CACHE_RETENTION_MINUTES", "20")) * 60),
+        )
+    ),
 )
-OUTPUT_RETENTION_DAYS = max(
-    1, int(os.getenv("OUTPUT_RETENTION_DAYS", "7"))
+TEMP_AUDIO_RETENTION_SECONDS = max(
+    60,
+    int(
+        os.getenv(
+            "TEMP_AUDIO_RETENTION_SECONDS",
+            str(int(os.getenv("TEMP_AUDIO_RETENTION_MINUTES", "20")) * 60),
+        )
+    ),
 )
+OUTPUT_RETENTION_DAYS = max(0, int(os.getenv("OUTPUT_RETENTION_DAYS", "0")))
 SOURCE_DOWNLOAD_TIMEOUT_SECONDS = max(
     30, int(os.getenv("SOURCE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
 )
@@ -49,6 +62,8 @@ LOCAL_PROCESSOR_TIMEOUT_SECONDS = max(
 )
 
 MAX_LOG_CHARS = 60000
+AUDIO_TEMP_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".part"}
+CLEANUP_INTERVAL_SECONDS = max(60, int(os.getenv("CLEANUP_INTERVAL_SECONDS", "60")))
 
 
 def utc_now() -> str:
@@ -277,20 +292,71 @@ def find_cached_source_file(cache_key: str) -> Optional[Path]:
     return None
 
 
-def prune_expired_source_cache() -> None:
-    retention_seconds = SOURCE_CACHE_RETENTION_DAYS * 24 * 3600
+def active_job_ids() -> set[str]:
+    try:
+        with sqlite3.connect(DB_PATH) as connection:
+            rows = connection.execute(
+                "SELECT id FROM jobs WHERE status IN ('queued', 'running')"
+            ).fetchall()
+        return {str(row[0]) for row in rows if row and row[0]}
+    except sqlite3.Error:
+        return set()
+
+
+def file_belongs_to_active_job(candidate: Path, active_ids: set[str]) -> bool:
+    if not active_ids:
+        return False
+    first_stem = candidate.name.split(".", 1)[0]
+    return first_stem in active_ids
+
+
+def prune_expired_files(
+    directory: Path,
+    retention_seconds: int,
+    *,
+    active_ids: Optional[set[str]] = None,
+    suffixes: Optional[set[str]] = None,
+) -> int:
     cutoff = time.time() - retention_seconds
-    for candidate in SOURCE_CACHE_DIR.glob("*"):
+    deleted = 0
+    for candidate in directory.glob("*"):
         if not candidate.is_file():
+            continue
+        if suffixes is not None and candidate.suffix.lower() not in suffixes:
+            continue
+        if active_ids is not None and file_belongs_to_active_job(candidate, active_ids):
             continue
         try:
             if candidate.stat().st_mtime < cutoff:
                 candidate.unlink(missing_ok=True)
+                deleted += 1
         except OSError:
             continue
+    return deleted
 
+
+def prune_expired_temp_audio() -> None:
+    active_ids = active_job_ids()
+    deleted_inputs = prune_expired_files(
+        INPUT_DIR,
+        TEMP_AUDIO_RETENTION_SECONDS,
+        active_ids=active_ids,
+        suffixes=AUDIO_TEMP_SUFFIXES,
+    )
+    deleted_cache = prune_expired_files(
+        SOURCE_CACHE_DIR,
+        SOURCE_CACHE_RETENTION_SECONDS,
+        suffixes=AUDIO_TEMP_SUFFIXES,
+    )
+    if deleted_inputs or deleted_cache:
+        print(
+            "[worker] Pruned temp audio: "
+            f"input={deleted_inputs}, source-cache={deleted_cache}"
+        )
 
 def prune_old_outputs() -> None:
+    if OUTPUT_RETENTION_DAYS <= 0:
+        return
     retention_seconds = OUTPUT_RETENTION_DAYS * 24 * 3600
     cutoff = time.time() - retention_seconds
     for candidate in OUTPUT_DIR.glob("*"):
@@ -618,7 +684,7 @@ def process_job_file(queue_file: Path) -> None:
     started_at = time.time()
 
     try:
-        prune_expired_source_cache()
+        prune_expired_temp_audio()
         if not is_tunnel_backend(backend):
             raise RuntimeError("Ad removal requires the Windows tunnel processor. No server-side fallback is available.")
 
@@ -672,7 +738,7 @@ def main() -> None:
     args = parser.parse_args()
 
     ensure_directories()
-    prune_expired_source_cache()
+    prune_expired_temp_audio()
     prune_old_outputs()
     print(
         "[worker] Starting with "
@@ -685,8 +751,13 @@ def main() -> None:
         write_heartbeat("idle")
         return
 
+    last_cleanup_at = time.monotonic()
     while True:
         did_work = process_queue_once()
+        now = time.monotonic()
+        if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
+            prune_expired_temp_audio()
+            last_cleanup_at = now
         if not did_work:
             write_heartbeat("idle")
             time.sleep(POLL_SECONDS)
