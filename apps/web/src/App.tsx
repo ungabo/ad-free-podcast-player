@@ -22,6 +22,7 @@ const SEARCH_CACHE_TTL = 12 * 60 * 60 * 1000
 const EPISODE_CACHE_TTL = 12 * 60 * 60 * 1000
 const EPISODE_CACHE_VERSION = 2
 const EPISODE_PAGE_SIZE = 40
+const COMPLETED_JOB_INDEX_LIMIT = 200
 const DESKTOP_LEGACY_IMPORT_KEY = 'adfree-desktop-legacy-import-v1'
 
 function getSearchCache(term: string): PodcastResult[] | null {
@@ -114,6 +115,15 @@ function mediaUrlWithoutQuery(url: string | null | undefined): string {
 
 function normalizedTitleKey(value: string | null | undefined): string {
   return (value ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+function normalizedMatchText(value: string | null | undefined): string {
+  return cleanJobText(value)
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function deferEffect(callback: () => void | Promise<void>): number {
@@ -582,8 +592,8 @@ function jobDisplayPodcast(job: Pick<JobStatusResponse, 'podcast_name'>): string
 }
 
 function completedJobKey(job: JobRecord): string {
-  const title = jobDisplayTitle(job).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
-  const podcast = jobDisplayPodcast(job).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  const title = normalizedMatchText(jobDisplayTitle(job))
+  const podcast = normalizedMatchText(jobDisplayPodcast(job))
   return `${podcast}|${title}`
 }
 
@@ -627,9 +637,9 @@ function indexRemoteEpisodeStates(states: RemoteEpisodeState[]): Record<string, 
   return indexed
 }
 
-function cleanCompletedJobs(jobs: JobRecord[]): JobRecord[] {
+function cleanCompletedJobs(jobs: JobRecord[], limit = 40): JobRecord[] {
   const seen = new Set<string>()
-  return [...jobs]
+  const filtered = [...jobs]
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
     .filter((job) => {
       const title = jobDisplayTitle(job)
@@ -639,7 +649,7 @@ function cleanCompletedJobs(jobs: JobRecord[]): JobRecord[] {
       seen.add(key)
       return true
     })
-    .slice(0, 40)
+  return Number.isFinite(limit) ? filtered.slice(0, limit) : filtered
 }
 
 function sleep(ms: number): Promise<void> {
@@ -668,7 +678,7 @@ function App() {
   const [sourceAudioUrl, setSourceAudioUrl] = useState('')
   const [episodeStates, setEpisodeStates] = useState<Record<string, EpisodePlaybackState>>(() => loadEpisodeStates())
 
-  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [submittingEpisodeKeys, setSubmittingEpisodeKeys] = useState<Record<string, boolean>>({})
   const [isPreparingPlayback, setIsPreparingPlayback] = useState(false)
   const [runError, setRunError] = useState('')
   const [logLines, setLogLines] = useState<string[]>([])
@@ -691,6 +701,10 @@ function App() {
     () => cleanCompletedJobs([...completedJobs, ...legacyCompletedJobs]),
     [completedJobs, legacyCompletedJobs]
   )
+  const adFreeMatchJobs = useMemo(
+    () => cleanCompletedJobs([...completedJobs, ...legacyCompletedJobs], COMPLETED_JOB_INDEX_LIMIT),
+    [completedJobs, legacyCompletedJobs]
+  )
   const legacySavedCards = useMemo(() => legacySavedEpisodeCards(legacyDesktopState), [legacyDesktopState])
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<JobRecord | null>(null)
 
@@ -709,13 +723,15 @@ function App() {
   const processedUrlRef = useRef<string | null>(null)
   const searchRequestRef = useRef(0)
   const lastEpisodeStateSyncRef = useRef(0)
+  const liveJobIdsRef = useRef<string[]>([])
 
   const activeAudioLabel = useMemo(() => {
     if (!activeEpisode) return 'No episode selected'
     return activeEpisode.trackName
   }, [activeEpisode])
 
-  const canSubmit = Boolean(activeEpisode && episodePlayableUrl(activeEpisode) && !isSubmitting)
+  const isSubmitting = Object.keys(submittingEpisodeKeys).length > 0
+  const canSubmit = Boolean(activeEpisode && episodePlayableUrl(activeEpisode))
   const windowsBridgeUnavailable = workerStatus?.local_bridge ? !workerStatus.local_bridge.reachable : false
   const totalEpisodePages = Math.max(1, Math.ceil(episodes.length / EPISODE_PAGE_SIZE))
   const currentEpisodePage = Math.min(episodePage, totalEpisodePages - 1)
@@ -736,6 +752,8 @@ function App() {
   const processingPodcast = activeJobPodcast || activePodcast?.collectionName || ''
   const hasProcessingCard = Boolean(jobStatus || isSubmitting || logLines.length > 0)
   const selectedAdFreeJob = activeEpisode ? adFreeJobForEpisode(activeEpisode) : null
+  const selectedLiveJob = activeEpisode ? liveJobForEpisode(activeEpisode) : null
+  const selectedEpisodeSubmitting = activeEpisode ? isEpisodeSubmitting(activeEpisode) : false
 
   function setEpisodePageClamped(page: number): void {
     setEpisodePage(Math.max(0, Math.min(page, totalEpisodePages - 1)))
@@ -920,6 +938,7 @@ function App() {
   async function selectPodcast(podcast: PodcastResult): Promise<EpisodeResult[]> {
     setActivePodcast(podcast)
     setEpisodePage(0)
+    void fetchCompletedJobs()
     return loadPodcastEpisodes(podcast)
   }
 
@@ -1103,26 +1122,52 @@ function App() {
     updateEpisodeState(episode, { saved: !current.saved })
   }
 
-  function adFreeJobForEpisode(episode: EpisodeResult): JobRecord | null {
+  function episodeSubmissionKey(episode: EpisodeResult, podcast: PodcastResult | null = activePodcast): string {
+    return remoteEpisodeKeysFor(episode, podcast)[0] ?? `track:${episode.trackId}`
+  }
+
+  function isEpisodeSubmitting(episode: EpisodeResult): boolean {
+    return Boolean(submittingEpisodeKeys[episodeSubmissionKey(episode)])
+  }
+
+  function setEpisodeSubmitting(episode: EpisodeResult, podcast: PodcastResult | null, submitting: boolean): void {
+    const key = episodeSubmissionKey(episode, podcast)
+    setSubmittingEpisodeKeys((current) => {
+      if (submitting) return { ...current, [key]: true }
+      if (!current[key]) return current
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+  }
+
+  function jobMatchesEpisode(job: JobRecord, episode: EpisodeResult, podcast: PodcastResult | null = activePodcast): boolean {
     const mediaUrl = episodePlayableUrl(episode)
     const canonical = canonicalMediaUrl(mediaUrl)
     const noQuery = mediaUrlWithoutQuery(mediaUrl)
-    const episodeTitle = normalizedTitleKey(episode.trackName)
-    const podcastTitle = normalizedTitleKey(activePodcast?.collectionName)
+    const episodeTitle = normalizedMatchText(episode.trackName)
+    const podcastTitle = normalizedMatchText(podcast?.collectionName)
+    const jobUrl = canonicalMediaUrl(job.source_url)
+    const jobNoQuery = mediaUrlWithoutQuery(job.source_url)
+    if (canonical && jobUrl && canonical === jobUrl) return true
+    if (noQuery && jobNoQuery && noQuery === jobNoQuery) return true
+    return Boolean(
+      episodeTitle &&
+      podcastTitle &&
+      normalizedMatchText(job.episode_title) === episodeTitle &&
+      normalizedMatchText(job.podcast_name) === podcastTitle
+    )
+  }
 
-    return visibleCompletedJobs.find((job) => {
+  function adFreeJobForEpisode(episode: EpisodeResult): JobRecord | null {
+    return adFreeMatchJobs.find((job) => {
       if (!job.download_url) return false
-      const jobUrl = canonicalMediaUrl(job.source_url)
-      const jobNoQuery = mediaUrlWithoutQuery(job.source_url)
-      if (canonical && jobUrl && canonical === jobUrl) return true
-      if (noQuery && jobNoQuery && noQuery === jobNoQuery) return true
-      return Boolean(
-        episodeTitle &&
-        podcastTitle &&
-        normalizedTitleKey(job.episode_title) === episodeTitle &&
-        normalizedTitleKey(job.podcast_name) === podcastTitle
-      )
+      return jobMatchesEpisode(job, episode)
     }) ?? null
+  }
+
+  function liveJobForEpisode(episode: EpisodeResult): JobRecord | null {
+    return liveJobs.find((job) => jobMatchesEpisode(job, episode)) ?? null
   }
 
   function badgesForEpisode(episode: EpisodeResult): string[] {
@@ -1135,6 +1180,8 @@ function App() {
     }
     if (state.saved) badges.push('Saved')
     if (adFreeJobForEpisode(episode)) badges.push('Ad-free')
+    const liveJob = liveJobForEpisode(episode)
+    if (liveJob) badges.push(liveJob.status === 'running' ? 'Processing' : 'Queued')
     return badges
   }
 
@@ -1189,7 +1236,17 @@ function App() {
       const response = await fetchWithTimeout(apiUrl(`/api/jobs?status=queued,running&limit=20${userParam}`))
       if (!response.ok) return
       const data = (await response.json()) as { jobs: JobRecord[] }
-      setLiveJobs(data.jobs ?? [])
+      const jobs = data.jobs ?? []
+      const nextJobIds = jobs.map((job) => job.job_id)
+      const previousJobIds = liveJobIdsRef.current
+      const liveQueueChanged = previousJobIds.length !== nextJobIds.length ||
+        previousJobIds.some((jobId) => !nextJobIds.includes(jobId))
+      liveJobIdsRef.current = nextJobIds
+      setLiveJobs(jobs)
+      if (previousJobIds.length > 0 && liveQueueChanged) {
+        void fetchCompletedJobs()
+        void fetchFailedJobs()
+      }
     } catch {
       // Best-effort live monitoring
     }
@@ -1217,7 +1274,7 @@ function App() {
 
   async function fetchCompletedJobs(): Promise<void> {
     try {
-      const response = await fetchWithTimeout(apiUrl('/api/jobs?status=completed&limit=100'))
+      const response = await fetchWithTimeout(apiUrl(`/api/jobs?status=completed&limit=${COMPLETED_JOB_INDEX_LIMIT}`))
       if (!response.ok) return
       const data = (await response.json()) as { jobs: JobRecord[] }
       setCompletedJobs(data.jobs ?? [])
@@ -1436,18 +1493,24 @@ function App() {
     options?: { backend?: Backend; detectionMode?: DetectionMode; podcast?: PodcastResult | null }
   ): Promise<void> {
     const mediaUrl = episodePlayableUrl(episode)
+    const podcastForJob = options?.podcast ?? activePodcast
     if (!mediaUrl) {
       setRunError('This episode does not expose an audio URL from iTunes.')
       return
     }
 
+    const existingLiveJob = liveJobForEpisode(episode)
+    if (existingLiveJob) {
+      setJobStatus(existingLiveJob)
+      appendLog(`${sourceLabel} is already ${existingLiveJob.status}.`)
+      return
+    }
+
     setRunError('')
-    setIsSubmitting(true)
+    setEpisodeSubmitting(episode, podcastForJob, true)
     setJobStatus(null)
     setDirectDownloadUrl('')
     setProcessedAudioUrl('')
-    setLogLines([])
-    setActiveJob('')
 
     const effectiveBackend = options?.backend ?? backend
     const effectiveDetectionMode: DetectionMode = 'openai'
@@ -1456,7 +1519,7 @@ function App() {
       const message = 'Ads cannot be removed right now because the Windows processor is offline. Start WAMP and the Windows tunnel, then try again.'
       setRunError(message)
       appendLog(`Error: ${message}`)
-      setIsSubmitting(false)
+      setEpisodeSubmitting(episode, podcastForJob, false)
       return
     }
 
@@ -1473,7 +1536,6 @@ function App() {
       }
       // Pass episode metadata so the server can store it on the job.
       form.append('episode_title', episode.trackName)
-      const podcastForJob = options?.podcast ?? activePodcast
       if (podcastForJob) {
         form.append('podcast_name', podcastForJob.collectionName)
       }
@@ -1493,16 +1555,16 @@ function App() {
       }
 
       appendLog(`Job queued: ${createResult.job_id}`)
-      setActiveJob(createResult.job_id)
       setStartNoticeVisible(true)
       window.setTimeout(() => setStartNoticeVisible(false), 3000)
-      await waitForJob(createResult.job_id)
+      await fetchLiveJobs()
+      void fetchCompletedJobs()
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Processing failed.'
       setRunError(message)
       appendLog(`Error: ${message}`)
     } finally {
-      setIsSubmitting(false)
+      setEpisodeSubmitting(episode, podcastForJob, false)
     }
   }
 
@@ -1867,6 +1929,15 @@ function App() {
               const state = stateForEpisode(episode)
               const badges = badgesForEpisode(episode)
               const adFreeJob = adFreeJobForEpisode(episode)
+              const liveJob = liveJobForEpisode(episode)
+              const episodeSubmitting = isEpisodeSubmitting(episode)
+              const removeLabel = episodeSubmitting
+                ? 'Queueing...'
+                : liveJob
+                  ? (liveJob.status === 'running' ? 'Processing' : 'Queued')
+                  : adFreeJob
+                    ? 'Get ad-free'
+                    : 'Remove ads'
               return (
                 <div
                   key={episode.trackId}
@@ -1904,7 +1975,13 @@ function App() {
                     <button
                       type="button"
                       className="episode-remove-btn"
-                      disabled={(!episodePlayableUrl(episode) && !adFreeJob?.download_url) || isSubmitting || isPreparingPlayback || (!adFreeJob && windowsBridgeUnavailable)}
+                      disabled={
+                        (!episodePlayableUrl(episode) && !adFreeJob?.download_url) ||
+                        episodeSubmitting ||
+                        Boolean(liveJob) ||
+                        isPreparingPlayback ||
+                        (!adFreeJob && windowsBridgeUnavailable)
+                      }
                       onClick={(event) => {
                         event.stopPropagation()
                         chooseEpisode(episode)
@@ -1917,7 +1994,7 @@ function App() {
                         void submitEpisodeForProcessing(episode, episode.trackName, { podcast: activePodcast })
                       }}
                     >
-                      {isSubmitting ? 'Processing...' : adFreeJob ? 'Get ad-free' : 'Remove ads'}
+                      {removeLabel}
                     </button>
                     <button
                       type="button"
@@ -1990,7 +2067,13 @@ function App() {
           <div className="button-row">
             <button
               type="button"
-              disabled={isSubmitting || (!canSubmit && !selectedAdFreeJob?.download_url) || isPreparingPlayback || (!selectedAdFreeJob && windowsBridgeUnavailable)}
+              disabled={
+                selectedEpisodeSubmitting ||
+                Boolean(selectedLiveJob) ||
+                (!canSubmit && !selectedAdFreeJob?.download_url) ||
+                isPreparingPlayback ||
+                (!selectedAdFreeJob && windowsBridgeUnavailable)
+              }
               onClick={() => {
                 if (!activeEpisode) return
                 if (selectedAdFreeJob?.download_url) {
@@ -2002,7 +2085,13 @@ function App() {
                 void submitEpisodeForProcessing(activeEpisode, activeEpisode.trackName)
               }}
             >
-              {isSubmitting ? 'Processing...' : selectedAdFreeJob ? 'Get existing ad-free episode' : 'Remove ads from selected episode'}
+              {selectedEpisodeSubmitting
+                ? 'Queueing...'
+                : selectedLiveJob
+                  ? (selectedLiveJob.status === 'running' ? 'Processing selected episode' : 'Selected episode queued')
+                  : selectedAdFreeJob
+                    ? 'Get existing ad-free episode'
+                    : 'Remove ads from selected episode'}
             </button>
           </div>
 
