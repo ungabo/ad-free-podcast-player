@@ -194,6 +194,22 @@ type JobStatusResponse = {
 
 type JobRecord = JobStatusResponse
 
+type RemoteEpisodeState = {
+  user_id: string
+  episode_key: string
+  source_url: string | null
+  source_url_no_query: string | null
+  episode_title: string | null
+  podcast_name: string | null
+  title_key: string | null
+  listened: boolean
+  saved: boolean
+  position_seconds: number | null
+  duration_seconds: number | null
+  last_played_at: string | null
+  updated_at: string
+}
+
 type User = {
   id: string
   name: string
@@ -571,6 +587,46 @@ function completedJobKey(job: JobRecord): string {
   return `${podcast}|${title}`
 }
 
+function episodeTitlePodcastKey(title: string | null | undefined, podcast: string | null | undefined): string {
+  const titleKey = normalizedTitleKey(title)
+  const podcastKey = normalizedTitleKey(podcast)
+  if (!titleKey || !podcastKey) return ''
+  return `${podcastKey}|${titleKey}`
+}
+
+function remoteEpisodeKeysFor(
+  episode: EpisodeResult,
+  podcast: PodcastResult | null
+): string[] {
+  const keys = new Set<string>()
+  const mediaUrl = episodePlayableUrl(episode)
+  const noQuery = mediaUrlWithoutQuery(mediaUrl)
+  const canonical = canonicalMediaUrl(mediaUrl)
+  const titleKey = episodeTitlePodcastKey(episode.trackName, podcast?.collectionName)
+  if (noQuery) keys.add(`url:${noQuery}`)
+  if (canonical) keys.add(`url:${canonical}`)
+  if (titleKey) keys.add(`title:${titleKey}`)
+  return [...keys]
+}
+
+function indexRemoteEpisodeStates(states: RemoteEpisodeState[]): Record<string, RemoteEpisodeState> {
+  const indexed: Record<string, RemoteEpisodeState> = {}
+  for (const state of states) {
+    if (state.episode_key) indexed[state.episode_key] = state
+    if (state.source_url_no_query) indexed[`url:${state.source_url_no_query}`] = state
+    if (state.source_url) {
+      const noQuery = mediaUrlWithoutQuery(state.source_url)
+      const canonical = canonicalMediaUrl(state.source_url)
+      if (noQuery) indexed[`url:${noQuery}`] = state
+      if (canonical) indexed[`url:${canonical}`] = state
+    }
+    if (state.title_key) indexed[`title:${state.title_key}`] = state
+    const fallbackTitleKey = episodeTitlePodcastKey(state.episode_title, state.podcast_name)
+    if (fallbackTitleKey) indexed[`title:${fallbackTitleKey}`] = state
+  }
+  return indexed
+}
+
 function cleanCompletedJobs(jobs: JobRecord[]): JobRecord[] {
   const seen = new Set<string>()
   return [...jobs]
@@ -643,6 +699,7 @@ function App() {
     () => window.localStorage.getItem(USER_KEY) ?? ''
   )
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
+  const [remoteEpisodeStateIndex, setRemoteEpisodeStateIndex] = useState<Record<string, RemoteEpisodeState>>({})
   const displayedSubscriptions = useMemo(
     () => mergeSubscriptions(subscriptions, legacySubscriptions),
     [subscriptions, legacySubscriptions]
@@ -651,6 +708,7 @@ function App() {
 
   const processedUrlRef = useRef<string | null>(null)
   const searchRequestRef = useRef(0)
+  const lastEpisodeStateSyncRef = useRef(0)
 
   const activeAudioLabel = useMemo(() => {
     if (!activeEpisode) return 'No episode selected'
@@ -677,6 +735,7 @@ function App() {
   const processingTitle = activeJobTitle || activeEpisode?.trackName || ''
   const processingPodcast = activeJobPodcast || activePodcast?.collectionName || ''
   const hasProcessingCard = Boolean(jobStatus || isSubmitting || logLines.length > 0)
+  const selectedAdFreeJob = activeEpisode ? adFreeJobForEpisode(activeEpisode) : null
 
   function setEpisodePageClamped(page: number): void {
     setEpisodePage(Math.max(0, Math.min(page, totalEpisodePages - 1)))
@@ -966,24 +1025,77 @@ function App() {
     setSourceAudioUrl(episodePlayableUrl(episode))
   }
 
-  function stateForEpisode(episode: EpisodeResult): EpisodePlaybackState {
-    return episodeStates[episodeStateKey(activePodcast, episode)] ?? {}
+  function remoteStateForEpisode(episode: EpisodeResult): RemoteEpisodeState | null {
+    for (const key of remoteEpisodeKeysFor(episode, activePodcast)) {
+      const state = remoteEpisodeStateIndex[key]
+      if (state) return state
+    }
+    return null
   }
 
-  function updateEpisodeState(episode: EpisodeResult, patch: EpisodePlaybackState): void {
+  function stateForEpisode(episode: EpisodeResult): EpisodePlaybackState {
+    const local = episodeStates[episodeStateKey(activePodcast, episode)] ?? {}
+    const remote = remoteStateForEpisode(episode)
+    if (!remote) return local
+    return {
+      ...local,
+      listened: local.listened || remote.listened,
+      saved: local.saved || remote.saved,
+      positionSeconds: local.positionSeconds ?? remote.position_seconds ?? undefined,
+      durationSeconds: local.durationSeconds ?? remote.duration_seconds ?? undefined,
+      updatedAt: local.updatedAt ?? (remote.updated_at ? new Date(remote.updated_at).getTime() : undefined),
+    }
+  }
+
+  function syncEpisodeStateToServer(episode: EpisodeResult, state: EpisodePlaybackState, force = false): void {
+    if (!currentUserId || !activePodcast) return
+    const now = Date.now()
+    if (!force && !state.listened && now - lastEpisodeStateSyncRef.current < 30000) return
+    lastEpisodeStateSyncRef.current = now
+    const mediaUrl = episodePlayableUrl(episode)
+    const payload = {
+      episode_key: remoteEpisodeKeysFor(episode, activePodcast)[0] ?? '',
+      source_url: mediaUrl,
+      episode_title: episode.trackName,
+      podcast_name: activePodcast.collectionName,
+      listened: Boolean(state.listened),
+      saved: Boolean(state.saved),
+      position_seconds: state.positionSeconds ?? null,
+      duration_seconds: state.durationSeconds ?? (episode.trackTimeMillis ? episode.trackTimeMillis / 1000 : null),
+      last_played_at: new Date().toISOString(),
+    }
+    void fetchWithTimeout(apiUrl(`/api/users/${encodeURIComponent(currentUserId)}/episode-states`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then((response) => response.ok ? response.json() : null)
+      .then((data: { state?: RemoteEpisodeState } | null) => {
+        if (data?.state) {
+          setRemoteEpisodeStateIndex((current) => ({
+            ...current,
+            ...indexRemoteEpisodeStates([data.state as RemoteEpisodeState]),
+          }))
+        }
+      })
+      .catch(() => {})
+  }
+
+  function updateEpisodeState(episode: EpisodeResult, patch: EpisodePlaybackState, forceSync = false): void {
     const key = episodeStateKey(activePodcast, episode)
+    const nextState = {
+      ...(episodeStates[key] ?? {}),
+      ...patch,
+      updatedAt: Date.now(),
+    }
     setEpisodeStates((current) => {
       const next = {
         ...current,
-        [key]: {
-          ...(current[key] ?? {}),
-          ...patch,
-          updatedAt: Date.now(),
-        },
+        [key]: nextState,
       }
       saveEpisodeStates(next)
       return next
     })
+    syncEpisodeStateToServer(episode, nextState, forceSync)
   }
 
   function toggleSavedEpisode(episode: EpisodeResult): void {
@@ -1042,7 +1154,7 @@ function App() {
   function handleSourceAudioEnded(): void {
     if (!activeEpisode) return
     const durationSeconds = activeEpisode.trackTimeMillis ? activeEpisode.trackTimeMillis / 1000 : undefined
-    updateEpisodeState(activeEpisode, { listened: true, durationSeconds })
+    updateEpisodeState(activeEpisode, { listened: true, durationSeconds }, true)
   }
 
   async function prepareProcessedPlayback(downloadPath: string): Promise<void> {
@@ -1156,6 +1268,21 @@ function App() {
       setFavoritesError('')
     } catch {
       setFavoritesError('Server favorites could not be loaded right now.')
+    }
+  }
+
+  async function fetchEpisodeStates(userId: string): Promise<void> {
+    if (!userId) {
+      setRemoteEpisodeStateIndex({})
+      return
+    }
+    try {
+      const response = await fetchWithTimeout(apiUrl(`/api/users/${encodeURIComponent(userId)}/episode-states?limit=5000`))
+      if (!response.ok) return
+      const data = (await response.json()) as { states?: RemoteEpisodeState[] }
+      setRemoteEpisodeStateIndex(indexRemoteEpisodeStates(data.states ?? []))
+    } catch {
+      // Episode state sync is best-effort; local app state still works.
     }
   }
 
@@ -1425,6 +1552,7 @@ function App() {
       window.localStorage.setItem(USER_KEY, currentUserId)
       const kickoff = deferEffect(() => {
         void fetchSubscriptions(currentUserId)
+        void fetchEpisodeStates(currentUserId)
         void fetchLiveJobs()
         void fetchCompletedJobs()
         void fetchFailedJobs()
@@ -1432,6 +1560,13 @@ function App() {
       return () => clearTimeout(kickoff)
     }
     return undefined
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId])
+
+  useEffect(() => {
+    if (!currentUserId) return undefined
+    const interval = setInterval(() => void fetchEpisodeStates(currentUserId), 60000)
+    return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUserId])
 
@@ -1731,6 +1866,7 @@ function App() {
             {visibleEpisodes.map((episode) => {
               const state = stateForEpisode(episode)
               const badges = badgesForEpisode(episode)
+              const adFreeJob = adFreeJobForEpisode(episode)
               return (
                 <div
                   key={episode.trackId}
@@ -1768,14 +1904,20 @@ function App() {
                     <button
                       type="button"
                       className="episode-remove-btn"
-                      disabled={!episodePlayableUrl(episode) || isSubmitting || isPreparingPlayback || windowsBridgeUnavailable}
+                      disabled={(!episodePlayableUrl(episode) && !adFreeJob?.download_url) || isSubmitting || isPreparingPlayback || (!adFreeJob && windowsBridgeUnavailable)}
                       onClick={(event) => {
                         event.stopPropagation()
                         chooseEpisode(episode)
+                        if (adFreeJob?.download_url) {
+                          setJobStatus(adFreeJob)
+                          appendLog(`Using existing ad-free episode: ${jobDisplayTitle(adFreeJob) || episode.trackName}`)
+                          void prepareProcessedPlayback(adFreeJob.download_url)
+                          return
+                        }
                         void submitEpisodeForProcessing(episode, episode.trackName, { podcast: activePodcast })
                       }}
                     >
-                      {isSubmitting ? 'Processing...' : 'Remove ads'}
+                      {isSubmitting ? 'Processing...' : adFreeJob ? 'Get ad-free' : 'Remove ads'}
                     </button>
                     <button
                       type="button"
@@ -1848,13 +1990,19 @@ function App() {
           <div className="button-row">
             <button
               type="button"
-              disabled={!canSubmit || isPreparingPlayback || windowsBridgeUnavailable}
+              disabled={isSubmitting || (!canSubmit && !selectedAdFreeJob?.download_url) || isPreparingPlayback || (!selectedAdFreeJob && windowsBridgeUnavailable)}
               onClick={() => {
                 if (!activeEpisode) return
+                if (selectedAdFreeJob?.download_url) {
+                  setJobStatus(selectedAdFreeJob)
+                  appendLog(`Using existing ad-free episode: ${jobDisplayTitle(selectedAdFreeJob) || activeEpisode.trackName}`)
+                  void prepareProcessedPlayback(selectedAdFreeJob.download_url)
+                  return
+                }
                 void submitEpisodeForProcessing(activeEpisode, activeEpisode.trackName)
               }}
             >
-              {isSubmitting ? 'Processing...' : 'Remove ads from selected episode'}
+              {isSubmitting ? 'Processing...' : selectedAdFreeJob ? 'Get existing ad-free episode' : 'Remove ads from selected episode'}
             </button>
           </div>
 

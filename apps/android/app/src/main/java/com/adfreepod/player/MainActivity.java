@@ -167,6 +167,8 @@ public class MainActivity extends Activity {
     private final Map<String, RemoteAdFreeInfo> remoteAdFreeByUrl = new HashMap<>();
     private final Map<String, RemoteAdFreeInfo> remoteAdFreeByTitlePodcast = new HashMap<>();
     private Runnable currentScreenAction;
+    private long lastEpisodeStateSyncAt;
+    private String lastEpisodeStateSyncKey = "";
     private volatile boolean serverUsersLoaded;
     private volatile boolean serverUsersLoading;
     private volatile boolean remoteAdFreeLoading;
@@ -1429,6 +1431,7 @@ public class MainActivity extends Activity {
             boolean next = !db.isSaved(e.id);
             db.setEpisodeSaved(e.id, next);
             setStatus(next ? "Saved to your episode playlist." : "Removed from saved episodes.");
+            syncEpisodeState(e, true);
             if (!openable) showEpisode(e.id);
         }));
         boolean processed = "processed".equals(e.adSupportedStatus);
@@ -1491,10 +1494,14 @@ public class MainActivity extends Activity {
             boolean next = !db.isSaved(e.id);
             db.setEpisodeSaved(e.id, next);
             setStatus(next ? "Saved to your episode playlist." : "Removed from saved episodes.");
+            syncEpisodeState(e, true);
             showEpisode(e.id);
         }));
         actions.addView(secondaryButton(e.isListened ? "Mark unlistened" : "Mark listened", v -> {
-            db.markListened(e.id, !e.isListened);
+            boolean listened = !e.isListened;
+            db.markListened(e.id, listened);
+            e.isListened = listened;
+            syncEpisodeState(e, true);
             showEpisode(e.id);
         }));
         boolean processed = "processed".equals(e.adSupportedStatus);
@@ -2017,7 +2024,51 @@ public class MainActivity extends Activity {
             db.saveProgress(currentEpisode.id, currentEpisode.podcastId, pos, dur);
             currentEpisode.positionSeconds = pos;
             currentEpisode.durationSeconds = dur;
+            if (dur > 0 && pos * 100.0 / dur >= 95) currentEpisode.isListened = true;
+            syncEpisodeState(currentEpisode, currentEpisode.isListened);
         } catch (Exception ignored) {}
+    }
+
+    private void syncEpisodeState(Episode episode, boolean force) {
+        if (episode == null || db == null || io == null || io.isShutdown()) return;
+        String userId = selectedServerUserId(db);
+        if (TextUtils.isEmpty(userId)) return;
+
+        long now = System.currentTimeMillis();
+        String key = episode.id + ":" + episode.positionSeconds + ":" + episode.isListened;
+        if (!force && now - lastEpisodeStateSyncAt < 30000 && TextUtils.equals(key, lastEpisodeStateSyncKey)) return;
+        if (!force && now - lastEpisodeStateSyncAt < 30000 && !episode.isListened) return;
+
+        lastEpisodeStateSyncAt = now;
+        lastEpisodeStateSyncKey = key;
+
+        String apiBase = normalizeApiBaseUrl(db.setting("ad_api_base_url", DEFAULT_AD_API_BASE_URL));
+        String podcastName = db.podcastTitle(episode.podcastId);
+        String episodeId = episode.id;
+        String sourceUrl = episode.enclosureUrl;
+        String title = episode.title;
+        int pos = Math.max(0, episode.positionSeconds);
+        int dur = Math.max(0, episode.durationSeconds);
+        boolean listened = episode.isListened || (dur > 0 && pos * 100.0 / dur >= 95);
+        boolean saved = db.isSaved(episode.id);
+
+        io.execute(() -> {
+            try {
+                JSONObject payload = new JSONObject();
+                payload.put("source_url", sourceUrl);
+                payload.put("episode_title", title);
+                payload.put("podcast_name", podcastName);
+                payload.put("listened", listened);
+                payload.put("saved", saved);
+                payload.put("position_seconds", pos);
+                payload.put("duration_seconds", dur);
+                payload.put("last_played_at", isoNow());
+                postJsonApiJsonWithFallback(apiBase, "/api/users/" + URLEncoder.encode(userId, "UTF-8") + "/episode-states", payload, "Episode state sync failed", "episode state sync response");
+            } catch (Exception ex) {
+                addCallLog("EPISODE STATE SYNC FAILED", resolveApiUrl(apiBase, "/api/users/" + userId + "/episode-states"), "", 0,
+                        "", ex.getMessage(), 0);
+            }
+        });
     }
 
     private void seekBy(int seconds) {

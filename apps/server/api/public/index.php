@@ -128,6 +128,14 @@ try {
         removeSubscription($pdo, $matches[1], $matches[2]);
     }
 
+    if ($method === 'GET' && preg_match('#^/api/users/([a-f0-9\-]{36})/episode-states$#', $uri, $matches) === 1) {
+        listEpisodeStates($pdo, $matches[1]);
+    }
+
+    if ($method === 'POST' && preg_match('#^/api/users/([a-f0-9\-]{36})/episode-states$#', $uri, $matches) === 1) {
+        saveEpisodeState($pdo, $matches[1]);
+    }
+
     jsonResponse(404, ['error' => 'Route not found']);
 } catch (RuntimeException $exception) {
     jsonResponse(422, ['error' => $exception->getMessage()]);
@@ -242,6 +250,28 @@ function ensureSchema(PDO $pdo): void
             UNIQUE(user_id, feed_url)
         )'
     );
+
+    $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS episode_states (
+            user_id TEXT NOT NULL,
+            episode_key TEXT NOT NULL,
+            source_url TEXT,
+            source_url_no_query TEXT,
+            episode_title TEXT,
+            podcast_name TEXT,
+            title_key TEXT,
+            listened INTEGER NOT NULL DEFAULT 0,
+            saved INTEGER NOT NULL DEFAULT 0,
+            position_seconds REAL,
+            duration_seconds REAL,
+            last_played_at TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, episode_key)
+        )'
+    );
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_episode_states_user_updated ON episode_states (user_id, updated_at DESC)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_episode_states_user_source ON episode_states (user_id, source_url_no_query)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_episode_states_user_title ON episode_states (user_id, title_key)');
 
     // Ensure test user exists.
     $testExists = $pdo->query("SELECT COUNT(*) FROM users WHERE name='test'")->fetchColumn();
@@ -2248,6 +2278,161 @@ function removeSubscription(PDO $pdo, string $userId, string $subId): void
     $stmt = $pdo->prepare('DELETE FROM subscriptions WHERE id=? AND user_id=?');
     $stmt->execute([$subId, $userId]);
     jsonResponse(200, ['removed' => $stmt->rowCount() > 0]);
+}
+
+function normalizeStateUrl(?string $url, bool $stripQuery): string
+{
+    $trimmed = trim((string)$url);
+    if ($trimmed === '') {
+        return '';
+    }
+
+    $parts = parse_url($trimmed);
+    if (!is_array($parts) || empty($parts['scheme']) || empty($parts['host'])) {
+        return strtolower(rtrim($trimmed, '/'));
+    }
+
+    $scheme = strtolower((string)$parts['scheme']);
+    $host = strtolower((string)$parts['host']);
+    $path = isset($parts['path']) ? (string)$parts['path'] : '';
+    $normalized = $scheme . '://' . $host . $path;
+    if (!$stripQuery && isset($parts['query']) && (string)$parts['query'] !== '') {
+        $normalized .= '?' . (string)$parts['query'];
+    }
+
+    return strtolower(rtrim($normalized, '/'));
+}
+
+function normalizeStateText(?string $value): string
+{
+    $text = strtolower(trim((string)$value));
+    $text = preg_replace('/\s+/', ' ', $text);
+    return is_string($text) ? $text : '';
+}
+
+function episodeTitleKey(?string $title, ?string $podcast): string
+{
+    $titleKey = normalizeStateText($title);
+    $podcastKey = normalizeStateText($podcast);
+    if ($titleKey === '' || $podcastKey === '') {
+        return '';
+    }
+    return $podcastKey . '|' . $titleKey;
+}
+
+function normalizeEpisodeStateRow(array $row): array
+{
+    return [
+        'user_id' => (string)$row['user_id'],
+        'episode_key' => (string)$row['episode_key'],
+        'source_url' => $row['source_url'] === null ? null : (string)$row['source_url'],
+        'source_url_no_query' => $row['source_url_no_query'] === null ? null : (string)$row['source_url_no_query'],
+        'episode_title' => $row['episode_title'] === null ? null : (string)$row['episode_title'],
+        'podcast_name' => $row['podcast_name'] === null ? null : (string)$row['podcast_name'],
+        'title_key' => $row['title_key'] === null ? null : (string)$row['title_key'],
+        'listened' => (int)$row['listened'] === 1,
+        'saved' => (int)$row['saved'] === 1,
+        'position_seconds' => $row['position_seconds'] === null ? null : (float)$row['position_seconds'],
+        'duration_seconds' => $row['duration_seconds'] === null ? null : (float)$row['duration_seconds'],
+        'last_played_at' => $row['last_played_at'] === null ? null : (string)$row['last_played_at'],
+        'updated_at' => (string)$row['updated_at'],
+    ];
+}
+
+function listEpisodeStates(PDO $pdo, string $userId): void
+{
+    $limit = max(1, min(5000, (int)($_GET['limit'] ?? 2000)));
+    $stmt = $pdo->prepare(
+        'SELECT * FROM episode_states
+         WHERE user_id=?
+         ORDER BY updated_at DESC
+         LIMIT ?'
+    );
+    $stmt->execute([$userId, $limit]);
+
+    $states = [];
+    foreach ($stmt->fetchAll() ?: [] as $row) {
+        $states[] = normalizeEpisodeStateRow($row);
+    }
+
+    jsonResponse(200, ['states' => $states]);
+}
+
+function saveEpisodeState(PDO $pdo, string $userId): void
+{
+    $body = json_decode(file_get_contents('php://input'), true) ?? [];
+    if (!is_array($body)) {
+        throw new RuntimeException('Invalid JSON body.');
+    }
+
+    $sourceUrl = trim((string)($body['source_url'] ?? ''));
+    $sourceUrlNoQuery = normalizeStateUrl($sourceUrl, true);
+    $episodeTitle = trim((string)($body['episode_title'] ?? ''));
+    $podcastName = trim((string)($body['podcast_name'] ?? ''));
+    $titleKey = episodeTitleKey($episodeTitle, $podcastName);
+    $episodeKey = trim((string)($body['episode_key'] ?? ''));
+    if ($episodeKey === '') {
+        if ($sourceUrlNoQuery !== '') {
+            $episodeKey = 'url:' . $sourceUrlNoQuery;
+        } elseif ($titleKey !== '') {
+            $episodeKey = 'title:' . $titleKey;
+        }
+    }
+    if ($episodeKey === '') {
+        throw new RuntimeException('source_url or episode_title/podcast_name is required.');
+    }
+
+    $positionSeconds = isset($body['position_seconds']) ? max(0.0, (float)$body['position_seconds']) : null;
+    $durationSeconds = isset($body['duration_seconds']) ? max(0.0, (float)$body['duration_seconds']) : null;
+    $listened = !empty($body['listened']) || ($durationSeconds !== null && $durationSeconds > 0 && $positionSeconds !== null && ($positionSeconds / $durationSeconds) >= 0.95);
+    $saved = !empty($body['saved']);
+    $lastPlayedAt = trim((string)($body['last_played_at'] ?? ''));
+    if ($lastPlayedAt === '' && $positionSeconds !== null && $positionSeconds > 0) {
+        $lastPlayedAt = gmdate(DATE_ATOM);
+    }
+    $now = gmdate(DATE_ATOM);
+
+    $stmt = $pdo->prepare(
+        'INSERT INTO episode_states (
+            user_id, episode_key, source_url, source_url_no_query, episode_title, podcast_name, title_key,
+            listened, saved, position_seconds, duration_seconds, last_played_at, updated_at
+        ) VALUES (
+            :user_id, :episode_key, :source_url, :source_url_no_query, :episode_title, :podcast_name, :title_key,
+            :listened, :saved, :position_seconds, :duration_seconds, :last_played_at, :updated_at
+        )
+        ON CONFLICT(user_id, episode_key) DO UPDATE SET
+            source_url=excluded.source_url,
+            source_url_no_query=excluded.source_url_no_query,
+            episode_title=excluded.episode_title,
+            podcast_name=excluded.podcast_name,
+            title_key=excluded.title_key,
+            listened=excluded.listened,
+            saved=excluded.saved,
+            position_seconds=excluded.position_seconds,
+            duration_seconds=excluded.duration_seconds,
+            last_played_at=excluded.last_played_at,
+            updated_at=excluded.updated_at'
+    );
+    $stmt->execute([
+        ':user_id' => $userId,
+        ':episode_key' => $episodeKey,
+        ':source_url' => $sourceUrl !== '' ? $sourceUrl : null,
+        ':source_url_no_query' => $sourceUrlNoQuery !== '' ? $sourceUrlNoQuery : null,
+        ':episode_title' => $episodeTitle !== '' ? $episodeTitle : null,
+        ':podcast_name' => $podcastName !== '' ? $podcastName : null,
+        ':title_key' => $titleKey !== '' ? $titleKey : null,
+        ':listened' => $listened ? 1 : 0,
+        ':saved' => $saved ? 1 : 0,
+        ':position_seconds' => $positionSeconds,
+        ':duration_seconds' => $durationSeconds,
+        ':last_played_at' => $lastPlayedAt !== '' ? $lastPlayedAt : null,
+        ':updated_at' => $now,
+    ]);
+
+    $select = $pdo->prepare('SELECT * FROM episode_states WHERE user_id=? AND episode_key=?');
+    $select->execute([$userId, $episodeKey]);
+    $row = $select->fetch();
+    jsonResponse(200, ['state' => is_array($row) ? normalizeEpisodeStateRow($row) : null]);
 }
 
 function deleteJob(PDO $pdo, array $config, string $id): void
