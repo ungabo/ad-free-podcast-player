@@ -909,7 +909,7 @@ function getWorkerStatus(PDO $pdo, array $config): void
         'stale_jobs_marked' => $staleJobsMarked,
         'local_bridge' => probeLocalBridge($config),
         'start_command' => 'ssh agitated-engelbart_9pw3g4pzt1v@74.208.203.194 "nohup /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1 &"',
-        'watchdog_command' => '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/run_daemon.sh >> /var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/logs/worker-daemon.log 2>&1',
+        'watchdog_command' => '/var/www/vhosts/agitated-engelbart.74-208-203-194.plesk.page/adfree-stack/worker/watchdog.sh',
     ]);
 }
 

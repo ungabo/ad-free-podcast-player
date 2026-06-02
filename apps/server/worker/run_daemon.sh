@@ -5,12 +5,43 @@ STACK_ROOT="${STACK_ROOT:-/var/www/vhosts/agitated-engelbart.74-208-203-194.ples
 STORAGE_ROOT="${APP_STORAGE:-$STACK_ROOT/storage}"
 LOG_DIR="$STACK_ROOT/logs"
 LOCK_DIR="$STACK_ROOT/worker.lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
+WORKER_SCRIPT="$STACK_ROOT/worker/process_jobs.py"
 
 mkdir -p "$LOG_DIR"
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  exit 0
-fi
+is_pid_alive() {
+  pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+worker_is_running() {
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "$WORKER_SCRIPT" >/dev/null 2>&1
+    return $?
+  fi
+
+  ps -ef | grep "$WORKER_SCRIPT" | grep -v grep >/dev/null 2>&1
+}
+
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  existing_pid=""
+  if [ -f "$LOCK_PID_FILE" ]; then
+    existing_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+  fi
+
+  if is_pid_alive "$existing_pid"; then
+    exit 0
+  fi
+  if [ -z "$existing_pid" ] && worker_is_running; then
+    exit 0
+  fi
+
+  printf '[%s] removing stale worker lock%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${existing_pid:+ from pid $existing_pid}" >> "$LOG_DIR/worker-daemon.log"
+  rm -rf "$LOCK_DIR"
+done
+
+printf '%s\n' "$$" > "$LOCK_PID_FILE"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 export APP_STORAGE="$STORAGE_ROOT"
@@ -24,4 +55,4 @@ export LOCAL_PROCESSOR_BASE_URL="${LOCAL_PROCESSOR_BASE_URL:-http://127.0.0.1:80
 export LOCAL_PROCESSOR_TIMEOUT_SECONDS="${LOCAL_PROCESSOR_TIMEOUT_SECONDS:-14400}"
 
 printf '\n[%s] worker daemon start\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-/usr/bin/python3 "$STACK_ROOT/worker/process_jobs.py"
+/usr/bin/python3 "$WORKER_SCRIPT"
