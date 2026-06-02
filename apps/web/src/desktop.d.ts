@@ -3,6 +3,9 @@ export {}
 declare global {
   interface Window {
     desktopApi?: {
+      loadState: () => Promise<unknown>
+      saveState: (payload: unknown) => Promise<{ ok: boolean; filePath: string }>
+      clearState: () => Promise<{ ok: boolean }>
       loadSettings: (filePath: string) => Promise<unknown>
       getCapabilities: () => Promise<{ isDesktop: boolean; adCutForgeRoot: string }>
       pickAudioFile: () => Promise<string | null>

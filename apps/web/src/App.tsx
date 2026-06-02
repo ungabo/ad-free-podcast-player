@@ -22,6 +22,7 @@ const SEARCH_CACHE_TTL = 12 * 60 * 60 * 1000
 const EPISODE_CACHE_TTL = 12 * 60 * 60 * 1000
 const EPISODE_CACHE_VERSION = 2
 const EPISODE_PAGE_SIZE = 40
+const DESKTOP_LEGACY_IMPORT_KEY = 'adfree-desktop-legacy-import-v1'
 
 function getSearchCache(term: string): PodcastResult[] | null {
   try {
@@ -138,6 +139,7 @@ type PodcastResult = {
   feedUrl?: string
   artworkUrl600?: string
   artworkUrl100?: string
+  legacyPodcastId?: string
 }
 
 type EpisodeResult = {
@@ -208,6 +210,7 @@ type Subscription = {
   artwork_url: string | null
   collection_id: number | null
   added_at: string
+  legacy_source?: 'desktop'
 }
 
 type WorkerStatus = {
@@ -230,6 +233,250 @@ type WorkerStatus = {
     time?: string
     mode?: string
   } | null
+}
+
+type DesktopLegacyPodcast = {
+  id: string
+  title?: string
+  publisher?: string
+  feedUrl?: string
+  artworkUrl?: string
+  collectionId?: number
+  subscribed?: boolean
+}
+
+type DesktopLegacyEpisode = {
+  id: string
+  podcastId: string
+  title?: string
+  description?: string
+  pubDate?: string
+  durationSeconds?: number
+  enclosureUrl?: string
+  offlineRelativePath?: string
+  offlineFilePath?: string
+  downloadStatus?: string
+  isListened?: boolean
+  adSupportedStatus?: string
+  downloadedAt?: string
+  firstSeenAt?: string
+}
+
+type DesktopLegacyProgress = {
+  episodeId?: string
+  podcastId?: string
+  positionSeconds?: number
+  durationSeconds?: number
+  percentComplete?: number
+  lastPlayedAt?: string
+}
+
+type DesktopLegacyState = {
+  podcasts: Record<string, DesktopLegacyPodcast>
+  episodes: Record<string, DesktopLegacyEpisode>
+  progress: Record<string, DesktopLegacyProgress>
+}
+
+type SavedEpisodeCard = {
+  key: string
+  podcast: PodcastResult
+  episode: EpisodeResult
+  podcastTitle: string
+  episodeTitle: string
+}
+
+function stableLegacyNumber(value: string): number {
+  let hash = 0
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0
+  }
+  return Math.max(1, Math.abs(hash))
+}
+
+function legacyPodcastCollectionId(podcastId: string): number {
+  return -stableLegacyNumber(`podcast:${podcastId}`)
+}
+
+function legacyEpisodeTrackId(episodeId: string): number {
+  return -stableLegacyNumber(`episode:${episodeId}`)
+}
+
+function legacyPodcastToResult(podcast: DesktopLegacyPodcast): PodcastResult {
+  return {
+    collectionId: legacyPodcastCollectionId(podcast.id),
+    collectionName: podcast.title || 'Saved podcast',
+    artistName: podcast.publisher,
+    feedUrl: podcast.feedUrl,
+    artworkUrl600: podcast.artworkUrl,
+    artworkUrl100: podcast.artworkUrl,
+    legacyPodcastId: podcast.id,
+  }
+}
+
+function legacyEpisodeToResult(episode: DesktopLegacyEpisode): EpisodeResult {
+  return {
+    trackId: legacyEpisodeTrackId(episode.id),
+    trackName: episode.title || 'Saved episode',
+    description: episode.description,
+    releaseDate: episode.pubDate,
+    episodeUrl: episode.offlineRelativePath
+      ? `/api/offline-audio?path=${encodeURIComponent(episode.offlineRelativePath)}`
+      : episode.enclosureUrl,
+    previewUrl: episode.enclosureUrl,
+    trackTimeMillis: typeof episode.durationSeconds === 'number' ? episode.durationSeconds * 1000 : undefined,
+  }
+}
+
+function normalizeDesktopLegacyState(payload: unknown): DesktopLegacyState | null {
+  if (!payload || typeof payload !== 'object') return null
+  const source = payload as Partial<DesktopLegacyState>
+  const podcasts = source.podcasts && typeof source.podcasts === 'object' ? source.podcasts : {}
+  const episodes = source.episodes && typeof source.episodes === 'object' ? source.episodes : {}
+  const progress = source.progress && typeof source.progress === 'object' ? source.progress : {}
+  if (Object.keys(podcasts).length === 0 && Object.keys(episodes).length === 0) return null
+  return { podcasts, episodes, progress }
+}
+
+function desktopLegacySignature(state: DesktopLegacyState): string {
+  const podcastCount = Object.keys(state.podcasts).length
+  const episodeCount = Object.keys(state.episodes).length
+  const progressCount = Object.keys(state.progress).length
+  return `${podcastCount}:${episodeCount}:${progressCount}`
+}
+
+function legacySubscriptionsFromState(state: DesktopLegacyState): Subscription[] {
+  return Object.values(state.podcasts)
+    .filter((podcast) => podcast.id && (podcast.title || podcast.feedUrl))
+    .map((podcast) => ({
+      id: `desktop:${podcast.id}`,
+      user_id: 'desktop-local',
+      podcast_title: podcast.title || 'Saved podcast',
+      podcast_author: podcast.publisher ?? null,
+      feed_url: podcast.feedUrl || `desktop://${podcast.id}`,
+      artwork_url: podcast.artworkUrl ?? null,
+      collection_id: typeof podcast.collectionId === 'number' && podcast.collectionId > 0 ? podcast.collectionId : null,
+      added_at: '',
+      legacy_source: 'desktop' as const,
+    }))
+}
+
+function mergeSubscriptions(server: Subscription[], legacy: Subscription[]): Subscription[] {
+  const seen = new Set<string>()
+  const merged: Subscription[] = []
+  for (const sub of [...server, ...legacy]) {
+    const key = `${sub.collection_id ?? ''}|${sub.feed_url || sub.podcast_title}`.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(sub)
+  }
+  return merged
+}
+
+function legacyPodcastForSubscription(state: DesktopLegacyState | null, sub: Subscription): DesktopLegacyPodcast | null {
+  if (!state || sub.legacy_source !== 'desktop') return null
+  const id = sub.id.replace(/^desktop:/, '')
+  return state.podcasts[id] ?? null
+}
+
+function legacyEpisodesForPodcast(state: DesktopLegacyState, podcastId: string): EpisodeResult[] {
+  return Object.values(state.episodes)
+    .filter((episode) => episode.podcastId === podcastId)
+    .sort((a, b) => new Date(b.pubDate || 0).getTime() - new Date(a.pubDate || 0).getTime())
+    .map(legacyEpisodeToResult)
+}
+
+function legacyEpisodeStateKey(episode: DesktopLegacyEpisode): string {
+  return `${legacyPodcastCollectionId(episode.podcastId)}:${legacyEpisodeTrackId(episode.id)}`
+}
+
+function legacyEpisodePlaybackState(
+  episode: DesktopLegacyEpisode,
+  progress?: DesktopLegacyProgress
+): EpisodePlaybackState {
+  const positionSeconds = progress?.positionSeconds
+  const durationSeconds = progress?.durationSeconds ?? episode.durationSeconds
+  const saved = Boolean(
+    episode.downloadStatus === 'downloaded' ||
+    episode.offlineRelativePath ||
+    episode.offlineFilePath ||
+    episode.adSupportedStatus === 'processed'
+  )
+  const listened = Boolean(episode.isListened || (progress?.percentComplete ?? 0) >= 95)
+  return {
+    saved,
+    listened,
+    positionSeconds,
+    durationSeconds,
+    updatedAt: progress?.lastPlayedAt ? new Date(progress.lastPlayedAt).getTime() : Date.now(),
+  }
+}
+
+function legacySavedEpisodeCards(state: DesktopLegacyState | null): SavedEpisodeCard[] {
+  if (!state) return []
+  return Object.values(state.episodes)
+    .filter((episode) => {
+      return Boolean(
+        episode.downloadStatus === 'downloaded' ||
+        episode.offlineRelativePath ||
+        episode.offlineFilePath ||
+        episode.adSupportedStatus === 'processed'
+      )
+    })
+    .sort((a, b) => new Date(b.downloadedAt || b.firstSeenAt || b.pubDate || 0).getTime() -
+      new Date(a.downloadedAt || a.firstSeenAt || a.pubDate || 0).getTime())
+    .map((episode) => {
+      const podcast = state.podcasts[episode.podcastId]
+      const podcastResult = podcast ? legacyPodcastToResult(podcast) : legacyPodcastToResult({
+        id: episode.podcastId,
+        title: 'Saved podcast',
+      })
+      return {
+        key: episode.id,
+        podcast: podcastResult,
+        episode: legacyEpisodeToResult(episode),
+        podcastTitle: podcastResult.collectionName,
+        episodeTitle: episode.title || 'Saved episode',
+      }
+    })
+}
+
+function legacyCompletedJobsFromState(state: DesktopLegacyState | null): JobRecord[] {
+  if (!state) return []
+  return Object.values(state.episodes)
+    .filter((episode) => {
+      const path = episode.offlineRelativePath || episode.offlineFilePath || ''
+      return episode.adSupportedStatus === 'processed' || /\.adfree\./i.test(path)
+    })
+    .map((episode) => {
+      const podcast = state.podcasts[episode.podcastId]
+      const createdAt = episode.downloadedAt || episode.firstSeenAt || episode.pubDate || new Date().toISOString()
+      return {
+        job_id: `desktop:${episode.id}`,
+        status: 'completed',
+        backend: 'desktop-local',
+        detection_mode: 'openai',
+        openai_model: OPENAI_MODEL,
+        source_url: episode.enclosureUrl ?? null,
+        episode_title: episode.title ?? null,
+        podcast_name: podcast?.title ?? null,
+        progress: 100,
+        duration_seconds: null,
+        error_message: null,
+        logs: null,
+        created_at: createdAt,
+        updated_at: createdAt,
+        started_at: null,
+        finished_at: createdAt,
+        download_url: episode.offlineRelativePath
+          ? `/api/offline-audio?path=${encodeURIComponent(episode.offlineRelativePath)}`
+          : null,
+        transcript_url: null,
+        timestamped_transcript_url: null,
+        timestamps_url: null,
+        stats_url: null,
+        user_id: 'desktop-local',
+      }
+    })
 }
 
 function formatDuration(ms?: number): string {
@@ -280,6 +527,19 @@ function toAbsoluteUrl(url: string): string {
 
 function apiUrl(path: string): string {
   return `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: options.signal ?? controller.signal,
+    })
+  } finally {
+    window.clearTimeout(timeout)
+  }
 }
 
 function cleanJobText(value: string | null | undefined): string {
@@ -366,7 +626,16 @@ function App() {
   const [liveJobs, setLiveJobs] = useState<JobRecord[]>([])
   const [completedJobs, setCompletedJobs] = useState<JobRecord[]>([])
   const [failedJobs, setFailedJobs] = useState<JobRecord[]>([])
-  const visibleCompletedJobs = useMemo(() => cleanCompletedJobs(completedJobs), [completedJobs])
+  const [completedJobsError, setCompletedJobsError] = useState('')
+  const [favoritesError, setFavoritesError] = useState('')
+  const [legacyDesktopState, setLegacyDesktopState] = useState<DesktopLegacyState | null>(null)
+  const [legacySubscriptions, setLegacySubscriptions] = useState<Subscription[]>([])
+  const legacyCompletedJobs = useMemo(() => legacyCompletedJobsFromState(legacyDesktopState), [legacyDesktopState])
+  const visibleCompletedJobs = useMemo(
+    () => cleanCompletedJobs([...completedJobs, ...legacyCompletedJobs]),
+    [completedJobs, legacyCompletedJobs]
+  )
+  const legacySavedCards = useMemo(() => legacySavedEpisodeCards(legacyDesktopState), [legacyDesktopState])
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<JobRecord | null>(null)
 
   const [users, setUsers] = useState<User[]>([])
@@ -374,6 +643,10 @@ function App() {
     () => window.localStorage.getItem(USER_KEY) ?? ''
   )
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
+  const displayedSubscriptions = useMemo(
+    () => mergeSubscriptions(subscriptions, legacySubscriptions),
+    [subscriptions, legacySubscriptions]
+  )
   const [workerStatus, setWorkerStatus] = useState<WorkerStatus | null>(null)
 
   const processedUrlRef = useRef<string | null>(null)
@@ -458,11 +731,77 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    const desktopApi = window.desktopApi
+    if (!desktopApi?.loadState) return undefined
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const loaded = await desktopApi.loadState()
+        if (cancelled) return
+        const legacy = normalizeDesktopLegacyState(loaded)
+        if (!legacy) return
+
+        setLegacyDesktopState(legacy)
+        setLegacySubscriptions(legacySubscriptionsFromState(legacy))
+
+        const signature = desktopLegacySignature(legacy)
+        if (window.localStorage.getItem(DESKTOP_LEGACY_IMPORT_KEY) === signature) return
+
+        setEpisodeStates((current) => {
+          const next = { ...current }
+          let changed = false
+          for (const episode of Object.values(legacy.episodes)) {
+            const key = legacyEpisodeStateKey(episode)
+            const imported = legacyEpisodePlaybackState(episode, legacy.progress[episode.id])
+            const existing = next[key] ?? {}
+            next[key] = {
+              ...imported,
+              ...existing,
+              saved: existing.saved ?? imported.saved,
+              listened: existing.listened ?? imported.listened,
+              positionSeconds: existing.positionSeconds ?? imported.positionSeconds,
+              durationSeconds: existing.durationSeconds ?? imported.durationSeconds,
+              updatedAt: existing.updatedAt ?? imported.updatedAt,
+            }
+            changed = true
+          }
+          if (changed) saveEpisodeStates(next)
+          return next
+        })
+        window.localStorage.setItem(DESKTOP_LEGACY_IMPORT_KEY, signature)
+      } catch {
+        // Desktop compatibility import is best-effort; the server-backed app can still run.
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   async function loadPodcastEpisodes(podcast: PodcastResult): Promise<EpisodeResult[]> {
     setEpisodeError('')
     setIsLoadingEpisodes(true)
 
     try {
+      if (podcast.legacyPodcastId && legacyDesktopState) {
+        const normalized = legacyEpisodesForPodcast(legacyDesktopState, podcast.legacyPodcastId)
+        setEpisodes(normalized)
+
+        if (normalized.length > 0) {
+          const firstPlayable = normalized.find((item) => episodePlayableUrl(item).length > 0) ?? normalized[0]
+          setActiveEpisode(firstPlayable)
+          setSourceAudioUrl(episodePlayableUrl(firstPlayable))
+        } else {
+          setActiveEpisode(null)
+          setSourceAudioUrl('')
+        }
+
+        return normalized
+      }
+
       const cached = getEpisodeCache(podcast.collectionId)
       let normalized: EpisodeResult[]
 
@@ -470,7 +809,7 @@ function App() {
         normalized = cached
       } else {
         const lookupUrl = apiUrl(`/api/catalog/episodes?collection_id=${podcast.collectionId}`)
-        const response = await fetch(lookupUrl)
+        const response = await fetchWithTimeout(lookupUrl)
         if (!response.ok) {
           throw new Error(`Could not load episodes (${response.status})`)
         }
@@ -526,6 +865,15 @@ function App() {
   }
 
   async function selectSubscription(sub: Subscription): Promise<void> {
+    const legacyPodcast = legacyPodcastForSubscription(legacyDesktopState, sub)
+    if (legacyPodcast) {
+      setSearchError('')
+      setPodcasts([])
+      setHasSearched(false)
+      await selectPodcast(legacyPodcastToResult(legacyPodcast))
+      return
+    }
+
     if (!sub.collection_id) {
       setSearchError('This favorite is missing its podcast catalog ID. Search for it once and favorite it again.')
       return
@@ -576,7 +924,7 @@ function App() {
         list = cached
       } else {
         const url = apiUrl(`/api/catalog/search?term=${encodeURIComponent(term)}`)
-        const response = await fetch(url)
+        const response = await fetchWithTimeout(url)
         if (!response.ok) {
           throw new Error(`Search failed (${response.status})`)
         }
@@ -726,7 +1074,7 @@ function App() {
   async function fetchLiveJobs(): Promise<void> {
     try {
       const userParam = currentUserId ? `&user_id=${encodeURIComponent(currentUserId)}` : ''
-      const response = await fetch(apiUrl(`/api/jobs?status=queued,running&limit=20${userParam}`))
+      const response = await fetchWithTimeout(apiUrl(`/api/jobs?status=queued,running&limit=20${userParam}`))
       if (!response.ok) return
       const data = (await response.json()) as { jobs: JobRecord[] }
       setLiveJobs(data.jobs ?? [])
@@ -737,7 +1085,7 @@ function App() {
 
   async function fetchWorkerStatus(): Promise<void> {
     try {
-      const response = await fetch(apiUrl('/api/worker/status'))
+      const response = await fetchWithTimeout(apiUrl('/api/worker/status'))
       if (!response.ok) return
       const data = (await response.json()) as WorkerStatus
       setWorkerStatus(data)
@@ -748,7 +1096,7 @@ function App() {
 
   async function killJob(jobId: string): Promise<void> {
     try {
-      await fetch(apiUrl(`/api/jobs/${jobId}/cancel`), { method: 'POST' })
+      await fetchWithTimeout(apiUrl(`/api/jobs/${jobId}/cancel`), { method: 'POST' })
       void fetchLiveJobs()
     } catch {
       // ignore
@@ -757,19 +1105,20 @@ function App() {
 
   async function fetchCompletedJobs(): Promise<void> {
     try {
-      const response = await fetch(apiUrl('/api/jobs?status=completed&limit=100'))
+      const response = await fetchWithTimeout(apiUrl('/api/jobs?status=completed&limit=100'))
       if (!response.ok) return
       const data = (await response.json()) as { jobs: JobRecord[] }
       setCompletedJobs(data.jobs ?? [])
+      setCompletedJobsError('')
     } catch {
-      // Best-effort history
+      setCompletedJobsError('Server ad-free history could not be loaded right now.')
     }
   }
 
   async function fetchFailedJobs(): Promise<void> {
     try {
       const userParam = currentUserId ? `&user_id=${encodeURIComponent(currentUserId)}` : ''
-      const response = await fetch(apiUrl(`/api/jobs?status=failed,cancelled&limit=100${userParam}`))
+      const response = await fetchWithTimeout(apiUrl(`/api/jobs?status=failed,cancelled&limit=100${userParam}`))
       if (!response.ok) return
       const data = (await response.json()) as { jobs: JobRecord[] }
       setFailedJobs(data.jobs ?? [])
@@ -780,11 +1129,12 @@ function App() {
 
   async function fetchUsers(): Promise<void> {
     try {
-      const response = await fetch(apiUrl('/api/users'))
+      const response = await fetchWithTimeout(apiUrl('/api/users'))
       if (!response.ok) return
       const data = (await response.json()) as { users: User[] }
       const list = data.users ?? []
       setUsers(list)
+      setFavoritesError('')
       // If no user is selected yet, pick the first one (test account).
       if (!currentUserId && list.length > 0) {
         const id = list[0].id
@@ -792,23 +1142,29 @@ function App() {
         window.localStorage.setItem(USER_KEY, id)
       }
     } catch {
-      // Best-effort
+      setFavoritesError('Server accounts and favorites could not be loaded right now.')
     }
   }
 
   async function fetchSubscriptions(userId: string): Promise<void> {
     if (!userId) return
     try {
-      const response = await fetch(apiUrl(`/api/users/${encodeURIComponent(userId)}/subscriptions`))
+      const response = await fetchWithTimeout(apiUrl(`/api/users/${encodeURIComponent(userId)}/subscriptions`))
       if (!response.ok) return
       const data = (await response.json()) as { subscriptions: Subscription[] }
       setSubscriptions(data.subscriptions ?? [])
+      setFavoritesError('')
     } catch {
-      // Best-effort
+      setFavoritesError('Server favorites could not be loaded right now.')
     }
   }
 
+  function isPodcastFavorited(podcast: PodcastResult): boolean {
+    return displayedSubscriptions.some((s) => s.collection_id === podcast.collectionId || s.feed_url === podcast.feedUrl)
+  }
+
   async function toggleSubscription(podcast: PodcastResult): Promise<void> {
+    if (podcast.legacyPodcastId) return
     if (!currentUserId) return
     const alreadySubbed = subscriptions.some(
       (s) => s.feed_url === podcast.feedUrl || s.collection_id === podcast.collectionId
@@ -843,7 +1199,7 @@ function App() {
 
   async function deleteJobById(jobId: string): Promise<void> {
     try {
-      await fetch(apiUrl(`/api/jobs/${jobId}`), { method: 'DELETE' })
+      await fetchWithTimeout(apiUrl(`/api/jobs/${jobId}`), { method: 'DELETE' })
       void fetchCompletedJobs()
       void fetchFailedJobs()
       if (selectedHistoryJob?.job_id === jobId) setSelectedHistoryJob(null)
@@ -854,7 +1210,7 @@ function App() {
 
   async function clearAllJobs(status: 'completed' | 'failed' | 'cancelled' | 'all' = 'all'): Promise<void> {
     try {
-      await fetch(apiUrl('/api/jobs/clear'), {
+      await fetchWithTimeout(apiUrl('/api/jobs/clear'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: currentUserId || undefined, status }),
@@ -1186,6 +1542,7 @@ function App() {
               <h2 className="section-heading">Recent Ad-free</h2>
               <button type="button" className="clear-all-btn" onClick={() => setActiveView('adfree')}>View all</button>
             </div>
+            {completedJobsError ? <p className="error-text">{completedJobsError}</p> : null}
             {visibleCompletedJobs.length === 0 ? (
               <p className="tiny">No completed conversions yet.</p>
             ) : (
@@ -1203,13 +1560,39 @@ function App() {
             )}
           </div>
 
+          {legacySavedCards.length > 0 ? (
+            <div className="panel">
+              <h2 className="section-heading">Saved</h2>
+              <div className="history-list">
+                {legacySavedCards.slice(0, 5).map((card) => (
+                  <button
+                    key={card.key}
+                    type="button"
+                    className="history-item"
+                    onClick={() => {
+                      setActiveView('search')
+                      void selectPodcast(card.podcast).then(() => chooseEpisode(card.episode))
+                    }}
+                  >
+                    <div className="history-item-main">
+                      <span className="history-podcast-name">{card.podcastTitle}</span>
+                      <strong className="history-episode-title">{card.episodeTitle}</strong>
+                    </div>
+                    <span className="status neutral">Saved</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <div className="panel">
             <h2 className="section-heading">Favorites</h2>
-            {subscriptions.length === 0 ? (
+            {favoritesError ? <p className="error-text">{favoritesError}</p> : null}
+            {displayedSubscriptions.length === 0 ? (
               <p className="tiny">Search for podcasts and favorite them here.</p>
             ) : (
               <div className="sub-list">
-                {subscriptions.slice(0, 6).map((sub) => (
+                {displayedSubscriptions.slice(0, 6).map((sub) => (
                   <button
                     key={sub.id}
                     type="button"
@@ -1234,11 +1617,12 @@ function App() {
         <div id="search" className="panel search-panel">
           <h2>Search</h2>
 
-          {subscriptions.length > 0 ? (
+          {favoritesError ? <p className="error-text">{favoritesError}</p> : null}
+          {displayedSubscriptions.length > 0 ? (
             <div className="subscriptions-panel">
               <p className="panel-subheading">Your favorites</p>
               <div className="sub-list">
-                {subscriptions.map((sub) => (
+                {displayedSubscriptions.map((sub) => (
                   <button
                     key={sub.id}
                     type="button"
@@ -1328,10 +1712,11 @@ function App() {
               {activePodcast ? (
                 <button
                   type="button"
-                  className={`sub-toggle-btn ${subscriptions.some((s) => s.collection_id === activePodcast.collectionId || s.feed_url === activePodcast.feedUrl) ? 'subbed' : ''}`}
+                  className={`sub-toggle-btn ${isPodcastFavorited(activePodcast) ? 'subbed' : ''}`}
+                  disabled={Boolean(activePodcast.legacyPodcastId)}
                   onClick={() => void toggleSubscription(activePodcast)}
                 >
-                  {subscriptions.some((s) => s.collection_id === activePodcast.collectionId || s.feed_url === activePodcast.feedUrl)
+                  {isPodcastFavorited(activePodcast)
                     ? '* Favorited'
                     : '+ Favorite'}
                 </button>
@@ -1634,6 +2019,7 @@ function App() {
             </button>
           ) : null}
         </div>
+        {completedJobsError ? <p className="error-text">{completedJobsError}</p> : null}
         {visibleCompletedJobs.length === 0 ? (
           <p className="tiny">No completed conversions yet.</p>
         ) : (
@@ -1664,12 +2050,14 @@ function App() {
                     )}
                   </div>
                 </button>
-                <button
-                  type="button"
-                  className="delete-job-btn"
-                  title="Delete this job"
-                  onClick={() => void deleteJobById(job.job_id)}
-                >x</button>
+                {job.job_id.startsWith('desktop:') ? null : (
+                  <button
+                    type="button"
+                    className="delete-job-btn"
+                    title="Delete this job"
+                    onClick={() => void deleteJobById(job.job_id)}
+                  >x</button>
+                )}
               </div>
             ))}
           </div>

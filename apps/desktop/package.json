@@ -9,7 +9,7 @@
     "dev": "electron .",
     "start": "electron .",
     "sync:web": "node scripts/sync-web-ui.mjs",
-    "package:win": "node scripts/sync-web-ui.mjs && powershell -NoProfile -Command \"Remove-Item -Recurse -Force '.\\Ad Free Podcast Player-win32-x64' -ErrorAction SilentlyContinue; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue; npx @electron/packager . 'Ad Free Podcast Player' --platform=win32 --arch=x64 --out .\\dist --overwrite --asar --ignore=renderer --ignore=dist --ignore='Ad Free Podcast Player-win32-x64'; Move-Item '.\\dist\\Ad Free Podcast Player-win32-x64' '.\\Ad Free Podcast Player-win32-x64'; Remove-Item -Recurse -Force '.\\dist' -ErrorAction SilentlyContinue\""
+    "package:win": "node scripts/sync-web-ui.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-win.ps1"
   },
   "devDependencies": {
     "@electron/get": "^2.0.3",
