@@ -1379,16 +1379,30 @@ function App() {
                       </div>
                     ) : null}
                   </div>
-                  <button
-                    type="button"
-                    className={`episode-save-btn ${state.saved ? 'saved' : ''}`}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      toggleSavedEpisode(episode)
-                    }}
-                  >
-                    {state.saved ? 'Saved' : 'Save'}
-                  </button>
+                  <div className="episode-row-actions">
+                    <button
+                      type="button"
+                      className="episode-remove-btn"
+                      disabled={!episodePlayableUrl(episode) || isSubmitting || isPreparingPlayback || windowsBridgeUnavailable}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        chooseEpisode(episode)
+                        void submitEpisodeForProcessing(episode, episode.trackName, { podcast: activePodcast })
+                      }}
+                    >
+                      {isSubmitting ? 'Processing...' : 'Remove ads'}
+                    </button>
+                    <button
+                      type="button"
+                      className={`episode-save-btn ${state.saved ? 'saved' : ''}`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        toggleSavedEpisode(episode)
+                      }}
+                    >
+                      {state.saved ? 'Saved' : 'Save'}
+                    </button>
+                  </div>
                 </div>
               )
             })}

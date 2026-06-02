@@ -512,21 +512,43 @@ h1 {
   background: var(--soft-blue);
 }
 
-.episode-save-btn {
-  min-width: 62px;
+.episode-row-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  width: 88px;
+}
+
+.episode-save-btn,
+.episode-remove-btn {
+  width: 100%;
   min-height: 30px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 4px 8px;
+  padding: 4px 7px;
+  font-size: 0.72rem;
+  line-height: 1.05;
+}
+
+.episode-save-btn {
   color: var(--blue);
   background: var(--surface);
-  font-size: 0.72rem;
 }
 
 .episode-save-btn.saved {
   color: var(--teal);
   border-color: #b8ded9;
   background: var(--soft-green);
+}
+
+.episode-remove-btn {
+  color: #fff;
+  background: var(--blue);
+}
+
+.episode-remove-btn:hover:not(:disabled) {
+  background: var(--blue-dark);
 }
 
 .episode-header,
@@ -1092,6 +1114,15 @@ h1 {
   .history-section-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .episode-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .episode-row-actions {
+    flex-direction: row;
+    width: 100%;
   }
 
   .episode-panel-actions,
