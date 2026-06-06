@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -551,6 +552,87 @@ def compact_segments_for_prompt(segments: list[Segment]) -> str:
     return json.dumps(rows, ensure_ascii=False)
 
 
+def detection_segment_batches(
+    segments: list[Segment],
+    max_window_seconds: float = 20 * 60,
+    overlap_seconds: float = 45.0,
+    max_prompt_chars: int = 55_000,
+) -> list[list[Segment]]:
+    if not segments:
+        return []
+
+    batches: list[list[Segment]] = []
+    current: list[Segment] = []
+    window_start = segments[0].start
+    prompt_chars = 0
+
+    def segment_prompt_size(segment: Segment) -> int:
+        return len(segment.text[:500]) + 96
+
+    for segment in segments:
+        next_size = segment_prompt_size(segment)
+        should_flush = bool(current) and (
+            (segment.end - window_start) > max_window_seconds
+            or (prompt_chars + next_size) > max_prompt_chars
+        )
+        if should_flush:
+            batches.append(current)
+            overlap_start = max(current[0].start, current[-1].end - overlap_seconds)
+            current = [item for item in current if item.end >= overlap_start]
+            window_start = current[0].start if current else segment.start
+            prompt_chars = sum(segment_prompt_size(item) for item in current)
+
+        current.append(segment)
+        prompt_chars += next_size
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def retrying_openai_json_request(
+    endpoint_url: str,
+    payload: dict,
+    api_key: str,
+    timeout_seconds: int,
+    max_attempts: int,
+) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    retryable_http_codes = {408, 409, 429, 500, 502, 503, 504}
+    last_error: BaseException | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        request = urllib.request.Request(
+            endpoint_url,
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(body)
+            if exc.code not in retryable_http_codes or attempt >= max_attempts:
+                raise last_error from exc
+        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+
+        sleep_seconds = min(45.0, 4.0 * attempt)
+        print(
+            f"OpenAI request attempt {attempt}/{max_attempts} failed; retrying in {sleep_seconds:.0f}s: {last_error}",
+            flush=True,
+        )
+        time.sleep(sleep_seconds)
+
+    raise RuntimeError(
+        f"OpenAI request failed after {max_attempts} attempts: {last_error}"
+    ) from last_error
+
+
 def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artifacts_dir: Path) -> list[AdRange]:
     schema = {
         "type": "json_schema",
@@ -633,50 +715,61 @@ def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artif
     detection_cache_dir = cache_root(artifacts_dir) / "detection" / f"openai-{endpoint_kind}" / model_name
     detection_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    batch_segments = compact_segments_for_prompt(segments)
-    user_content = "Detect every ad/promo block in this timestamped transcript. Return JSON only. Transcript segments:\n" + batch_segments
-    if endpoint_kind == "responses":
-        payload = {
-            "model": model_name,
-            "instructions": system,
-            "input": [{"role": "user", "content": user_content}],
-            "text": {"format": response_schema},
-            "reasoning": {"effort": "high"},
-            "store": False,
-        }
-        endpoint_url = "https://api.openai.com/v1/responses"
-        timeout_seconds = 180
-    else:
-        payload = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            "response_format": schema,
-            "temperature": 0,
-        }
-        endpoint_url = "https://api.openai.com/v1/chat/completions"
-        timeout_seconds = 90
-    cache_key = text_sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    cache_file = detection_cache_dir / f"{cache_key}.json"
+    timeout_seconds = int(os.getenv(
+        "ADCUTFORGE_OPENAI_TIMEOUT_SECONDS",
+        "600" if endpoint_kind == "responses" else "240",
+    ))
+    max_attempts = max(1, int(os.getenv("ADCUTFORGE_OPENAI_MAX_ATTEMPTS", "3")))
+    reasoning_effort = os.getenv("ADCUTFORGE_OPENAI_REASONING_EFFORT", "medium").strip() or "medium"
+    endpoint_url = (
+        "https://api.openai.com/v1/responses"
+        if endpoint_kind == "responses"
+        else "https://api.openai.com/v1/chat/completions"
+    )
 
-    if cache_file.is_file():
-        print("Using cached ad detection")
-        parsed = json.loads(cache_file.read_text(encoding="utf-8"))
-    else:
-        print("Detecting ads with OpenAI")
-        request = urllib.request.Request(
-            endpoint_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
+    parsed_batches: list[dict] = []
+    segment_batches = detection_segment_batches(segments)
+    for batch_index, segment_batch in enumerate(segment_batches, start=1):
+        batch_segments = compact_segments_for_prompt(segment_batch)
+        user_content = (
+            "Detect every ad/promo block in this timestamped transcript window. "
+            "Return JSON only. Transcript segments:\n" + batch_segments
         )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(exc.read().decode("utf-8", errors="replace")) from exc
+        if endpoint_kind == "responses":
+            payload = {
+                "model": model_name,
+                "instructions": system,
+                "input": [{"role": "user", "content": user_content}],
+                "text": {"format": response_schema},
+                "reasoning": {"effort": reasoning_effort},
+                "store": False,
+            }
+        else:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+                "response_format": schema,
+                "temperature": 0,
+            }
+        cache_key = text_sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        cache_file = detection_cache_dir / f"{cache_key}.json"
+
+        if cache_file.is_file():
+            print(f"Using cached ad detection batch {batch_index}/{len(segment_batches)}")
+            parsed_batches.append(json.loads(cache_file.read_text(encoding="utf-8")))
+            continue
+
+        print(f"Detecting ads with OpenAI batch {batch_index}/{len(segment_batches)}")
+        response_data = retrying_openai_json_request(
+            endpoint_url,
+            payload,
+            api_key,
+            timeout_seconds,
+            max_attempts,
+        )
         if endpoint_kind == "responses":
             content = response_data.get("output_text", "")
             if not content:
@@ -690,25 +783,27 @@ def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artif
             content = response_data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
         cache_file.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+        parsed_batches.append(parsed)
 
     ranges: list[AdRange] = []
-    for item in parsed.get("ad_ranges", []):
-        real_paid_or_external_promo = bool(item.get("real_paid_or_external_promo", False))
-        parody_or_comedy_bit = bool(item.get("parody_or_comedy_bit", False))
-        ad = AdRange(
-            start=float(item["start"]),
-            end=float(item["end"]),
-            confidence=float(item["confidence"]),
-            reason=str(item["reason"]),
-            source="openai",
-        )
-        if (
-            real_paid_or_external_promo
-            and not parody_or_comedy_bit
-            and ad.confidence >= 0.75
-            and 3.0 <= (ad.end - ad.start) <= 240.0
-        ):
-            ranges.append(ad)
+    for parsed in parsed_batches:
+        for item in parsed.get("ad_ranges", []):
+            real_paid_or_external_promo = bool(item.get("real_paid_or_external_promo", False))
+            parody_or_comedy_bit = bool(item.get("parody_or_comedy_bit", False))
+            ad = AdRange(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                confidence=float(item["confidence"]),
+                reason=str(item["reason"]),
+                source="openai",
+            )
+            if (
+                real_paid_or_external_promo
+                and not parody_or_comedy_bit
+                and ad.confidence >= 0.75
+                and 3.0 <= (ad.end - ad.start) <= 240.0
+            ):
+                ranges.append(ad)
     return merge_ranges(ranges, bridge_gap=25.0, min_seconds=8.0)
 
 
