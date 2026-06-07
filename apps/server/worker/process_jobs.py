@@ -465,7 +465,14 @@ def post_bridge_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         with HeartbeatPinger("running"):
             with urlopen(request, timeout=LOCAL_PROCESSOR_TIMEOUT_SECONDS) as response:
-                decoded = json.loads(response.read().decode("utf-8"))
+                body = response.read().decode("utf-8", errors="replace")
+                try:
+                    decoded = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "Windows bridge returned an empty/non-JSON response: "
+                        f"{summarize_bridge_error(body)}"
+                    ) from exc
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Windows bridge returned HTTP {exc.code}: {summarize_bridge_error(detail)}") from exc
@@ -474,6 +481,23 @@ def post_bridge_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise RuntimeError("Windows bridge returned a non-object JSON response")
     return decoded
+
+
+def completed_bridge_response_from_status(job_id: str, status: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not status or str(status.get("status") or "").strip().lower() != "completed":
+        return None
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "backend": "tunnel-parakeet",
+        "detection_mode": "openai",
+        "download_url": f"/api/local/jobs/{job_id}/download",
+        "transcript_url": f"/api/local/jobs/{job_id}/artifact/transcript",
+        "timestamped_transcript_url": f"/api/local/jobs/{job_id}/artifact/timestamped-transcript",
+        "timestamps_url": f"/api/local/jobs/{job_id}/artifact/timestamps",
+        "stats_url": f"/api/local/jobs/{job_id}/artifact/stats",
+        "logs": str(status.get("logs") or ""),
+    }
 
 
 def get_bridge_json(path: str, timeout: int = 10) -> Optional[dict[str, Any]]:
@@ -614,13 +638,33 @@ def run_tunnel_processor(job_id: str, payload: dict[str, Any], logs_list: list[s
                 )
         bridge_thread.join(timeout=1.0)
 
+    final_status = get_bridge_json(f"/api/local/jobs/{job_id}/status", timeout=10)
     if "error" in error_holder:
-        raise error_holder["error"]
+        recovered = completed_bridge_response_from_status(job_id, final_status)
+        if recovered is None:
+            if final_status and str(final_status.get("status") or "").strip().lower() == "failed":
+                message = str(final_status.get("message") or "").strip()
+                if message:
+                    raise RuntimeError(message) from error_holder["error"]
+            raise error_holder["error"]
+        logs_list.append(
+            f"Windows bridge final response was unavailable; recovered completed job from status. "
+            f"Original response error: {error_holder['error']}"
+        )
+        response_holder["response"] = recovered
     response = response_holder.get("response")
     if not isinstance(response, dict):
-        raise RuntimeError("Windows bridge did not return a response")
+        recovered = completed_bridge_response_from_status(job_id, final_status)
+        if recovered is None:
+            raise RuntimeError("Windows bridge did not return a response")
+        logs_list.append("Windows bridge did not return a final response; recovered completed job from status.")
+        response = recovered
     if not response.get("ok"):
-        raise RuntimeError(str(response.get("error") or "Windows bridge processing failed"))
+        recovered = completed_bridge_response_from_status(job_id, final_status)
+        if recovered is None:
+            raise RuntimeError(str(response.get("error") or "Windows bridge processing failed"))
+        logs_list.append("Windows bridge returned a non-ok final response; recovered completed job from status.")
+        response = recovered
 
     emit_runtime_update(job_id, logs_list, 88.0, "88% Pulling Windows tunnel output")
     output_path = Path(str(payload["output_path"])).resolve()

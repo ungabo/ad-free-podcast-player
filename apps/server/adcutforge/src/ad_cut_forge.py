@@ -633,6 +633,80 @@ def retrying_openai_json_request(
     ) from last_error
 
 
+def extract_openai_detection_text(response_data: dict, endpoint_kind: str) -> str:
+    if endpoint_kind == "responses":
+        content = str(response_data.get("output_text", "") or "")
+        if content:
+            return content
+        chunks: list[str] = []
+        for output_item in response_data.get("output", []):
+            if not isinstance(output_item, dict):
+                continue
+            for content_item in output_item.get("content", []):
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") == "output_text" and content_item.get("text") is not None:
+                    chunks.append(str(content_item.get("text", "")))
+        return "".join(chunks)
+    return str(response_data["choices"][0]["message"]["content"] or "")
+
+
+def parse_openai_detection_json(content: str) -> dict:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+    if not text:
+        raise ValueError("OpenAI returned empty detection text.")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        first = text.find("{")
+        last = text.rfind("}")
+        if first < 0 or last <= first:
+            raise
+        parsed = json.loads(text[first:last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("OpenAI detection response was not a JSON object.")
+    return parsed
+
+
+def request_openai_detection_json(
+    endpoint_url: str,
+    payload: dict,
+    api_key: str,
+    timeout_seconds: int,
+    max_attempts: int,
+    endpoint_kind: str,
+) -> dict:
+    last_error: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response_data = retrying_openai_json_request(
+                endpoint_url,
+                payload,
+                api_key,
+                timeout_seconds,
+                1,
+            )
+            content = extract_openai_detection_text(response_data, endpoint_kind)
+            return parse_openai_detection_json(content)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            sleep_seconds = min(45.0, 4.0 * attempt)
+            print(
+                f"OpenAI detection JSON attempt {attempt}/{max_attempts} failed; "
+                f"retrying in {sleep_seconds:.0f}s: {exc}",
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
+    raise RuntimeError(
+        f"OpenAI detection returned unusable JSON after {max_attempts} attempts: {last_error}"
+    ) from last_error
+
+
 def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artifacts_dir: Path) -> list[AdRange]:
     schema = {
         "type": "json_schema",
@@ -763,25 +837,14 @@ def call_openai_for_ads(segments: list[Segment], api_key: str, model: str, artif
             continue
 
         print(f"Detecting ads with OpenAI batch {batch_index}/{len(segment_batches)}")
-        response_data = retrying_openai_json_request(
+        parsed = request_openai_detection_json(
             endpoint_url,
             payload,
             api_key,
             timeout_seconds,
             max_attempts,
+            endpoint_kind,
         )
-        if endpoint_kind == "responses":
-            content = response_data.get("output_text", "")
-            if not content:
-                chunks: list[str] = []
-                for output_item in response_data.get("output", []):
-                    for content_item in output_item.get("content", []):
-                        if content_item.get("type") == "output_text":
-                            chunks.append(str(content_item.get("text", "")))
-                content = "".join(chunks)
-        else:
-            content = response_data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
         cache_file.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
         parsed_batches.append(parsed)
 
